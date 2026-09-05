@@ -121,7 +121,10 @@ export class Host extends DurableObject {
   async checkBoundary() {
     const grant = this.env.factory.getFacets(this.ctx.facets);
     const wrapper = this.wrapper(grant);
-    assert.throws(() => this.ctx.storage.put('grant', grant), /DataCloneError/);
+    await assert.rejects(
+      async () => this.ctx.storage.put('grant', grant),
+      /DataCloneError/
+    );
     await assert.rejects(wrapper.redelegate(), /DataCloneError/);
     await assert.rejects(wrapper.transfer(), /DataCloneError/);
     await assert.rejects(wrapper.revoke(), /originating host/);
