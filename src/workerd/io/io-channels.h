@@ -487,6 +487,22 @@ class IoChannelFactory: public virtual kj::Refcounted {
     JSG_FAIL_REQUIRE(Error, "Worker loader delegation is not supported by this runtime.");
   }
 
+  // Host-owned facet creation, delegated only to a trusted dynamic wrapper. The class is
+  // supplied locally; no dynamic ActorClass RPC or persistent token is needed.
+  class HostFacetChannel: public kj::Refcounted, public Frankenvalue::CapTableEntry {
+   public:
+    kj::Own<CapTableEntry> clone() override final {
+      return kj::addRef(*this);
+    }
+    virtual kj::Own<ActorChannel> getFacet(
+        kj::String name, uint depth, kj::String id, kj::Own<ActorClassChannel> actorClass) = 0;
+    virtual void revoke() = 0;
+  };
+
+  virtual kj::Own<HostFacetChannel> getHostFacetChannel(uint channel) {
+    JSG_FAIL_REQUIRE(Error, "Host facet delegation is not supported by this runtime.");
+  }
+
   // Only trusted static factory bindings can create or revoke namespaces. The returned loader
   // can be delegated once; it does not grant access to this factory or its namespace keys.
   virtual kj::Own<WorkerLoaderChannel> createWorkerLoaderNamespace(
@@ -671,6 +687,7 @@ class IoChannelCapTableEntry final: public Frankenvalue::CapTableEntry {
     ACTOR_CLASS,
     RPC,
     WORKER_LOADER,
+    HOST_FACETS,
   };
 
   IoChannelCapTableEntry(Type type, uint channel): type(type), channel(channel) {}

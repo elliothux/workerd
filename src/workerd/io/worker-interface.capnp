@@ -545,6 +545,9 @@ enum SerializationTag {
   workerLoader @18;
   # Process-local loader capability. Only supported in a dynamic env Frankenvalue; it cannot
   # be sent over RPC or persisted as a channel token.
+
+  hostFacets @19;
+  # Host-only facet manager grant. One dynamic env transfer, with no RPC/storage representation.
 }
 
 enum StreamEncoding {

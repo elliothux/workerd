@@ -1166,6 +1166,12 @@ wd_test(
 )
 
 wd_test(
+    src = "worker-loader-host-facets-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-host-facets-test.js"],
+)
+
+wd_test(
     src = "worker-loader-delegation-test.wd-test",
     args = ["--experimental"],
     data = ["worker-loader-delegation-test.js"],

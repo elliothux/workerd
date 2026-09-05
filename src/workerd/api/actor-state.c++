@@ -961,21 +961,10 @@ void DurableObjectTransaction::maybeRollback() {
   rolledBack = true;
 }
 
-namespace {
-
-// Maximum length of a facet name, in characters.
-constexpr size_t MAX_FACET_NAME_LENGTH = 256;
-
-// Maximum depth of the facet tree, including the root Durable Object. Root is at depth 0, so
-// the deepest allowed facet is at depth MAX_FACET_TREE_DEPTH - 1.
-constexpr uint MAX_FACET_TREE_DEPTH = 4;
-
-inline void requireValidFacetName(kj::StringPtr name) {
+void DurableObjectFacets::requireValidFacetName(kj::StringPtr name) {
   JSG_REQUIRE(name.size() <= MAX_FACET_NAME_LENGTH, TypeError, "Facet name is too long (max ",
       MAX_FACET_NAME_LENGTH, " characters).");
 }
-
-}  // namespace
 
 class FacetOutgoingFactory final: public Fetcher::OutgoingFactory {
  public:

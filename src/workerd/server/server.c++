@@ -475,10 +475,14 @@ class Server::ActorNamespace final {
     struct ClassAndId {
       kj::Own<ActorClass> actorClass;
       Worker::Actor::Id id;
+      kj::Maybe<uint> logicalDepth;
 
-      ClassAndId(kj::Own<ActorClass> actorClass, Worker::Actor::Id id)
+      ClassAndId(kj::Own<ActorClass> actorClass,
+          Worker::Actor::Id id,
+          kj::Maybe<uint> logicalDepth = kj::none)
           : actorClass(kj::mv(actorClass)),
-            id(kj::mv(id)) {}
+            id(kj::mv(id)),
+            logicalDepth(logicalDepth) {}
     };
 
     ActorContainer(kj::String key,
@@ -606,7 +610,9 @@ class Server::ActorNamespace final {
           requireNotBroken();
         }
 
-        auto& [actorClass, id] = KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>());
+        auto& resolved = KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>());
+        auto& actorClass = resolved.actorClass;
+        auto& id = resolved.id;
 
         KJ_IF_SOME(promise, actorClass->whenReady()) {
           co_await promise;
@@ -733,6 +739,11 @@ class Server::ActorNamespace final {
     }
 
     uint getDepth() const override {
+      KJ_IF_SOME(resolved, classAndId.tryGet<ClassAndId>()) {
+        KJ_IF_SOME(depth, resolved.logicalDepth) {
+          return depth;
+        }
+      }
       KJ_IF_SOME(p, parent) {
         return 1 + p.getDepth();
       }
@@ -1384,7 +1395,8 @@ class Server::ActorNamespace final {
         kj::Function<kj::Promise<StartInfo>()> getStartInfo) {
       auto info = co_await getStartInfo();
       co_await info.ensureAllResolved();
-      co_return ClassAndId(info.actorClass.downcast<ActorClass>(), kj::mv(info.id));
+      co_return ClassAndId(
+          info.actorClass.downcast<ActorClass>(), kj::mv(info.id), info.logicalDepth);
     }
 
     kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
@@ -3430,6 +3442,7 @@ class Server::WorkerService final: public Service,
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tails;
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> streamingTails;
     kj::Array<kj::Own<IoChannelFactory::WorkerLoaderChannel>> workerLoaders;
+    kj::Array<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacets;
     kj::Maybe<kj::Network&> workerdDebugPortNetwork;
     kj::Maybe<Server&> workerdDebugPortServer;
   };
@@ -4564,6 +4577,11 @@ class Server::WorkerService final: public Service,
       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override;
 
   kj::Own<WorkerLoaderChannel> getWorkerLoaderChannel(uint channel) override;
+  kj::Own<HostFacetChannel> getHostFacetChannel(uint channel) override {
+    auto& channels = KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
+    KJ_REQUIRE(channel < channels.hostFacets.size(), "invalid host facet channel number");
+    return kj::addRef(*channels.hostFacets[channel]);
+  }
   kj::Own<SubrequestChannel> wrapWorkerLoaderEntrypoint(uint factoryChannel,
       kj::Own<SubrequestChannel> entrypoint,
       kj::Array<kj::Own<SubrequestChannel>> tails) override;
@@ -5161,6 +5179,7 @@ struct Server::WorkerDef {
   kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> rpcChannels;
   kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
   bool hasWorkerdDebugPortBinding = false;
+  kj::Vector<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacetChannels;
   kj::Array<FutureSubrequestChannel> tails;
   kj::Array<FutureSubrequestChannel> streamingTails;
 
@@ -5381,7 +5400,10 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       // midst of destroying the `Server` and `cleanupTaskSet` may already be destroyed.
       if (!unlinked) {
         KJ_IF_SOME(s, service) {
-          cleanupTaskSet.add(kj::evalLater([service = kj::mv(s)]() mutable { service->unlink(); }));
+          // Server shutdown cancels this task set before unlinking its named services. Keep
+          // cleanup in an attachment so cancellation also breaks the dynamic service's cycles.
+          cleanupTaskSet.add(kj::evalLater([]() {}).attach(
+              kj::defer([service = kj::mv(s)]() mutable { service->unlink(); })));
         }
       }
     }
@@ -5458,6 +5480,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       kj::Vector<FutureActorClassChannel> actorClassChannels;
       kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> rpcChannels;
       kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
+      kj::Vector<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacetChannels;
       source.env.rewriteCaps([&](kj::Own<Frankenvalue::CapTableEntry> entry) {
         KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*entry)) {
           uint channelNumber =
@@ -5485,6 +5508,11 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           workerLoaderChannels.add(FutureWorkerLoaderChannel{.capability = kj::addRef(channel)});
           return kj::heap<IoChannelCapTableEntry>(
               IoChannelCapTableEntry::WORKER_LOADER, channelNumber);
+        } else KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::HostFacetChannel>(*entry)) {
+          uint channelNumber = hostFacetChannels.size();
+          hostFacetChannels.add(kj::addRef(channel));
+          return kj::heap<IoChannelCapTableEntry>(
+              IoChannelCapTableEntry::HOST_FACETS, channelNumber);
         } else {
           // Generally, it shouldn't be possible to get here, but just in case, let's at least
           // provide some sort of error, although it's a vague one.
@@ -5512,6 +5540,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         .actorClassChannels = kj::mv(actorClassChannels),
         .rpcChannels = kj::mv(rpcChannels),
         .workerLoaderChannels = kj::mv(workerLoaderChannels),
+        .hostFacetChannels = kj::mv(hostFacetChannels),
 
         .tails = KJ_MAP(tail, source.tails) -> FutureSubrequestChannel {
           return {
@@ -6304,6 +6333,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     result.tails = KJ_MAP(tail, def.tails) { return kj::mv(tail).lookup(*this); };
 
     result.streamingTails = KJ_MAP(tail, def.streamingTails) { return kj::mv(tail).lookup(*this); };
+    result.hostFacets = def.hostFacetChannels.releaseAsArray();
 
     result.workerLoaders =
         KJ_MAP(il, def.workerLoaderChannels) -> kj::Own<IoChannelFactory::WorkerLoaderChannel> {

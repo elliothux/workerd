@@ -11,6 +11,7 @@ namespace workerd::api {
 
 class Fetcher;
 class DurableObjectClass;
+class DurableObjectFacets;
 
 // JS stub pointing to a remote Worker loaded using WorkerLoader. This is not a stub for a specific
 // entrypoint, but instead the entire Worker, allowing the caller to call any entrypoint (and
@@ -180,6 +181,34 @@ class WorkerLoader: public jsg::Object {
       Worker::Script::Source extractedSource, CompatibilityFlags::Reader compatibilityFlags);
 };
 
+// A host facet grant used by trusted wrappers. It is not a public Worker Loader API and cannot
+// be minted by a tenant. The received grant cannot be transferred again.
+class HostFacets: public jsg::Object {
+ public:
+  explicit HostFacets(uint channel): channel(channel) {}
+  explicit HostFacets(IoOwn<IoChannelFactory::HostFacetChannel> channel)
+      : channel(kj::mv(channel)) {}
+
+  void create(jsg::Lock& js,
+      kj::String name,
+      uint depth,
+      kj::String id,
+      jsg::Ref<DurableObjectClass> actorClass);
+  void revoke(jsg::Lock& js);
+  void serialize(jsg::Lock& js, jsg::Serializer& serializer);
+  static jsg::Ref<HostFacets> deserialize(
+      jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
+
+  JSG_RESOURCE_TYPE(HostFacets) {
+    JSG_METHOD(create);
+    JSG_METHOD(revoke);
+  }
+  JSG_SERIALIZABLE(rpc::SerializationTag::HOST_FACETS);
+
+ private:
+  kj::OneOf<uint, IoOwn<IoChannelFactory::HostFacetChannel>> channel;
+};
+
 // Host-only binding for minting and revoking isolated loader capabilities. It is deliberately
 // separate from WorkerLoader and cannot be transferred into a dynamic Worker's env.
 class WorkerLoaderFactory: public jsg::Object {
@@ -188,6 +217,7 @@ class WorkerLoaderFactory: public jsg::Object {
 
   jsg::Ref<WorkerLoader> get(jsg::Lock& js, kj::String name);
   void revoke(jsg::Lock& js, kj::String name);
+  jsg::Ref<HostFacets> getFacets(jsg::Lock& js, jsg::Ref<DurableObjectFacets> facets);
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
       jsg::Ref<WorkerStub> stub,
       kj::Array<jsg::Ref<Fetcher>> tails,
@@ -197,6 +227,7 @@ class WorkerLoaderFactory: public jsg::Object {
   JSG_RESOURCE_TYPE(WorkerLoaderFactory) {
     JSG_METHOD(get);
     JSG_METHOD(revoke);
+    JSG_METHOD(getFacets);
     JSG_METHOD(getEntrypoint);
   }
 
@@ -207,6 +238,6 @@ class WorkerLoaderFactory: public jsg::Object {
 #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
       api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoaderFactory,          \
-      workerd::ResourceLimits
+      api::HostFacets, workerd::ResourceLimits
 
 }  // namespace workerd::api

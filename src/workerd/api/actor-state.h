@@ -429,7 +429,14 @@ class DurableObjectTransaction final: public jsg::Object, public DurableObjectSt
 };
 
 class DurableObjectFacets: public jsg::Object {
+  friend class WorkerLoaderFactory;
+  friend class HostFacets;
+
  public:
+  static constexpr size_t MAX_FACET_NAME_LENGTH = 256;
+  // Includes the root Durable Object at depth zero.
+  static constexpr uint MAX_FACET_TREE_DEPTH = 4;
+
   DurableObjectFacets(kj::Maybe<IoPtr<Worker::Actor::FacetManager>> facetManager)
       : facetManager(kj::mv(facetManager)) {}
 
@@ -488,6 +495,8 @@ class DurableObjectFacets: public jsg::Object {
   }
 
  private:
+  static void requireValidFacetName(kj::StringPtr name);
+
   kj::Maybe<IoPtr<Worker::Actor::FacetManager>> facetManager;
 
   Worker::Actor::FacetManager& getFacetManager() {

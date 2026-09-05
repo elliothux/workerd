@@ -940,6 +940,10 @@ class Worker::Actor final: public kj::Refcounted {
       // ctx.id for the child object.
       Worker::Actor::Id id;
 
+      // A trusted host may flatten logical facets below a private supervisor actor. Preserve
+      // the logical tree's depth for descendants. Public ctx.facets never supplies this field.
+      kj::Maybe<uint> logicalDepth;
+
       // Ensures `actorClass` is a fully-resolved channel.
       //
       // This is implemented in io-channels.c++ next to DynamicWorkerSource::ensureAllResolved()
