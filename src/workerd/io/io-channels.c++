@@ -193,6 +193,10 @@ resolveCap(kj::Own<Frankenvalue::CapTableEntry> cap) {
       }
     }
     KJ_UNREACHABLE;
+  } else if (kj::tryDowncast<IoChannelFactory::WorkerLoaderChannel>(*cap) != kj::none ||
+      kj::tryDowncast<IoChannelFactory::HostFacetChannel>(*cap) != kj::none) {
+    // Host capabilities are already resolved, process-local references with no token lookup.
+    return kj::mv(cap);
   } else {
     auto& ref = *cap;
     KJ_FAIL_ASSERT("unknown type in Frankenvalue", typeid(ref).name());

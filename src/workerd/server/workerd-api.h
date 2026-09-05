@@ -272,6 +272,7 @@ class WorkerdApi final: public Worker::Api {
 
     struct WorkerLoader {
       uint channel;
+      bool factory = false;
 
       WorkerLoader clone() const {
         return *this;

@@ -1,5 +1,6 @@
 #include "worker-loader.h"
 
+#include <workerd/api/actor-state.h>
 #include <workerd/api/actor.h>
 #include <workerd/api/http.h>
 #include <workerd/io/compatibility-date.h>
@@ -22,6 +23,87 @@ constexpr size_t MAX_DYNAMIC_WORKER_CODE_SIZE = 64 * 1024 * 1024;
 constexpr size_t MAX_DYNAMIC_WORKER_ENV_SIZE = 1 * 1024 * 1024;
 
 }  // namespace
+
+namespace {
+
+class HostFacetChannelImpl final: public IoChannelFactory::HostFacetChannel {
+ public:
+  explicit HostFacetChannelImpl(Worker::Actor::FacetManager& manager)
+      : origin(IoContext::current().getWeakRef()),
+        manager(manager) {}
+
+  kj::Own<IoChannelFactory::ActorChannel> getFacet(kj::String name,
+      uint depth,
+      kj::String id,
+      kj::Own<IoChannelFactory::ActorClassChannel> actorClass) override {
+    requireActive();
+    JSG_REQUIRE(depth > 0 && depth < DurableObjectFacets::MAX_FACET_TREE_DEPTH, Error,
+        "Invalid host facet depth.");
+    return manager.getFacet(name,
+        [self = kj::addRef(*this), depth, id = kj::mv(id),
+            actorClass = kj::mv(
+                actorClass)]() mutable -> kj::Promise<Worker::Actor::FacetManager::StartInfo> {
+      self->requireActive();
+      return Worker::Actor::FacetManager::StartInfo{
+        .actorClass = kj::mv(actorClass), .id = kj::mv(id), .logicalDepth = depth};
+    });
+  }
+
+  void revoke() override {
+    revoked = true;
+  }
+
+ private:
+  void requireActive() {
+    JSG_REQUIRE(!revoked && origin->tryGet() != kj::none, Error,
+        "The host facet grant has ended or been revoked.");
+  }
+  // A strong parent reference would form a cycle through the hosted child's env. The facet
+  // manager is valid for the originating host context's lifetime, just like its original IoPtr.
+  kj::Own<IoContext::WeakRef> origin;
+  Worker::Actor::FacetManager& manager;
+  bool revoked = false;
+};
+
+}  // namespace
+
+jsg::Ref<HostFacets> WorkerLoaderFactory::getFacets(
+    jsg::Lock& js, jsg::Ref<DurableObjectFacets> facets) {
+  kj::Own<IoChannelFactory::HostFacetChannel> channel =
+      kj::refcounted<HostFacetChannelImpl>(facets->getFacetManager());
+  return js.alloc<HostFacets>(IoContext::current().addObject(kj::mv(channel)));
+}
+
+void HostFacets::create(jsg::Lock& js,
+    kj::String name,
+    uint depth,
+    kj::String id,
+    jsg::Ref<DurableObjectClass> actorClass) {
+  DurableObjectFacets::requireValidFacetName(name);
+  JSG_REQUIRE(depth > 0 && depth < DurableObjectFacets::MAX_FACET_TREE_DEPTH, Error,
+      "Invalid host facet depth.");
+  auto& ioctx = IoContext::current();
+  kj::Own<IoChannelFactory::HostFacetChannel> capability;
+  KJ_SWITCH_ONEOF(channel) {
+    KJ_CASE_ONEOF(number, uint) {
+      capability = ioctx.getIoChannelFactory().getHostFacetChannel(number);
+    }
+    KJ_CASE_ONEOF(local, IoOwn<IoChannelFactory::HostFacetChannel>) {
+      capability = kj::addRef(*local);
+    }
+  }
+  // Resolve the local class capability before returning; no JavaScript callback or raw class
+  // needs to survive this request or cross the host manager's RPC boundary.
+  auto actor = capability->getFacet(kj::mv(name), depth, kj::mv(id), actorClass->getChannel(ioctx));
+}
+
+void HostFacets::revoke(jsg::Lock& js) {
+  KJ_IF_SOME(local, channel.tryGet<IoOwn<IoChannelFactory::HostFacetChannel>>()) {
+    local->revoke();
+    return;
+  }
+  JSG_FAIL_REQUIRE(Error, "Only the originating host can revoke a facet grant.");
+}
 
 jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
     jsg::Optional<kj::Maybe<kj::String>> name,
@@ -93,8 +175,7 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
     }));
   });
 
-  auto isolateChannel =
-      ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name), kj::mv(reenterAndGetCode));
+  auto isolateChannel = loadIsolate(ioctx, kj::mv(name), kj::mv(reenterAndGetCode));
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
@@ -115,12 +196,119 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
   };
   auto ownContentWrapper = kj::atomicRefcounted<OwnContentWrapper>(kj::mv(source.ownContent));
 
-  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
+  auto isolateChannel = loadIsolate(ioctx, kj::none,
       [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
     return source.clone(kj::atomicAddRef(*ownContentWrapper));
   });
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+}
+
+kj::Own<WorkerStubChannel> WorkerLoader::loadIsolate(IoContext& ioctx,
+    kj::Maybe<kj::String> name,
+    kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
+  KJ_SWITCH_ONEOF(channel) {
+    KJ_CASE_ONEOF(number, uint) {
+      return ioctx.getIoChannelFactory().loadIsolate(number, kj::mv(name), kj::mv(fetchSource));
+    }
+    KJ_CASE_ONEOF(capability, IoOwn<IoChannelFactory::WorkerLoaderChannel>) {
+      return capability->loadIsolate(kj::mv(name), kj::mv(fetchSource));
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+void WorkerLoader::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+  KJ_IF_SOME(handler, serializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableBuilder>(handler)) {
+      KJ_SWITCH_ONEOF(channel) {
+        KJ_CASE_ONEOF(number, uint) {
+          auto capability =
+              IoContext::current().getIoChannelFactory().getWorkerLoaderChannel(number);
+          serializer.writeRawUint32(table.add(capability->forTransfer()));
+          return;
+        }
+        KJ_CASE_ONEOF(capability, IoOwn<IoChannelFactory::WorkerLoaderChannel>) {
+          serializer.writeRawUint32(table.add(capability->forTransfer()));
+          return;
+        }
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(DOMDataCloneError, "WorkerLoader can only be transferred into a dynamic env.");
+}
+
+jsg::Ref<WorkerLoader> WorkerLoader::deserialize(
+    jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
+  KJ_IF_SOME(handler, deserializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableReader>(handler)) {
+      auto& cap = KJ_REQUIRE_NONNULL(table.get(deserializer.readRawUint32()),
+          "serialized WorkerLoader had invalid cap table index");
+      KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
+        return js.alloc<WorkerLoader>(
+            channel.getChannelNumber(IoChannelCapTableEntry::WORKER_LOADER),
+            CompatibilityDateValidation::CODE_VERSION);
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(DOMDataCloneError, "WorkerLoader can only be transferred into a dynamic env.");
+}
+
+void HostFacets::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+  KJ_IF_SOME(handler, serializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableBuilder>(handler)) {
+      KJ_IF_SOME(local, channel.tryGet<IoOwn<IoChannelFactory::HostFacetChannel>>()) {
+        serializer.writeRawUint32(table.add(kj::addRef(*local)));
+        return;
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(
+      DOMDataCloneError, "Host facet grants cannot be transferred again or persisted.");
+}
+
+jsg::Ref<HostFacets> HostFacets::deserialize(
+    jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
+  KJ_IF_SOME(handler, deserializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableReader>(handler)) {
+      auto& cap = KJ_REQUIRE_NONNULL(table.get(deserializer.readRawUint32()),
+          "serialized host facets had invalid cap table index");
+      KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
+        return js.alloc<HostFacets>(channel.getChannelNumber(IoChannelCapTableEntry::HOST_FACETS));
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(
+      DOMDataCloneError, "Host facet grants can only be transferred into a dynamic env.");
+}
+
+jsg::Ref<WorkerLoader> WorkerLoaderFactory::get(jsg::Lock& js, kj::String name) {
+  auto& ioctx = IoContext::current();
+  return js.alloc<WorkerLoader>(
+      ioctx.addObject(
+          ioctx.getIoChannelFactory().createWorkerLoaderNamespace(channel, kj::mv(name))),
+      CompatibilityDateValidation::CODE_VERSION);
+}
+
+void WorkerLoaderFactory::revoke(jsg::Lock& js, kj::String name) {
+  IoContext::current().getIoChannelFactory().revokeWorkerLoaderNamespace(channel, kj::mv(name));
+}
+
+jsg::Ref<Fetcher> WorkerLoaderFactory::getEntrypoint(jsg::Lock& js,
+    jsg::Ref<WorkerStub> stub,
+    kj::Array<jsg::Ref<Fetcher>> tails,
+    jsg::Optional<kj::Maybe<kj::String>> name,
+    jsg::Optional<WorkerStub::EntrypointOptions> options) {
+  auto& ioctx = IoContext::current();
+  JSG_REQUIRE(tails.size() <= 16, TypeError, "Too many host Dynamic Worker collectors.");
+  auto entrypoint = stub->getEntrypoint(js, kj::mv(name), kj::mv(options));
+  auto channels = KJ_MAP(tail, tails) {
+    auto channel = tail->getSubrequestChannel(ioctx);
+    channel->requireAllowsTransfer();
+    return kj::mv(channel);
+  };
+  return js.alloc<Fetcher>(ioctx.addObject(ioctx.getIoChannelFactory().wrapWorkerLoaderEntrypoint(
+      channel, entrypoint->getSubrequestChannel(ioctx), kj::mv(channels))));
 }
 
 DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,

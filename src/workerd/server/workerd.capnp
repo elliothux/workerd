@@ -457,6 +457,17 @@ struct Worker {
         # from it, they'll end up sharing the same loaded Worker.
         #
         # (If omitted, the binding will not share a cache with any other binding.)
+
+        factory @29 :Bool = false;
+        # Expose a trusted host-only factory with get(namespace) and revoke(namespace), instead
+        # of a loader. Each returned loader has an isolated cache and can be passed once into a
+        # dynamic env. Factories with the same id share their namespaces. Factories cannot be
+        # transferred to dynamic Workers. getEntrypoint(stub, tails, name?, options?) adds host
+        # collectors to one invocation without changing the cached WorkerCode.
+
+        inheritTails @30 :Bool = false;
+        # Trusted static loaders may propagate their loaded Worker's configured tails to children.
+        # Only host-owned collectors belong here; this option is invalid on a factory binding.
       }
 
       workerdDebugPort @28 :Void;
