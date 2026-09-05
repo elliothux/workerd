@@ -1,0 +1,31 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const unitTests :Workerd.Config = (
+  v8Flags = ["--expose-gc"],
+  services = [
+    (name = "factory-peer", worker = (
+      modules = [
+        (name = "peer", esModule = "export { FactoryPeer } from 'worker';"),
+        (name = "worker", esModule = embed "worker-loader-delegation-test.js"),
+      ],
+      compatibilityFlags = ["nodejs_compat", "experimental", "enable_ctx_exports"],
+      bindings = [(name = "factory", workerLoader = (id = "shared-factory", factory = true))],
+    )),
+    (name = "worker-loader-delegation-test", worker = (
+      modules = [(name = "worker", esModule = embed "worker-loader-delegation-test.js")],
+      compatibilityFlags = ["nodejs_compat", "experimental", "enable_ctx_exports"],
+      durableObjectNamespaces = [
+        (className = "InflightActor", uniqueKey = "InflightActor"),
+        (className = "Gate", uniqueKey = "Gate"),
+      ],
+      durableObjectStorage = (inMemory = void),
+      bindings = [
+        (name = "system", workerLoader = (id = "internal-loader")),
+        (name = "factory", workerLoader = (id = "shared-factory", factory = true)),
+        (name = "peer", service = (name = "factory-peer", entrypoint = "FactoryPeer")),
+        (name = "otherFactory", workerLoader = (factory = true)),
+        (name = "capacityFactory", workerLoader = (factory = true)),
+      ],
+    )),
+  ],
+);

@@ -26,6 +26,13 @@ namespace workerd {
 
 static thread_local IoContext* threadLocalRequest = nullptr;
 
+kj::Rc<DynamicWorkerLimiter> IoContext::getDynamicWorkerLimiter() {
+  if (dynamicWorkerLimiter == kj::none) {
+    dynamicWorkerLimiter = kj::rc<DynamicWorkerLimiter>(actor == kj::none ? 4 : 10);
+  }
+  return KJ_ASSERT_NONNULL(dynamicWorkerLimiter).addRef();
+}
+
 SuppressIoContextScope::SuppressIoContextScope(): cached(threadLocalRequest) {
   threadLocalRequest = nullptr;
 }
@@ -223,13 +230,15 @@ IoContext::IncomingRequest::IoContext_IncomingRequest(kj::Own<IoContext> context
     kj::Maybe<kj::Own<BaseTracer>> workerTracer,
     kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory)
+    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+    kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails)
     : context(kj::mv(contextParam)),
       metrics(kj::mv(metricsParam)),
       workerTracer(kj::mv(workerTracer)),
       ioChannelFactory(kj::mv(ioChannelFactoryParam)),
       accessInfo(kj::mv(accessInfo)),
       selfTokenFactory(kj::mv(selfTokenFactory)),
+      dynamicWorkerTails(kj::mv(dynamicWorkerTails)),
       maybeTriggerInvocationSpan(kj::mv(maybeTriggerInvocationSpan)) {}
 
 tracing::InvocationSpanContext& IoContext::IncomingRequest::getInvocationSpanContext() {
@@ -1158,6 +1167,7 @@ kj::Own<WorkerInterface> IoContext::getSubrequestChannelImpl(uint channel,
     .parentSpan = tracing.getInternalSpanParent(),
     .userSpanParent = kj::mv(propagatedUserSpanParent),
     .featureFlagsForFl = mapCopyString(worker->getIsolate().getFeatureFlagsForFl()),
+    .dynamicWorkerTails = getDynamicWorkerTails(),
   };
 
   auto client = channelFactory.startSubrequest(channel, kj::mv(metadata));

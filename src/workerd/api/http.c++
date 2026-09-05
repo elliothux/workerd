@@ -2934,7 +2934,8 @@ Fetcher::ClientWithTracing Fetcher::buildClient(IoContext& ioContext,
           [&](TraceContext& tracing, IoChannelFactory& ioChannelFactory) {
         return channel->startRequest({.cfBlobJson = kj::mv(cfStr),
             .parentSpan = tracing.getInternalSpanParent(),
-            .userSpanParent = tracing.getUserSpanParent()});
+            .userSpanParent = tracing.getUserSpanParent(),
+            .dynamicWorkerTails = ioContext.getDynamicWorkerTails()});
       }, {
         .inHouse = isInHouse,
         .wrapMetrics = !isInHouse,
@@ -2993,7 +2994,8 @@ Fetcher::ClientWithTracing Fetcher::buildClient(IoContext& ioContext,
           [&](TraceContext& tracing, IoChannelFactory& ioChannelFactory) {
         return channel->startRequest({.cfBlobJson = kj::mv(cfStr),
             .parentSpan = tracing.getInternalSpanParent(),
-            .userSpanParent = kj::mv(propagatedUserSpanParent)});
+            .userSpanParent = kj::mv(propagatedUserSpanParent),
+            .dynamicWorkerTails = ioContext.getDynamicWorkerTails()});
       }, {
         .inHouse = isInHouse,
         .wrapMetrics = !isInHouse,

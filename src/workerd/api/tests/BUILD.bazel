@@ -1160,6 +1160,18 @@ wd_test(
 )
 
 wd_test(
+    src = "worker-loader-tails-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-tails-test.js"],
+)
+
+wd_test(
+    src = "worker-loader-delegation-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-delegation-test.js"],
+)
+
+wd_test(
     src = "worker-loader-unnamed-gc-test.wd-test",
     args = ["--experimental"],
     data = ["worker-loader-unnamed-gc-test.js"],

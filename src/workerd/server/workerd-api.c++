@@ -736,9 +736,13 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(workerLoader, Global::WorkerLoader) {
-      value = lock.wrap(context,
-          lock.alloc<api::WorkerLoader>(
-              workerLoader.channel, CompatibilityDateValidation::CODE_VERSION));
+      if (workerLoader.factory) {
+        value = lock.wrap(context, lock.alloc<api::WorkerLoaderFactory>(workerLoader.channel));
+      } else {
+        value = lock.wrap(context,
+            lock.alloc<api::WorkerLoader>(
+                workerLoader.channel, CompatibilityDateValidation::CODE_VERSION));
+      }
     }
 
     KJ_CASE_ONEOF(_, Global::WorkerdDebugPort) {

@@ -71,7 +71,8 @@ Fetcher::OutgoingFactory::Result LocalActorOutgoingFactory::newSingleUseClient(
     return getOrCreateActorChannel(context, tracing.getInternalSpanParent())
         .startRequest({.cfBlobJson = kj::mv(cfStr),
           .parentSpan = tracing.getInternalSpanParent(),
-          .userSpanParent = kj::mv(userSpanParent)});
+          .userSpanParent = kj::mv(userSpanParent),
+          .dynamicWorkerTails = context.getDynamicWorkerTails()});
   };
   auto client = startActorSubrequest(context, startRequest, CountSubrequest::YES);
   return {.client = kj::mv(client), .spanParents = kj::mv(spanParents)};
@@ -143,7 +144,8 @@ Fetcher::OutgoingFactory::Result GlobalActorOutgoingFactory::
         .startRequest({.cfBlobJson = kj::mv(cfStr),
           .parentSpan = tracing.getInternalSpanParent(),
           .userSpanParent = kj::mv(userSpanParent),
-          .actorRetryRequestMetadata = kj::mv(actorRetryRequestMetadata)});
+          .actorRetryRequestMetadata = kj::mv(actorRetryRequestMetadata),
+          .dynamicWorkerTails = context.getDynamicWorkerTails()});
   };
   auto client = startActorSubrequest(context, makeClient, countSubrequest);
   return {.client = kj::mv(client), .spanParents = kj::mv(spanParents)};
@@ -181,7 +183,8 @@ Fetcher::OutgoingFactory::Result ReplicaActorOutgoingFactory::
     return actorChannel->startRequest({.cfBlobJson = kj::mv(cfStr),
       .parentSpan = tracing.getInternalSpanParent(),
       .userSpanParent = kj::mv(userSpanParent),
-      .actorRetryRequestMetadata = kj::mv(actorRetryRequestMetadata)});
+      .actorRetryRequestMetadata = kj::mv(actorRetryRequestMetadata),
+      .dynamicWorkerTails = context.getDynamicWorkerTails()});
   };
   auto client = startActorSubrequest(context, startRequest, countSubrequest);
   return {.client = kj::mv(client), .spanParents = kj::mv(spanParents)};

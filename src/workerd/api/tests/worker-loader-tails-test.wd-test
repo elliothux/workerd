@@ -1,0 +1,17 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const unitTests :Workerd.Config = (
+  services = [
+    (name = "worker-loader-tails-test", worker = (
+      modules = [(name = "worker", esModule = embed "worker-loader-tails-test.js")],
+      compatibilityFlags = ["nodejs_compat", "experimental", "enable_ctx_exports"],
+      durableObjectNamespaces = [(className = "Collector", uniqueKey = "Collector")],
+      durableObjectStorage = (inMemory = void),
+      bindings = [
+        (name = "loader", workerLoader = ()),
+        (name = "inheritingLoader", workerLoader = (inheritTails = true)),
+        (name = "factory", workerLoader = (factory = true)),
+      ],
+    )),
+  ],
+);

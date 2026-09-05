@@ -93,8 +93,7 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
     }));
   });
 
-  auto isolateChannel =
-      ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name), kj::mv(reenterAndGetCode));
+  auto isolateChannel = loadIsolate(ioctx, kj::mv(name), kj::mv(reenterAndGetCode));
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
@@ -115,12 +114,91 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
   };
   auto ownContentWrapper = kj::atomicRefcounted<OwnContentWrapper>(kj::mv(source.ownContent));
 
-  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
+  auto isolateChannel = loadIsolate(ioctx, kj::none,
       [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
     return source.clone(kj::atomicAddRef(*ownContentWrapper));
   });
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+}
+
+kj::Own<WorkerStubChannel> WorkerLoader::loadIsolate(IoContext& ioctx,
+    kj::Maybe<kj::String> name,
+    kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
+  KJ_SWITCH_ONEOF(channel) {
+    KJ_CASE_ONEOF(number, uint) {
+      return ioctx.getIoChannelFactory().loadIsolate(number, kj::mv(name), kj::mv(fetchSource));
+    }
+    KJ_CASE_ONEOF(capability, IoOwn<IoChannelFactory::WorkerLoaderChannel>) {
+      return capability->loadIsolate(kj::mv(name), kj::mv(fetchSource));
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+void WorkerLoader::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+  KJ_IF_SOME(handler, serializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableBuilder>(handler)) {
+      KJ_SWITCH_ONEOF(channel) {
+        KJ_CASE_ONEOF(number, uint) {
+          auto capability =
+              IoContext::current().getIoChannelFactory().getWorkerLoaderChannel(number);
+          serializer.writeRawUint32(table.add(capability->forTransfer()));
+          return;
+        }
+        KJ_CASE_ONEOF(capability, IoOwn<IoChannelFactory::WorkerLoaderChannel>) {
+          serializer.writeRawUint32(table.add(capability->forTransfer()));
+          return;
+        }
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(DOMDataCloneError, "WorkerLoader can only be transferred into a dynamic env.");
+}
+
+jsg::Ref<WorkerLoader> WorkerLoader::deserialize(
+    jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
+  KJ_IF_SOME(handler, deserializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableReader>(handler)) {
+      auto& cap = KJ_REQUIRE_NONNULL(table.get(deserializer.readRawUint32()),
+          "serialized WorkerLoader had invalid cap table index");
+      KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
+        return js.alloc<WorkerLoader>(
+            channel.getChannelNumber(IoChannelCapTableEntry::WORKER_LOADER),
+            CompatibilityDateValidation::CODE_VERSION);
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(DOMDataCloneError, "WorkerLoader can only be transferred into a dynamic env.");
+}
+
+jsg::Ref<WorkerLoader> WorkerLoaderFactory::get(jsg::Lock& js, kj::String name) {
+  auto& ioctx = IoContext::current();
+  return js.alloc<WorkerLoader>(
+      ioctx.addObject(
+          ioctx.getIoChannelFactory().createWorkerLoaderNamespace(channel, kj::mv(name))),
+      CompatibilityDateValidation::CODE_VERSION);
+}
+
+void WorkerLoaderFactory::revoke(jsg::Lock& js, kj::String name) {
+  IoContext::current().getIoChannelFactory().revokeWorkerLoaderNamespace(channel, kj::mv(name));
+}
+
+jsg::Ref<Fetcher> WorkerLoaderFactory::getEntrypoint(jsg::Lock& js,
+    jsg::Ref<WorkerStub> stub,
+    kj::Array<jsg::Ref<Fetcher>> tails,
+    jsg::Optional<kj::Maybe<kj::String>> name,
+    jsg::Optional<WorkerStub::EntrypointOptions> options) {
+  auto& ioctx = IoContext::current();
+  JSG_REQUIRE(tails.size() <= 16, TypeError, "Too many host Dynamic Worker collectors.");
+  auto entrypoint = stub->getEntrypoint(js, kj::mv(name), kj::mv(options));
+  auto channels = KJ_MAP(tail, tails) {
+    auto channel = tail->getSubrequestChannel(ioctx);
+    channel->requireAllowsTransfer();
+    return kj::mv(channel);
+  };
+  return js.alloc<Fetcher>(ioctx.addObject(ioctx.getIoChannelFactory().wrapWorkerLoaderEntrypoint(
+      channel, entrypoint->getSubrequestChannel(ioctx), kj::mv(channels))));
 }
 
 DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,

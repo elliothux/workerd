@@ -3429,7 +3429,7 @@ class Server::WorkerService final: public Service,
     kj::Maybe<const kj::Directory&> actorStorage;
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tails;
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> streamingTails;
-    kj::Array<kj::Rc<WorkerLoaderNamespace>> workerLoaders;
+    kj::Array<kj::Own<IoChannelFactory::WorkerLoaderChannel>> workerLoaders;
     kj::Maybe<kj::Network&> workerdDebugPortNetwork;
     kj::Maybe<Server&> workerdDebugPortServer;
   };
@@ -3504,6 +3504,18 @@ class Server::WorkerService final: public Service,
 
   void requireAllowsTransfer() override {
     if (isDynamic) throwDynamicEntrypointTransferError();
+  }
+
+  // The callback holds a weak reference to the loader stub. Specialized ctx.exports channels
+  // acquire a strong reference so that a child can keep its parent alive without making the
+  // parent's own loopback channel table cyclic. It also checks namespace revocation.
+  void setInheritDynamicWorkerTails(bool enabled) {
+    inheritDynamicWorkerTails = enabled;
+  }
+
+  void setDynamicOwner(kj::Function<kj::Own<WorkerStubChannel>()> retainOwner) {
+    KJ_REQUIRE(isDynamic);
+    retainDynamicOwner = kj::mv(retainOwner);
   }
 
   kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
@@ -3838,7 +3850,30 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
-    kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
+    // Host collectors follow an invocation through dynamic workers only. A static service is
+    // a separate trust boundary. Trusted loader namespaces may also install fixed collectors
+    // (e.g. for an actor activation), which then follow calls to dynamic descendants.
+    if (!isDynamic) metadata.dynamicWorkerTails = {};
+    if (inheritDynamicWorkerTails) {
+      kj::Vector<kj::Own<SubrequestChannel>> inherited;
+      kj::HashSet<SubrequestChannel*> seen;
+      for (auto& tail: metadata.dynamicWorkerTails) {
+        if (!seen.contains(tail.get())) {
+          seen.insert(tail.get());
+          inherited.add(kj::mv(tail));
+        }
+      }
+      for (auto& tail: channels.tails) {
+        if (!seen.contains(tail.get())) {
+          seen.insert(tail.get());
+          inherited.add(kj::addRef(*tail));
+        }
+      }
+      metadata.dynamicWorkerTails = inherited.releaseAsArray();
+    }
+
+    kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(
+        channels.tails.size() + metadata.dynamicWorkerTails.size());
     kj::Vector<kj::Own<WorkerInterface>> streamingTailWorkers(channels.streamingTails.size());
     auto addWorkerIfNotRecursiveTracer = [this, isTracer](
                                              kj::Vector<kj::Own<WorkerInterface>>& workers,
@@ -3880,8 +3915,18 @@ class Server::WorkerService final: public Service,
     // we are not implementing a (more complex) mechanism to disable tracing for all test() events
     // here.
     if (entrypointName.orDefault("") != "test"_kj) {
+      kj::HashSet<SubrequestChannel*> seen;
       for (auto& service: channels.tails) {
-        addWorkerIfNotRecursiveTracer(bufferedTailWorkers, *service);
+        if (!seen.contains(service.get())) {
+          seen.insert(service.get());
+          addWorkerIfNotRecursiveTracer(bufferedTailWorkers, *service);
+        }
+      }
+      for (auto& service: metadata.dynamicWorkerTails) {
+        if (!seen.contains(service.get())) {
+          seen.insert(service.get());
+          addWorkerIfNotRecursiveTracer(bufferedTailWorkers, *service);
+        }
       }
       for (auto& service: channels.streamingTails) {
         addWorkerIfNotRecursiveTracer(streamingTailWorkers, *service);
@@ -3923,12 +3968,14 @@ class Server::WorkerService final: public Service,
         waitUntilTasks.add(tracer->onComplete().then(
             kj::coCapture([tailWorkers = bufferedTailWorkers.releaseAsArray()](
                               kj::Own<Trace> trace) mutable -> kj::Promise<void> {
-          for (auto& worker: tailWorkers) {
+          // Start every collector before awaiting completion, so a slow or failing tenant
+          // tail cannot prevent the host collector from receiving the same trace.
+          auto deliveries = KJ_MAP(worker, tailWorkers) {
             auto event = kj::heap<workerd::api::TraceCustomEvent>(
                 workerd::api::TraceCustomEvent::TYPE, kj::arr(kj::addRef(*trace)));
-            co_await worker->customEvent(kj::mv(event));
-          }
-          co_return;
+            return worker->customEvent(kj::mv(event)).ignoreResult();
+          };
+          co_await kj::joinPromises(kj::mv(deliveries));
         })));
       }
       workerTracer = kj::mv(tracer);
@@ -3965,7 +4012,8 @@ class Server::WorkerService final: public Service,
         kj::none,  // versionInfo
         kj::mv(triggerContext),
         false,  // isDynamicDispatch
-        kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub);
+        kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+        kj::mv(metadata.dynamicWorkerTails));
   }
 
  private:
@@ -4013,12 +4061,14 @@ class Server::WorkerService final: public Service,
         kj::Maybe<kj::StringPtr> entrypoint,
         kj::Maybe<Frankenvalue> props,
         const kj::HashSet<kj::String>& handlers,
-        Persistent persistent = Persistent::NO)
+        Persistent persistent = Persistent::NO,
+        kj::Maybe<kj::Own<WorkerStubChannel>> dynamicOwner = kj::none)
         : worker(kj::addRef(worker)),
           entrypoint(entrypoint),
           handlers(handlers),
           props(kj::mv(props)),
-          persistent(persistent) {}
+          persistent(persistent),
+          dynamicOwner(kj::mv(dynamicOwner)) {}
 
     kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
       return startRequest(kj::mv(metadata), false);
@@ -4040,6 +4090,9 @@ class Server::WorkerService final: public Service,
 
       // Figure out the self-token factory, used for restore tokens.
       if (worker->isDynamic) {
+        KJ_IF_SOME(retain, worker->retainDynamicOwner) {
+          auto owner = retain();
+        }
         // We're a dynamic worker. The only way we could have been called by anyone other than our
         // own creator is if the `ctx.restore()` mechanism was used (because otherwise, the stub
         // is not serializable and therefore could not have been shared). In this case, we would
@@ -4075,12 +4128,18 @@ class Server::WorkerService final: public Service,
         return Service::forProps(kj::mv(props), persistent);
       }
 
+      kj::Maybe<kj::Own<WorkerStubChannel>> owner;
+      KJ_IF_SOME(retain, worker->retainDynamicOwner) {
+        owner = retain();
+      }
       return kj::refcounted<EntrypointService>(
-          *worker, entrypoint, kj::mv(props), handlers, persistent);
+          *worker, entrypoint, kj::mv(props), handlers, persistent, kj::mv(owner));
     }
 
     void requireAllowsTransfer() override {
-      worker->requireAllowsTransfer();
+      // Only explicitly specialized loopback capabilities can cross the local env boundary.
+      // RPC/storage still go through getTokenMaybeSync(), which rejects dynamic services.
+      if (dynamicOwner == kj::none) worker->requireAllowsTransfer();
     }
 
     kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
@@ -4106,6 +4165,8 @@ class Server::WorkerService final: public Service,
     // - This EntrypointService was constructed from a channel token that originated from
     //   serializing a persistent EntrypointService.
     Persistent persistent;
+
+    kj::Maybe<kj::Own<WorkerStubChannel>> dynamicOwner;
 
     friend class StaticServiceSelfTokenFactory;
   };
@@ -4211,6 +4272,8 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::String> dockerPath;
   kj::Maybe<kj::String> containerEgressInterceptorImage;
   bool isDynamic;
+  bool inheritDynamicWorkerTails = false;
+  kj::Maybe<kj::Function<kj::Own<WorkerStubChannel>()>> retainDynamicOwner;
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
   kj::Maybe<kj::String> accessBlobHeaderName;
   kj::Maybe<kj::uint> accessBindingServiceChannel;
@@ -4500,6 +4563,14 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::String> name,
       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override;
 
+  kj::Own<WorkerLoaderChannel> getWorkerLoaderChannel(uint channel) override;
+  kj::Own<SubrequestChannel> wrapWorkerLoaderEntrypoint(uint factoryChannel,
+      kj::Own<SubrequestChannel> entrypoint,
+      kj::Array<kj::Own<SubrequestChannel>> tails) override;
+  kj::Own<WorkerLoaderChannel> createWorkerLoaderNamespace(
+      uint factoryChannel, kj::String name) override;
+  void revokeWorkerLoaderNamespace(uint factoryChannel, kj::String name) override;
+
   kj::Network& getWorkerdDebugPortNetwork() override {
     auto& channels =
         KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>(), "link() has not been called");
@@ -4660,8 +4731,10 @@ struct FutureActorClassChannel {
 };
 
 struct FutureWorkerLoaderChannel {
-  kj::String name;  // for error logging, not necessarily unique
   kj::Maybe<kj::String> id;
+  bool factory = false;
+  bool inheritTails = false;
+  kj::Maybe<kj::Own<IoChannelFactory::WorkerLoaderChannel>> capability;
 };
 
 static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
@@ -5011,17 +5084,22 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
 
       auto loaderConf = binding.getWorkerLoader();
 
+      if (loaderConf.getFactory() && loaderConf.getInheritTails()) {
+        errorReporter.addError(kj::str("Worker loader factories cannot inherit code tails."));
+        return kj::none;
+      }
+
       FutureWorkerLoaderChannel channel;
+      channel.factory = loaderConf.getFactory();
+      channel.inheritTails = loaderConf.getInheritTails();
       if (loaderConf.hasId()) {
-        channel.name = kj::str(loaderConf.getId());
-        channel.id = kj::str(channel.name);
-      } else {
-        channel.name = kj::str(bindingName);
+        channel.id = kj::str(loaderConf.getId());
       }
 
       uint channelNumber = workerLoaderChannels.size();
       workerLoaderChannels.add(kj::mv(channel));
-      return makeGlobal(Global::WorkerLoader{.channel = channelNumber});
+      return makeGlobal(
+          Global::WorkerLoader{.channel = channelNumber, .factory = loaderConf.getFactory()});
     }
 
     case config::Worker::Binding::WORKERD_DEBUG_PORT: {
@@ -5114,81 +5192,128 @@ struct Server::WorkerDef {
   kj::Maybe<config::ServiceDesignator::Reader> accessBindingServiceDesignator;
 };
 
-class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
+class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChannel {
  public:
-  WorkerLoaderNamespace(Server& server, kj::String namespaceName)
+  enum Mode { LOADER, FACTORY, DELEGATED };
+
+  WorkerLoaderNamespace(Server& server, Mode mode = LOADER, bool inheritTails = false)
       : server(server),
-        namespaceName(kj::mv(namespaceName)),
-        startupTasks(*this) {}
+        mode(mode),
+        inheritTails(inheritTails) {}
+
+  bool matches(Mode expected, bool tails) const {
+    return mode == expected && inheritTails == tails;
+  }
+  bool isFactory() const {
+    return mode == FACTORY;
+  }
 
   void unlink() {
     for (auto& isolate: isolates) {
       isolate.value->unlink();
     }
-  }
-
-  kj::Own<WorkerStubChannel> loadIsolate(
-      kj::Maybe<kj::String> name, kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
-    KJ_IF_SOME(n, name) {
-      return isolates
-          .findOrCreate(n,
-              [&]() -> decltype(isolates)::Entry {
-        // This name isn't actually used in any maps nor is it ever revealed back to the app, but it
-        // may be used in error logs.
-        auto isolateName = kj::str(namespaceName, ':', n);
-
-        // On abort, remove the entry from this namespace's isolates map so
-        // subsequent loadIsolate() calls with the same name will create a fresh
-        // isolate.
-        kj::Function<void()> onAborted = [this, mapKey = kj::str(n)]() { removeIsolate(mapKey); };
-
-        return {.key = kj::mv(n),
-          .value = kj::rc<WorkerStubImpl>(
-              server, kj::mv(isolateName), kj::mv(onAborted), kj::mv(fetchSource))};
-      })
-          .addRef()
-          .toOwn();
-    } else {
-      auto isolateName = kj::str(namespaceName, ":dynamic:", randomUUID(server.entropySource));
-      auto stub =
-          kj::rc<WorkerStubImpl>(server, kj::mv(isolateName), kj::none, kj::mv(fetchSource));
-      // Unnamed workers have no entry in the isolates map, so the JS-side
-      // IoOwn would be the sole owner. Retain an extra ref so that GC of the
-      // JS handle during the getCode re-entry callback cannot destroy the
-      // object while its start() coroutine is still running. The extra ref
-      // is held in a task on the namespace (NOT on the WorkerStubImpl itself)
-      // so that when the task completes and drops the ref, the destruction
-      // does not re-enter a firing Event. The named-load path is safe because
-      // the isolates map already holds an additional kj::Rc.
-      auto selfRef = stub.addRef();
-      startupTasks.add(
-          stub->whenStartupDone().then([prevent = kj::mv(selfRef)]() { /* prevent dropped here */ },
-              [](kj::Exception&&) { /* startup failed; prevent dropped here */ }));
-      return kj::mv(stub).toOwn();
+    for (auto& child: namespaces) {
+      child.value->unlink();
     }
   }
 
-  void removeIsolate(kj::StringPtr name) {
-    // This is called by abortIsolate()
-    isolates.erase(name);
+  kj::Own<IoChannelFactory::WorkerLoaderChannel> forTransfer() override {
+    JSG_FAIL_REQUIRE(DOMDataCloneError, "This WorkerLoader cannot be delegated.");
+  }
+
+  kj::Own<IoChannelFactory::WorkerLoaderChannel> createNamespace(kj::String name) {
+    JSG_REQUIRE(mode == FACTORY, Error, "This binding is not a WorkerLoader factory.");
+    JSG_REQUIRE(name.size() > 0 && name.size() <= 256, TypeError,
+        "WorkerLoader namespace keys must contain between 1 and 256 bytes.");
+    auto& child = namespaces.findOrCreate(name, [&]() -> decltype(namespaces)::Entry {
+      JSG_REQUIRE(namespaces.size() < 1024, Error, "WorkerLoader namespace capacity exceeded.");
+      return {kj::mv(name), kj::rc<WorkerLoaderNamespace>(server, DELEGATED)};
+    });
+    return kj::refcounted<DelegatedChannel>(child.addRef(), DelegatedChannel::TRANSFER_ONCE);
+  }
+
+  void revokeNamespace(kj::StringPtr name) {
+    JSG_REQUIRE(mode == FACTORY, Error, "This binding is not a WorkerLoader factory.");
+    KJ_IF_SOME(child, namespaces.find(name)) {
+      child->revoked = true;
+      // Existing requests retain their stubs and may drain. New invocations on retained
+      // capabilities fail even after the factory releases its cache ownership.
+      child->isolates.clear();
+      namespaces.erase(name);
+    }
+  }
+
+  kj::Own<WorkerStubChannel> loadIsolate(kj::Maybe<kj::String> name,
+      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override {
+    JSG_REQUIRE(mode != FACTORY, Error, "WorkerLoader factories cannot load Workers directly.");
+    JSG_REQUIRE(!revoked, Error, "WorkerLoader namespace has been revoked.");
+    kj::Rc<WorkerStubImpl> stub;
+    KJ_IF_SOME(n, name) {
+      JSG_REQUIRE(n.size() <= 1024, TypeError, "Dynamic Worker id exceeds 1024 bytes.");
+      // Reclaim before inserting: a findOrCreate callback must not mutate the same map.
+      if (isolates.find(n) == kj::none && isolates.size() >= 64) {
+        for (auto& candidate: isolates) {
+          if (candidate.value->canEvict()) {
+            isolates.erase(candidate.key);
+            break;
+          }
+        }
+        JSG_REQUIRE(isolates.size() < 64, Error, "WorkerLoader cache capacity exceeded.");
+      }
+      stub = isolates
+                 .findOrCreate(n, [&]() -> decltype(isolates)::Entry {
+        auto cacheKey = kj::str(n);
+        return {.key = kj::mv(n),
+          .value =
+              kj::rc<WorkerStubImpl>(server, kj::str("dynamic:", randomUUID(server.entropySource)),
+                  addWeakToThis(), kj::mv(cacheKey), kj::mv(fetchSource))};
+      }).addRef();
+    } else {
+      stub = kj::rc<WorkerStubImpl>(server, kj::str("dynamic:", randomUUID(server.entropySource)),
+          addWeakToThis(), kj::none, kj::mv(fetchSource));
+    }
+
+    // Keep both named and unnamed stubs alive through startup. Failure removes the named map
+    // entry, and GC or namespace revocation may otherwise release its last reference while the
+    // start coroutine is running. A server task also outlives a revoked namespace.
+    auto selfRef = stub.addRef();
+    server.tasks.add(
+        stub->whenStartupDone().then([prevent = kj::mv(selfRef)]() {}, [](kj::Exception&&) {}));
+    return IoContext::current().getDynamicWorkerLimiter()->wrap(kj::mv(stub).toOwn());
   }
 
  private:
   Server& server;
-  kj::String namespaceName;
+  Mode mode;
+  bool inheritTails;
+  bool revoked = false;
+  kj::HashMap<kj::String, kj::Rc<WorkerLoaderNamespace>> namespaces;
+
+  class DelegatedChannel final: public IoChannelFactory::WorkerLoaderChannel {
+   public:
+    enum Transfer { TRANSFER_ONCE, NO_TRANSFER };
+    DelegatedChannel(kj::Rc<WorkerLoaderNamespace> owner, Transfer transfer)
+        : owner(kj::mv(owner)),
+          transfer(transfer) {}
+
+    kj::Own<WorkerStubChannel> loadIsolate(kj::Maybe<kj::String> name,
+        kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override {
+      return owner->loadIsolate(kj::mv(name), kj::mv(fetchSource));
+    }
+
+    kj::Own<IoChannelFactory::WorkerLoaderChannel> forTransfer() override {
+      JSG_REQUIRE(transfer == TRANSFER_ONCE, DOMDataCloneError,
+          "This WorkerLoader cannot be delegated again.");
+      return kj::refcounted<DelegatedChannel>(owner.addRef(), NO_TRANSFER);
+    }
+
+   private:
+    kj::Rc<WorkerLoaderNamespace> owner;
+    Transfer transfer;
+  };
 
   class WorkerStubImpl;
   kj::HashMap<kj::String, kj::Rc<WorkerStubImpl>> isolates;
-
-  // Holds tasks that keep unnamed WorkerStubImpl instances alive while their
-  // start() coroutines are running. See the unnamed branch of loadIsolate().
-  kj::TaskSet startupTasks;
-
-  void taskFailed(kj::Exception&& exception) override {
-    // Startup failures are already handled by the WorkerStubImpl's
-    // startupTask (callers get the exception when they await the stub).
-    // Nothing to do here.
-  }
 
   class NullGlobalOutboundChannel final: public IoChannelFactory::SubrequestChannel {
    public:
@@ -5221,11 +5346,22 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
    public:
     WorkerStubImpl(Server& server,
         kj::String isolateName,
-        kj::Maybe<kj::Function<void()>> onAborted,
+        kj::WeakRc<WorkerLoaderNamespace> owner,
+        kj::Maybe<kj::String> cacheKey,
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource)
-        : onAborted(kj::mv(onAborted)),
-          startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource)).fork()),
+        : owner(kj::mv(owner)),
+          cacheKey(kj::mv(cacheKey)),
+          startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource))
+                          .catch_([this](kj::Exception&& exception) {
+                            onAbortIsolate();
+                            kj::throwRecoverableException(kj::mv(exception));
+                          })
+                          .fork()),
           cleanupTaskSet(server.tasks) {}
+
+    bool canEvict() const {
+      return service != kj::none && !isShared();
+    }
 
     // Returns a branch of the startup task promise. Used by the namespace to
     // hold an extra reference to unnamed stubs until startup completes.
@@ -5259,18 +5395,21 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
     kj::Own<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
         kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
+      JSG_REQUIRE(limits == kj::none, Error,
+          "Dynamic Worker resource limits are not supported by this runtime.");
       return kj::refcounted<SubrequestChannelImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
     }
 
     kj::Own<IoChannelFactory::ActorClassChannel> getActorClassResolved(
         kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
+      JSG_REQUIRE(limits == kj::none, Error,
+          "Dynamic Worker resource limits are not supported by this runtime.");
       return kj::refcounted<ActorClassImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
     }
 
    private:
-    // Callback to remove the worker stub from the isolates map. None for
-    // unnamed dynamic isolates.
-    kj::Maybe<kj::Function<void()>> onAborted;
+    kj::WeakRc<WorkerLoaderNamespace> owner;
+    kj::Maybe<kj::String> cacheKey;
 
     kj::Maybe<kj::Own<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;        // resolves when `service` is non-null
@@ -5279,17 +5418,38 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     bool unlinked = false;
 
     void onAbortIsolate() {
-      KJ_IF_SOME(cb, onAborted) {
-        auto callback = kj::mv(cb);
-        onAborted = kj::none;
-        callback();
+      KJ_IF_SOME(ns, owner.tryGet()) {
+        KJ_IF_SOME(key, cacheKey) {
+          KJ_IF_SOME(current, ns.isolates.find(key)) {
+            // A retained, evicted stub must never remove its replacement's cache entry.
+            if (current.get() == this) ns.isolates.erase(key);
+          }
+        }
       }
+    }
+
+    void requireActiveNamespace() {
+      KJ_IF_SOME(ns, owner.tryGet()) {
+        JSG_REQUIRE(!ns.revoked, Error, "WorkerLoader namespace has been revoked.");
+        return;
+      }
+      JSG_FAIL_REQUIRE(Error, "WorkerLoader namespace has been revoked.");
     }
 
     kj::Promise<void> start(Server& server,
         kj::String isolateName,
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
       auto source = co_await fetchSource();
+      requireActiveNamespace();
+      // Standalone has no resource budget enforcer. Reject an explicit budget before compiling
+      // the child, including an empty limits object, rather than accepting a sandbox constraint
+      // that will not be enforced. The API layer still forwards limits to other runtime hosts.
+      JSG_REQUIRE(source.limits == kj::none, Error,
+          "Dynamic Worker resource limits are not supported by this runtime.");
+      KJ_IF_SOME(ns, owner.tryGet()) {
+        JSG_REQUIRE(ns.mode != DELEGATED || source.streamingTails.size() == 0, Error,
+            "Streaming tails are not supported by delegated WorkerLoaders.");
+      }
       co_await source.ensureAllResolved();
       static const kj::HashMap<kj::String, ActorConfig> EMPTY_ACTOR_CONFIGS;
 
@@ -5297,6 +5457,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       kj::Vector<FutureSubrequestChannel> subrequestChannels;
       kj::Vector<FutureActorClassChannel> actorClassChannels;
       kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> rpcChannels;
+      kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
       source.env.rewriteCaps([&](kj::Own<Frankenvalue::CapTableEntry> entry) {
         KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*entry)) {
           uint channelNumber =
@@ -5319,6 +5480,11 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
           uint channelNumber = rpcChannels.size();
           rpcChannels.add(kj::addRef(channel));
           return kj::heap<IoChannelCapTableEntry>(IoChannelCapTableEntry::RPC, channelNumber);
+        } else KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::WorkerLoaderChannel>(*entry)) {
+          uint channelNumber = workerLoaderChannels.size();
+          workerLoaderChannels.add(FutureWorkerLoaderChannel{.capability = kj::addRef(channel)});
+          return kj::heap<IoChannelCapTableEntry>(
+              IoChannelCapTableEntry::WORKER_LOADER, channelNumber);
         } else {
           // Generally, it shouldn't be possible to get here, but just in case, let's at least
           // provide some sort of error, although it's a vague one.
@@ -5345,6 +5511,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         .subrequestChannels = kj::mv(subrequestChannels),
         .actorClassChannels = kj::mv(actorClassChannels),
         .rpcChannels = kj::mv(rpcChannels),
+        .workerLoaderChannels = kj::mv(workerLoaderChannels),
 
         .tails = KJ_MAP(tail, source.tails) -> FutureSubrequestChannel {
           return {
@@ -5381,6 +5548,17 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       auto service = co_await server.makeWorkerImpl(isolateName, kj::mv(def), {}, errorReporter);
       errorReporter.throwIfErrors();
 
+      KJ_IF_SOME(ns, owner.tryGet()) {
+        service->setInheritDynamicWorkerTails(ns.inheritTails);
+      }
+      service->setDynamicOwner([self = addWeakToThis()]() -> kj::Own<WorkerStubChannel> {
+        KJ_IF_SOME(stub, self.tryGet()) {
+          stub.requireActiveNamespace();
+          return stub.addRefToThis().toOwn();
+        }
+        JSG_FAIL_REQUIRE(Error, "Dynamic Worker is no longer available.");
+      });
+
       service->link(errorReporter);
       errorReporter.throwIfErrors();
 
@@ -5397,6 +5575,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata) override {
+        isolate->requireActiveNamespace();
         if (isolate->service == kj::none) {
           // Capture a refcounted reference rather than a raw `this` pointer so that the
           // SubrequestChannelImpl is kept alive until the startup task resolves, even if the
@@ -5458,6 +5637,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       ActorClassImpl(
           kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props)
           : isolate(kj::mv(isolate)),
+            limiter(IoContext::current().getDynamicWorkerLimiter()),
             entrypointName(kj::mv(entrypointName)),
             props(kj::mv(props)) {}
 
@@ -5471,6 +5651,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       }
 
       kj::Maybe<kj::Promise<void>> whenReady() override {
+        isolate->requireActiveNamespace();
         if (inner != kj::none) return kj::none;
 
         KJ_IF_SOME(service, isolate->service) {
@@ -5498,6 +5679,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
           kj::Maybe<rpc::Container::Client> container,
           jsg::Dict<kj::String> containerImages,
           kj::Maybe<Worker::Actor::FacetManager&> facetManager) override {
+        isolate->requireActiveNamespace();
         return getInner().newActor(tracker, kj::mv(actorId), kj::mv(makeActorCache),
             kj::mv(makeStorage), kj::mv(loopback), kj::mv(manager), kj::mv(container),
             kj::mv(containerImages), facetManager);
@@ -5505,11 +5687,16 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata, kj::Own<Worker::Actor> actor) override {
-        return getInner().startRequest(kj::mv(metadata), kj::mv(actor));
+        isolate->requireActiveNamespace();
+        auto lease = limiter->acquire(isolate.get());
+        return getInner()
+            .startRequest(kj::mv(metadata), kj::mv(actor))
+            .attach(kj::addRef(*this), kj::mv(lease));
       }
 
      private:
       kj::Rc<WorkerStubImpl> isolate;
+      kj::Rc<DynamicWorkerLimiter> limiter;
       kj::Maybe<kj::String> entrypointName;
       Frankenvalue props;  // moved away when `inner` is initialized
 
@@ -5540,6 +5727,70 @@ kj::Own<WorkerStubChannel> Server::WorkerService::loadIsolate(uint loaderChannel
   KJ_REQUIRE(loaderChannel < channels.workerLoaders.size(), "invalid worker loader channel number");
 
   return channels.workerLoaders[loaderChannel]->loadIsolate(kj::mv(name), kj::mv(fetchSource));
+}
+
+kj::Own<IoChannelFactory::WorkerLoaderChannel> Server::WorkerService::getWorkerLoaderChannel(
+    uint channel) {
+  auto& channels =
+      KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>(), "link() has not been called");
+  KJ_REQUIRE(channel < channels.workerLoaders.size(), "invalid worker loader channel number");
+  return kj::addRef(*channels.workerLoaders[channel]);
+}
+
+kj::Own<IoChannelFactory::SubrequestChannel> Server::WorkerService::wrapWorkerLoaderEntrypoint(
+    uint factoryChannel,
+    kj::Own<SubrequestChannel> entrypoint,
+    kj::Array<kj::Own<SubrequestChannel>> tails) {
+  auto channel = getWorkerLoaderChannel(factoryChannel);
+  auto& factory = JSG_REQUIRE_NONNULL(kj::tryDowncast<WorkerLoaderNamespace>(*channel), Error,
+      "This binding is not a WorkerLoader factory.");
+  JSG_REQUIRE(factory.isFactory(), Error, "This binding is not a WorkerLoader factory.");
+
+  class ObservedEntrypoint final: public SubrequestChannel {
+   public:
+    ObservedEntrypoint(
+        kj::Own<SubrequestChannel> inner, kj::Array<kj::Own<SubrequestChannel>> tails)
+        : inner(kj::mv(inner)),
+          tails(kj::mv(tails)) {}
+
+    kj::Own<WorkerInterface> startRequest(SubrequestMetadata metadata) override {
+      metadata.dynamicWorkerTails = KJ_MAP(tail, tails) { return kj::addRef(*tail); };
+      return inner->startRequest(kj::mv(metadata)).attach(kj::addRef(*this));
+    }
+
+    void requireAllowsTransfer() override {
+      throwDynamicEntrypointTransferError();
+    }
+
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+        ChannelTokenUsage usage) override {
+      throwDynamicEntrypointTransferError();
+    }
+
+   private:
+    kj::Own<SubrequestChannel> inner;
+    kj::Array<kj::Own<SubrequestChannel>> tails;
+  };
+
+  return kj::refcounted<ObservedEntrypoint>(kj::mv(entrypoint), kj::mv(tails));
+}
+
+kj::Own<IoChannelFactory::WorkerLoaderChannel> Server::WorkerService::createWorkerLoaderNamespace(
+    uint factoryChannel, kj::String name) {
+  auto channel = getWorkerLoaderChannel(factoryChannel);
+  KJ_IF_SOME(factory, kj::tryDowncast<WorkerLoaderNamespace>(*channel)) {
+    return factory.createNamespace(kj::mv(name));
+  }
+  JSG_FAIL_REQUIRE(Error, "This binding is not a WorkerLoader factory.");
+}
+
+void Server::WorkerService::revokeWorkerLoaderNamespace(uint factoryChannel, kj::String name) {
+  auto channel = getWorkerLoaderChannel(factoryChannel);
+  KJ_IF_SOME(factory, kj::tryDowncast<WorkerLoaderNamespace>(*channel)) {
+    factory.revokeNamespace(name);
+    return;
+  }
+  JSG_FAIL_REQUIRE(Error, "This binding is not a WorkerLoader factory.");
 }
 
 static MainModuleIsPython isPythonMainModule(config::Worker::Reader conf) {
@@ -6054,19 +6305,28 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
     result.streamingTails = KJ_MAP(tail, def.streamingTails) { return kj::mv(tail).lookup(*this); };
 
-    result.workerLoaders = KJ_MAP(il, def.workerLoaderChannels) {
+    result.workerLoaders =
+        KJ_MAP(il, def.workerLoaderChannels) -> kj::Own<IoChannelFactory::WorkerLoaderChannel> {
+      KJ_IF_SOME(capability, il.capability) {
+        return kj::mv(capability);
+      }
+      auto mode = il.factory ? WorkerLoaderNamespace::FACTORY : WorkerLoaderNamespace::LOADER;
       KJ_IF_SOME(id, il.id) {
-        return workerLoaderNamespaces
-            .findOrCreate(id, [&]() -> decltype(workerLoaderNamespaces)::Entry {
-          return {
-            .key = kj::mv(id),
-            .value = kj::rc<WorkerLoaderNamespace>(*this, kj::mv(il.name)),
-          };
-        }).addRef();
+        auto& ns = workerLoaderNamespaces.findOrCreate(
+            id, [&]() -> decltype(workerLoaderNamespaces)::Entry {
+          return {.key = kj::mv(id),
+            .value = kj::rc<WorkerLoaderNamespace>(*this, mode, il.inheritTails)};
+        });
+        if (!ns->matches(mode, il.inheritTails)) {
+          errorReporter.addError(
+              kj::str("Shared WorkerLoader bindings must use the same factory and tail policy."));
+        }
+        return ns.addRef().toOwn();
       } else {
         return anonymousWorkerLoaderNamespaces
-            .add(kj::rc<WorkerLoaderNamespace>(*this, kj::mv(il.name)))
-            .addRef();
+            .add(kj::rc<WorkerLoaderNamespace>(*this, mode, il.inheritTails))
+            .addRef()
+            .toOwn();
       }
     };
 

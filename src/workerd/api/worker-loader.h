@@ -59,6 +59,11 @@ class WorkerLoader: public jsg::Object {
       : channel(channel),
         compatDateValidation(compatDateValidation) {}
 
+  explicit WorkerLoader(IoOwn<IoChannelFactory::WorkerLoaderChannel> channel,
+      CompatibilityDateValidation compatDateValidation)
+      : channel(kj::mv(channel)),
+        compatDateValidation(compatDateValidation) {}
+
   struct Module {
     // Exactly one must be filled in.
     jsg::Optional<kj::String> js;               // ES module
@@ -141,6 +146,10 @@ class WorkerLoader: public jsg::Object {
   // Shortcut for `get(null, () => code)`.
   jsg::Ref<WorkerStub> load(jsg::Lock& js, WorkerCode code);
 
+  void serialize(jsg::Lock& js, jsg::Serializer& serializer);
+  static jsg::Ref<WorkerLoader> deserialize(
+      jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
+
   JSG_RESOURCE_TYPE(WorkerLoader) {
     JSG_METHOD(get);
     JSG_METHOD(load);
@@ -148,9 +157,15 @@ class WorkerLoader: public jsg::Object {
     JSG_TS_ROOT();
   }
 
+  JSG_SERIALIZABLE(rpc::SerializationTag::WORKER_LOADER);
+
  private:
-  uint channel;
+  kj::OneOf<uint, IoOwn<IoChannelFactory::WorkerLoaderChannel>> channel;
   CompatibilityDateValidation compatDateValidation;
+
+  kj::Own<WorkerStubChannel> loadIsolate(IoContext& ioctx,
+      kj::Maybe<kj::String> name,
+      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource);
 
   static DynamicWorkerSource toDynamicWorkerSource(jsg::Lock& js,
       IoContext& ioctx,
@@ -165,8 +180,33 @@ class WorkerLoader: public jsg::Object {
       Worker::Script::Source extractedSource, CompatibilityFlags::Reader compatibilityFlags);
 };
 
+// Host-only binding for minting and revoking isolated loader capabilities. It is deliberately
+// separate from WorkerLoader and cannot be transferred into a dynamic Worker's env.
+class WorkerLoaderFactory: public jsg::Object {
+ public:
+  explicit WorkerLoaderFactory(uint channel): channel(channel) {}
+
+  jsg::Ref<WorkerLoader> get(jsg::Lock& js, kj::String name);
+  void revoke(jsg::Lock& js, kj::String name);
+  jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
+      jsg::Ref<WorkerStub> stub,
+      kj::Array<jsg::Ref<Fetcher>> tails,
+      jsg::Optional<kj::Maybe<kj::String>> name,
+      jsg::Optional<WorkerStub::EntrypointOptions> options);
+
+  JSG_RESOURCE_TYPE(WorkerLoaderFactory) {
+    JSG_METHOD(get);
+    JSG_METHOD(revoke);
+    JSG_METHOD(getEntrypoint);
+  }
+
+ private:
+  uint channel;
+};
+
 #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
-      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, workerd::ResourceLimits
+      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoaderFactory,          \
+      workerd::ResourceLimits
 
 }  // namespace workerd::api

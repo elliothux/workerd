@@ -10,6 +10,7 @@
 #include <workerd/api/deferred-proxy.h>
 #include <workerd/io/access-info.h>
 #include <workerd/io/actor-id.h>
+#include <workerd/io/dynamic-worker-limiter.h>
 #include <workerd/io/external-pusher.h>
 #include <workerd/io/io-channels.h>
 #include <workerd/io/io-gate.h>
@@ -113,7 +114,8 @@ class IoContext_IncomingRequest final {
       kj::Maybe<kj::Own<BaseTracer>> workerTracer,
       kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo = kj::none,
-      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory = kj::none);
+      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory = kj::none,
+      kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails = {});
   KJ_DISALLOW_COPY_AND_MOVE(IoContext_IncomingRequest);
   ~IoContext_IncomingRequest() noexcept(false);
 
@@ -213,6 +215,7 @@ class IoContext_IncomingRequest final {
   kj::Rc<IoChannelFactory> ioChannelFactory;
   kj::Maybe<kj::Own<AccessInfo>> accessInfo;
   kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory;
+  kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails;
 
   // Root user trace span for this request. Populated during delivered() via
   // BaseTracer::makeUserRequestSpan(); otherwise a null SpanParent. The tracer it references
@@ -296,6 +299,16 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   kj::Maybe<Worker::Actor&> getActor() {
     return actor;
+  }
+
+  // Shared by every loader binding used in this caller context.
+  kj::Rc<DynamicWorkerLimiter> getDynamicWorkerLimiter();
+
+  // Follow the current incoming request, including the existing shared-IoContext actor rules.
+  kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> getDynamicWorkerTails() {
+    if (incomingRequests.empty()) return {};
+    return KJ_MAP(tail,
+        getCurrentIncomingRequest().dynamicWorkerTails) { return kj::addRef(*tail); };
   }
 
   // Gets the actor, throwing if there isn't one.
@@ -1169,6 +1182,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::Own<const Worker> worker;
   kj::Maybe<Worker::Actor&> actor;
   kj::Own<LimitEnforcer> limitEnforcer;
+  kj::Maybe<kj::Rc<DynamicWorkerLimiter>> dynamicWorkerLimiter;
 
   // List of active IncomingRequests, ordered from most-recently-started to least-recently-started.
   kj::List<IncomingRequest, &IncomingRequest::link> incomingRequests;
