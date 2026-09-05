@@ -71,7 +71,8 @@ class WorkerEntrypoint final: public WorkerInterface {
       kj::Maybe<kj::Own<AccessInfo>> accessInfo,
       kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
       Persistent fromPersistentStub,
-      kj::Maybe<kj::String> clientAddress);
+      kj::Maybe<kj::String> clientAddress,
+      kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
@@ -124,7 +125,8 @@ class WorkerEntrypoint final: public WorkerInterface {
       kj::Maybe<kj::Own<BaseTracer>> workerTracer,
       kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory);
+      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+      kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails);
 
   kj::Promise<void> requestImpl(kj::HttpMethod method,
       kj::StringPtr url,
@@ -216,7 +218,8 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
     Persistent fromPersistentStub,
-    kj::Maybe<kj::String> clientAddress) {
+    kj::Maybe<kj::String> clientAddress,
+    kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails) {
   TRACE_EVENT("workerd", "WorkerEntrypoint::construct()");
 
   // If this request came from a stored ("persistent") stub, re-verify that the target worker still
@@ -242,7 +245,8 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
       kj::mv(props), kj::mv(cfBlobJson), kj::mv(versionInfo), kj::mv(clientAddress));
   obj->init(kj::mv(worker), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
       kj::mv(ioChannelFactory), kj::addRef(*metrics), kj::mv(workerTracer),
-      kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo), kj::mv(selfTokenFactory));
+      kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo), kj::mv(selfTokenFactory),
+      kj::mv(dynamicWorkerTails));
   auto& wrapper = metrics->wrapWorkerInterface(*obj);
   return kj::attachRef(wrapper, kj::mv(obj), kj::mv(metrics));
 }
@@ -278,7 +282,8 @@ void WorkerEntrypoint::init(kj::Own<const Worker> worker,
     kj::Maybe<kj::Own<BaseTracer>> workerTracer,
     kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory) {
+    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+    kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails) {
   TRACE_EVENT("workerd", "WorkerEntrypoint::init()");
   // We need to construct the IoContext -- unless this is an actor and it already has a
   // IoContext, in which case we reuse it.
@@ -309,7 +314,7 @@ void WorkerEntrypoint::init(kj::Own<const Worker> worker,
 
   incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::mv(context), kj::mv(ioChannelFactory),
       kj::mv(metrics), kj::mv(workerTracer), kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo),
-      kj::mv(selfTokenFactory))
+      kj::mv(selfTokenFactory), kj::mv(dynamicWorkerTails))
                         .attach(kj::mv(actor));
 }
 
@@ -1136,13 +1141,15 @@ kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
     Persistent fromPersistentStub,
-    kj::Maybe<kj::String> clientAddress) {
+    kj::Maybe<kj::String> clientAddress,
+    kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> dynamicWorkerTails) {
   return WorkerEntrypoint::construct(threadContext, kj::mv(worker), kj::mv(entrypointName),
       kj::mv(props), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
       kj::mv(ioChannelFactory), kj::mv(metrics), waitUntilTasks, tunnelExceptions,
       kj::mv(workerTracer), kj::mv(cfBlobJson), kj::mv(versionInfo),
       kj::mv(maybeTriggerInvocationSpan), isDynamicDispatch, kj::mv(accessInfo),
-      kj::mv(selfTokenFactory), fromPersistentStub, kj::mv(clientAddress));
+      kj::mv(selfTokenFactory), fromPersistentStub, kj::mv(clientAddress),
+      kj::mv(dynamicWorkerTails));
 }
 
 }  // namespace workerd

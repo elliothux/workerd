@@ -1,0 +1,17 @@
+using Workerd = import "/workerd/workerd.capnp";
+const unitTests :Workerd.Config = (
+  services = [(name = "TEST_TMPDIR", disk = (writable = true)),
+    (name = "host-facets", worker = (
+    modules = [(name = "worker", esModule = embed "worker-loader-host-facets-test.js")],
+    compatibilityFlags = ["nodejs_compat", "experimental", "enable_ctx_exports"],
+    durableObjectNamespaces = [
+      (className = "Host", uniqueKey = "Host", enableSql = true),
+      (className = "StaticChild", uniqueKey = "StaticChild", enableSql = true),
+    ],
+    durableObjectStorage = (localDisk = "TEST_TMPDIR"),
+    bindings = [
+      (name = "loader", workerLoader = ()),
+      (name = "factory", workerLoader = (factory = true)),
+    ],
+  ))],
+);

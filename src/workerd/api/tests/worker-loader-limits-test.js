@@ -96,3 +96,109 @@ export let envSizeExceedsLimit = {
     });
   },
 };
+
+// Standalone must not silently accept resource budgets that it cannot enforce. The shared API
+// still accepts the dictionary and returns a synchronous stub; startup rejects its invocation.
+export let explicitCodeLimitsRejected = {
+  async test(ctrl, env, ctx) {
+    const expected = {
+      name: 'Error',
+      message:
+        'Dynamic Worker resource limits are not supported by this runtime.',
+    };
+    for (const limits of [
+      {},
+      { cpuMs: 1 },
+      { subRequests: 1 },
+      { cpuMs: 1, subRequests: 1 },
+    ]) {
+      const code = makeCode({ limits });
+      const workers = [
+        env.loader.load(code),
+        env.loader.get(null, () => code),
+        env.loader.get(`limits:${JSON.stringify(limits)}`, async () => code),
+      ];
+      for (const worker of workers) {
+        assert.strictEqual(typeof worker.getEntrypoint, 'function');
+        await assert.rejects(worker.getEntrypoint().ping(), expected);
+      }
+    }
+  },
+};
+
+export let explicitEntrypointLimitsRejected = {
+  async test(ctrl, env, ctx) {
+    const expected = {
+      name: 'Error',
+      message:
+        'Dynamic Worker resource limits are not supported by this runtime.',
+    };
+    const worker = env.loader.load(makeCode());
+    for (const limits of [
+      {},
+      { cpuMs: 1 },
+      { subRequests: 1 },
+      { cpuMs: 1, subRequests: 1 },
+    ]) {
+      assert.throws(
+        () => worker.getEntrypoint(undefined, { limits }),
+        expected
+      );
+      assert.throws(
+        () => worker.getDurableObjectClass(undefined, { limits }),
+        expected
+      );
+    }
+    // Rejecting an entrypoint option must not change the cached worker's subsequent invocations.
+    assert.strictEqual(await worker.getEntrypoint().ping(), 'pong');
+    assert.strictEqual(
+      await worker.getEntrypoint(undefined, {}).ping(),
+      'pong'
+    );
+    assert.strictEqual(
+      await worker.getEntrypoint(undefined, { limits: undefined }).ping(),
+      'pong'
+    );
+  },
+};
+
+export let omittedLimitsAndUnknownFieldsAccepted = {
+  async test(ctrl, env, ctx) {
+    const worker = env.loader.load(
+      makeCode({ limits: undefined, unknownOption: true })
+    );
+    assert.strictEqual(await worker.getEntrypoint().ping(), 'pong');
+    assert.strictEqual(
+      await worker.getEntrypoint(undefined, { unknownOption: true }).ping(),
+      'pong'
+    );
+    assert.strictEqual(
+      typeof worker.getDurableObjectClass(undefined, {}),
+      'object'
+    );
+  },
+};
+
+export let aggregateCodeSizeBoundary = {
+  async test(ctrl, env) {
+    const prefixBytes = new TextEncoder().encode(MAIN_MODULE).byteLength;
+    const data = new Uint8Array(17);
+    const text =
+      'x'.repeat(MAX_CODE_SIZE - prefixBytes - data.byteLength - 2) + 'π';
+    const modules = { 'main.js': MAIN_MODULE, text: { text }, data: { data } };
+    const worker = env.loader.load(makeCode({ modules }));
+    assert.strictEqual(await worker.getEntrypoint().ping(), 'pong');
+    const oversized = { ...modules, text: { text: text + 'x' } };
+    assert.throws(
+      () => env.loader.load(makeCode({ modules: oversized })),
+      /Dynamic Worker code size \(67108865 bytes\) exceeds/
+    );
+    await assert.rejects(
+      env.loader
+        .get(null, () => makeCode({ modules: oversized }))
+        .getEntrypoint()
+        .ping(),
+      /Dynamic Worker code size \(67108865 bytes\) exceeds/
+    );
+  },
+};

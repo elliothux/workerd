@@ -147,6 +147,8 @@ class IoChannelFactory: public virtual kj::Refcounted {
 
   // Contains metadata attached to an outgoing subrequest from a worker, independent of the type
   // of request.
+  class SubrequestChannel;
+
   struct SubrequestMetadata {
     // The `request.cf` blob, JSON-encoded.
     kj::Maybe<kj::String> cfBlobJson;
@@ -190,6 +192,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
 
     // Address of the client as IP:port on whose behalf this request is being made.
     kj::Maybe<kj::String> clientAddress;
+
+    // Process-local host collectors inherited only by dynamic workers. This is a capability,
+    // never a tenant header, serialized token, or part of the cached WorkerCode.
+    kj::Array<kj::Own<SubrequestChannel>> dynamicWorkerTails;
   };
 
   // Parameters that can influence the version of a worker that is used to serve a subrequest.
@@ -464,6 +470,59 @@ class IoChannelFactory: public virtual kj::Refcounted {
     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
   }
 
+  // Process-local authority to load Workers in one namespace. This capability can be placed in
+  // a dynamic env but has no RPC or persistent token representation. Transfer implementations
+  // may attenuate the returned capability, e.g. disallowing further delegation.
+  class WorkerLoaderChannel: public kj::Refcounted, public Frankenvalue::CapTableEntry {
+   public:
+    kj::Own<CapTableEntry> clone() override final {
+      return kj::addRef(*this);
+    }
+
+    virtual kj::Own<WorkerStubChannel> loadIsolate(kj::Maybe<kj::String> name,
+        kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) = 0;
+    virtual kj::Own<WorkerLoaderChannel> forTransfer() = 0;
+  };
+
+  // Resolve a loader received through dynamic env. The index is assigned by the host's env
+  // rewrite, never read from tenant input.
+  virtual kj::Own<WorkerLoaderChannel> getWorkerLoaderChannel(uint channel) {
+    JSG_FAIL_REQUIRE(Error, "Worker loader delegation is not supported by this runtime.");
+  }
+
+  // Host-owned facet creation, delegated only to a trusted dynamic wrapper. The class is
+  // supplied locally; no dynamic ActorClass RPC or persistent token is needed.
+  class HostFacetChannel: public kj::Refcounted, public Frankenvalue::CapTableEntry {
+   public:
+    kj::Own<CapTableEntry> clone() override final {
+      return kj::addRef(*this);
+    }
+    virtual kj::Own<ActorChannel> getFacet(
+        kj::String name, uint depth, kj::String id, kj::Own<ActorClassChannel> actorClass) = 0;
+    virtual void revoke() = 0;
+  };
+
+  virtual kj::Own<HostFacetChannel> getHostFacetChannel(uint channel) {
+    JSG_FAIL_REQUIRE(Error, "Host facet delegation is not supported by this runtime.");
+  }
+
+  // Only trusted static factory bindings can create or revoke namespaces. The returned loader
+  // can be delegated once; it does not grant access to this factory or its namespace keys.
+  virtual kj::Own<WorkerLoaderChannel> createWorkerLoaderNamespace(
+      uint factoryChannel, kj::String name) {
+    JSG_FAIL_REQUIRE(Error, "Worker loader factories are not supported by this runtime.");
+  }
+  virtual void revokeWorkerLoaderNamespace(uint factoryChannel, kj::String name) {
+    JSG_FAIL_REQUIRE(Error, "Worker loader factories are not supported by this runtime.");
+  }
+
+  // Host-only request decoration. Collector identity stays outside the cached WorkerCode.
+  virtual kj::Own<SubrequestChannel> wrapWorkerLoaderEntrypoint(uint factoryChannel,
+      kj::Own<SubrequestChannel> entrypoint,
+      kj::Array<kj::Own<SubrequestChannel>> tails) {
+    JSG_FAIL_REQUIRE(Error, "Worker loader factories are not supported by this runtime.");
+  }
+
   // Get the network for connecting to workerd debug ports.
   // This is used by the workerdDebugPort binding to connect to remote workerd instances.
   virtual kj::Network& getWorkerdDebugPortNetwork() {
@@ -630,6 +689,8 @@ class IoChannelCapTableEntry final: public Frankenvalue::CapTableEntry {
     SUBREQUEST,
     ACTOR_CLASS,
     RPC,
+    WORKER_LOADER,
+    HOST_FACETS,
   };
 
   IoChannelCapTableEntry(Type type, uint channel): type(type), channel(channel) {}
