@@ -231,6 +231,9 @@ wd_cc_library(
         ":container-client",
         ":facet-tree-index",
         ":fallback-service",
+        ":standalone-isolate-limits",
+        ":standalone-resource-limits",
+        ":thread-cpu-clock",
         ":workerd-api",
         ":workerd_capnp",
         "//src/cloudflare",
@@ -340,6 +343,59 @@ wd_cc_library(
     ],
 )
 
+wd_cc_library(
+    name = "thread-cpu-clock",
+    srcs = [
+        "thread-cpu-clock.c++",
+    ],
+    hdrs = [
+        "thread-cpu-clock.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+wd_cc_library(
+    name = "standalone-resource-limits",
+    srcs = [
+        "standalone-resource-limits.c++",
+    ],
+    hdrs = [
+        "standalone-resource-limits.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":thread-cpu-clock",
+        "//src/workerd/io",
+        "//src/workerd/jsg",
+        "//src/workerd/util:exception",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async",
+    ],
+)
+
+wd_cc_library(
+    name = "standalone-isolate-limits",
+    srcs = [
+        "standalone-isolate-limits.c++",
+    ],
+    hdrs = [
+        "standalone-isolate-limits.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":standalone-resource-limits",
+        ":thread-cpu-clock",
+        "//src/workerd/io",
+        "//src/workerd/jsg",
+        "//src/workerd/util:exception",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async",
+    ],
+)
+
 wd_capnp_library(
     src = "workerd.capnp",
     # Limit visibility to avoid accidental usage – there should be no need to use this outside of
@@ -427,6 +483,40 @@ kj_test(
     deps = [
         ":json-logger",
         "@capnp-cpp//src/capnp/compat:json",
+        "@capnp-cpp//src/kj:kj-async",
+    ],
+)
+
+kj_test(
+    src = "thread-cpu-clock-test.c++",
+    deps = [
+        ":thread-cpu-clock",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+kj_test(
+    src = "standalone-resource-limits-test.c++",
+    deps = [
+        ":server",
+        ":standalone-isolate-limits",
+        ":standalone-resource-limits",
+        ":thread-cpu-clock",
+        "//src/workerd/util:test-util",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async",
+    ],
+)
+
+kj_test(
+    src = "standalone-isolate-limits-test.c++",
+    deps = [
+        ":server",
+        ":standalone-isolate-limits",
+        ":standalone-resource-limits",
+        ":thread-cpu-clock",
+        "//src/workerd/util:test-util",
+        "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj:kj-async",
     ],
 )

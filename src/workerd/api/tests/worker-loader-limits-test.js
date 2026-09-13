@@ -25,7 +25,7 @@ function makeCode(overrides) {
   };
 }
 
-// A worker whose total module size is comfortably under the limit loads and runs fine.
+// A worker whose total (uncompressed) size is comfortably under the limit loads and runs fine.
 export let codeSizeWithinLimit = {
   async test(ctrl, env, ctx) {
     let worker = env.loader.get('codeSizeWithinLimit', () =>
@@ -97,71 +97,6 @@ export let envSizeExceedsLimit = {
   },
 };
 
-// Standalone must not silently accept resource budgets that it cannot enforce. The shared API
-// still accepts the dictionary and returns a synchronous stub; startup rejects its invocation.
-export let explicitCodeLimitsRejected = {
-  async test(ctrl, env, ctx) {
-    const expected = {
-      name: 'Error',
-      message:
-        'Dynamic Worker resource limits are not supported by this runtime.',
-    };
-    for (const limits of [
-      {},
-      { cpuMs: 1 },
-      { subRequests: 1 },
-      { cpuMs: 1, subRequests: 1 },
-    ]) {
-      const code = makeCode({ limits });
-      const workers = [
-        env.loader.load(code),
-        env.loader.get(null, () => code),
-        env.loader.get(`limits:${JSON.stringify(limits)}`, async () => code),
-      ];
-      for (const worker of workers) {
-        assert.strictEqual(typeof worker.getEntrypoint, 'function');
-        await assert.rejects(worker.getEntrypoint().ping(), expected);
-      }
-    }
-  },
-};
-
-export let explicitEntrypointLimitsRejected = {
-  async test(ctrl, env, ctx) {
-    const expected = {
-      name: 'Error',
-      message:
-        'Dynamic Worker resource limits are not supported by this runtime.',
-    };
-    const worker = env.loader.load(makeCode());
-    for (const limits of [
-      {},
-      { cpuMs: 1 },
-      { subRequests: 1 },
-      { cpuMs: 1, subRequests: 1 },
-    ]) {
-      assert.throws(
-        () => worker.getEntrypoint(undefined, { limits }),
-        expected
-      );
-      assert.throws(
-        () => worker.getDurableObjectClass(undefined, { limits }),
-        expected
-      );
-    }
-    // Rejecting an entrypoint option must not change the cached worker's subsequent invocations.
-    assert.strictEqual(await worker.getEntrypoint().ping(), 'pong');
-    assert.strictEqual(
-      await worker.getEntrypoint(undefined, {}).ping(),
-      'pong'
-    );
-    assert.strictEqual(
-      await worker.getEntrypoint(undefined, { limits: undefined }).ping(),
-      'pong'
-    );
-  },
-};
-
 export let omittedLimitsAndUnknownFieldsAccepted = {
   async test(ctrl, env, ctx) {
     const worker = env.loader.load(
@@ -200,5 +135,173 @@ export let aggregateCodeSizeBoundary = {
         .ping(),
       /Dynamic Worker code size \(67108865 bytes\) exceeds/
     );
+  },
+};
+
+// =====================================================================================
+// Native enforcement of declared Standard resource limits. Every child here uses
+// `globalOutbound: null`, so each fetch() attempt is counted as a subrequest and then fails
+// with the null-outbound error -- letting the tests observe exactly where the budget ran out
+// without any network access.
+
+const PROBE_MODULE = `
+  import {WorkerEntrypoint} from "cloudflare:workers";
+  export default class extends WorkerEntrypoint {
+    ping() { return "pong"; }
+    // Attempt count fetches; return how many failed with the null-outbound error (counted)
+    // versus the subrequest budget error (not counted, rejected before any side effect).
+    async probe(count) {
+      const outbound = [];
+      const budget = [];
+      for (let i = 0; i < count; i++) {
+        try {
+          await fetch("https://example.invalid/");
+          outbound.push(i);
+        } catch (e) {
+          if (/not permitted/i.test(e.message)) outbound.push(i);
+          else if (/Too many subrequests/i.test(e.message)) budget.push(i);
+          else budget.push("unexpected: " + e.message);
+        }
+      }
+      return { outbound: outbound.length, budget: budget.length, first: budget[0] };
+    }
+    async spin() {
+      // Busy loop that can only end through CPU-limit termination.
+      let x = 0;
+      while (true) { x = (x + 1) | 0; }
+      return x;
+    }
+  }
+`;
+
+function makeProbeCode(overrides) {
+  return makeCode({
+    mainModule: 'main.js',
+    modules: { 'main.js': PROBE_MODULE },
+    ...overrides,
+  });
+}
+
+// A declared invocation CPU budget terminates a busy loop promptly. The terminated isolate is
+// condemned: retained stubs keep failing, while a freshly loaded Worker (same immutable code)
+// starts from a clean isolate.
+export let cpuLimitTerminatesBusyLoop = {
+  async test(ctrl, env, ctx) {
+    const code = makeProbeCode({ limits: { cpuMs: 100 } });
+    const entrypoint = env.loader.load(code).getEntrypoint();
+
+    await assert.rejects(entrypoint.spin(), /cpu time limit/i);
+    // The condemned isolate never admits another invocation through retained stubs.
+    await assert.rejects(
+      entrypoint.ping(),
+      /cpu time limit|condemned|not permitted/i
+    );
+
+    // A fresh load rebuilds from the same code and runs normally.
+    assert.strictEqual(
+      await env.loader.load(code).getEntrypoint().ping(),
+      'pong'
+    );
+  },
+};
+
+// An omitted CPU budget does not terminate a bounded-but-slow computation.
+export let unlimitedCpuWithoutDeclaredLimits = {
+  async test(ctrl, env, ctx) {
+    const worker = env.loader.load(makeProbeCode());
+    const result = await worker.getEntrypoint().probe(2);
+    assert.deepStrictEqual(result, {
+      outbound: 2,
+      budget: 0,
+      first: undefined,
+    });
+  },
+};
+
+// The subrequest budget allows exactly N calls and rejects the (N+1)th before any side
+// effect: attempts zero..N-1 produce the null-outbound error, the rest "Too many
+// subrequests."
+export let subrequestBudgetEnforced = {
+  async test(ctrl, env, ctx) {
+    const worker = env.loader.load(
+      makeProbeCode({ limits: { subRequests: 3 } })
+    );
+    const result = await worker.getEntrypoint().probe(6);
+    assert.deepStrictEqual(result, { outbound: 3, budget: 3, first: 3 });
+  },
+};
+
+// Entrypoint-level limits combine per-dimension with the WorkerCode limits by minimum; an
+// omitted entrypoint value inherits the WorkerCode budget, and a larger entrypoint value can
+// never widen it.
+export let entrypointLimitsMinWithWorkerCode = {
+  async test(ctrl, env, ctx) {
+    // Omitted entrypoint limits inherit the WorkerCode budget of 3.
+    const inherit = env.loader.load(
+      makeProbeCode({ limits: { subRequests: 3 } })
+    );
+    assert.deepStrictEqual(await inherit.getEntrypoint().probe(5), {
+      outbound: 3,
+      budget: 2,
+      first: 3,
+    });
+
+    // A narrower entrypoint budget (1) wins over the WorkerCode budget (3).
+    const narrower = env.loader.load(
+      makeProbeCode({ limits: { subRequests: 3 } })
+    );
+    assert.deepStrictEqual(
+      await narrower
+        .getEntrypoint(undefined, { limits: { subRequests: 1 } })
+        .probe(5),
+      { outbound: 1, budget: 4, first: 1 }
+    );
+
+    // A wider entrypoint budget (10) cannot widen the WorkerCode budget of 3.
+    const wider = env.loader.load(
+      makeProbeCode({ limits: { subRequests: 3 } })
+    );
+    assert.deepStrictEqual(
+      await wider
+        .getEntrypoint(undefined, { limits: { subRequests: 10 } })
+        .probe(5),
+      { outbound: 3, budget: 2, first: 3 }
+    );
+  },
+};
+
+// Entrypoint-level limits fail closed when the WorkerCode declared none: there is no isolate
+// budget state to enforce against, so accepting a narrower-sounding constraint would still be
+// unlimited. The WorkerCode limits are only known once the source resolves, so the rejection
+// surfaces when the invocation starts.
+export let entrypointLimitsRequireWorkerCodeLimits = {
+  async test(ctrl, env, ctx) {
+    const worker = env.loader.load(makeProbeCode());
+    const limited = worker.getEntrypoint(undefined, { limits: { cpuMs: 100 } });
+    await assert.rejects(
+      limited.ping(),
+      /entrypoint limits require the WorkerCode to declare limits/i
+    );
+    // The worker itself remains usable.
+    assert.strictEqual(await worker.getEntrypoint().ping(), 'pong');
+  },
+};
+
+// Out-of-range limits values are rejected before the worker ever runs; the source is
+// validated asynchronously, so the rejection surfaces on the first invocation.
+export let invalidLimitValuesRejected = {
+  async test(ctrl, env, ctx) {
+    const cases = [
+      [{ cpuMs: 0 }, /cpuMs must be a positive integer/],
+      [{ cpuMs: 300001 }, /cpuMs must be at most 300000/],
+      [{ subRequests: 0 }, /subRequests must be a positive integer/],
+      [{ subRequests: 10000001 }, /subRequests must be at most 10000000/],
+    ];
+    for (const [limits, expected] of cases) {
+      const entrypoint = env.loader
+        .load(makeProbeCode({ limits }))
+        .getEntrypoint();
+      await assert.rejects(entrypoint.ping(), expected);
+    }
   },
 };
