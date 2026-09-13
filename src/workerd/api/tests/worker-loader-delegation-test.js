@@ -183,16 +183,28 @@ export const failedStartupCanRetry = {
         .value(),
       'retry'
     );
-    await assert.rejects(
-      loader
-        .get('invalid', () => ({ ...code('invalid'), limits: {} }))
+    // Empty limits declare no budgets and are accepted; out-of-range values fail closed and
+    // evict the failed isolate, so the same key can be retried with valid code.
+    assert.equal(
+      await loader
+        .get('limits-empty', () => ({ ...code('empty'), limits: {} }))
         .getEntrypoint()
         .value(),
-      /resource limits are not supported/
+      'empty'
+    );
+    await assert.rejects(
+      loader
+        .get('limits-invalid', () => ({
+          ...code('invalid'),
+          limits: { cpuMs: 0 },
+        }))
+        .getEntrypoint()
+        .value(),
+      /cpuMs must be a positive integer/
     );
     assert.equal(
       await loader
-        .get('invalid', () => code('valid'))
+        .get('limits-invalid', () => code('valid'))
         .getEntrypoint()
         .value(),
       'valid'

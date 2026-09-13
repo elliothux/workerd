@@ -194,6 +194,27 @@ class LimitEnforcer {
   // execution, such as the CPU or memory limit.
   virtual void requireLimitsNotExceeded() = 0;
 
+  // Opaque handle representing one acquired simultaneous-outbound-connection slot. Dropping
+  // it releases the slot. Enforcers hand out leases bound to their own accounting state; the
+  // caller keeps the lease only until the outbound response headers arrive.
+  class OutboundConnectionLease {
+   public:
+    virtual ~OutboundConnectionLease() noexcept(false) = default;
+  };
+
+  // Called before opening a new tunneled outbound connection (e.g. connect()) on behalf of the
+  // current invocation. Resolves with a lease once a connection slot has been acquired; the
+  // caller must not start the connection until then, and must keep the lease alive until the
+  // CONNECT response is accepted or rejected. Cancelling the returned promise releases any
+  // queued slot.
+  //
+  // The default implementation is unlimited: enforcers that do not track connections resolve
+  // immediately. This hook cannot be expressed through newSubrequest(), which counts requests,
+  // not long-lived connections.
+  virtual kj::Promise<kj::Own<OutboundConnectionLease>> newOutboundConnection() {
+    return kj::Promise<kj::Own<OutboundConnectionLease>>(kj::heap<OutboundConnectionLease>());
+  }
+
   // Report resource usage metrics to the given request metrics object.
   virtual void reportMetrics(RequestObserver& requestMetrics) = 0;
 
