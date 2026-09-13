@@ -34,6 +34,8 @@
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/facet-tree-index.h>
 #include <workerd/server/fallback-service.h>
+#include <workerd/server/standalone-isolate-limits.h>
+#include <workerd/server/standalone-resource-limits.h>
 #include <workerd/util/exception.h>
 #include <workerd/util/http-util.h>
 #include <workerd/util/mimetype.h>
@@ -276,6 +278,15 @@ class Server::Service: public IoChannelFactory::SubrequestChannel {
   virtual kj::Own<WorkerInterface> startRequest(
       IoChannelFactory::SubrequestMetadata metadata) override = 0;
 
+  // Like startRequest(), but runs the invocation under the given request limit enforcer
+  // instead of the service's default. Only meaningful for dynamic worker entrypoints reached
+  // through the Worker Loader, which carry per-invocation resource limits; the default
+  // implementation rejects, since no other service can honor a caller-supplied enforcer.
+  virtual kj::Own<WorkerInterface> startRequest(
+      IoChannelFactory::SubrequestMetadata metadata, kj::Own<LimitEnforcer> limitEnforcer) {
+    KJ_FAIL_REQUIRE("this service cannot run under a caller-supplied limit enforcer");
+  }
+
   // Returns true if the service exports the given handler, e.g. `fetch`, `scheduled`, etc.
   virtual bool hasHandler(kj::StringPtr handlerName) = 0;
 
@@ -324,6 +335,14 @@ class Server::ActorClass: public IoChannelFactory::ActorClassChannel {
   // Start a request on the actor. (The actor must have been created using newActor().)
   virtual kj::Own<WorkerInterface> startRequest(
       IoChannelFactory::SubrequestMetadata metadata, kj::Own<Worker::Actor> actor) = 0;
+
+  // Like startRequest(), but runs the invocation under the given request limit enforcer
+  // instead of the service's default. See Server::Service::startRequest() for the scope.
+  virtual kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata,
+      kj::Own<Worker::Actor> actor,
+      kj::Own<LimitEnforcer> limitEnforcer) {
+    KJ_FAIL_REQUIRE("this actor class cannot run under a caller-supplied limit enforcer");
+  }
 
   virtual kj::Own<ActorClass> forProps(Frankenvalue props, Persistent persistent) {
     KJ_FAIL_REQUIRE("can't override props for this actor class");
@@ -3499,6 +3518,8 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::String> dockerPathParam,
       kj::Maybe<kj::String> containerEgressInterceptorImageParam,
       bool isDynamic,
+      kj::Maybe<kj::Rc<StandaloneIsolateLimitState>> isolateLimitStateParam,
+      EffectiveResourceLimits requestLimitsParam,
       kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
       kj::Maybe<kj::String> accessBlobHeaderNameParam = kj::none)
       : channelTokenHandler(channelTokenHandler),
@@ -3516,6 +3537,8 @@ class Server::WorkerService final: public Service,
         dockerPath(kj::mv(dockerPathParam)),
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic),
+        isolateLimitState(kj::mv(isolateLimitStateParam)),
+        requestLimits(requestLimitsParam),
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
         accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
 
@@ -3731,6 +3754,16 @@ class Server::WorkerService final: public Service,
     return startRequest(kj::mv(metadata), kj::none, {}, kj::none, false);
   }
 
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata,
+      kj::Own<LimitEnforcer> limitEnforcer) override {
+    if (!isDynamic) {
+      metadata.restoredSelfTokenFactory =
+          kj::refcounted<StaticServiceSelfTokenFactory>(kj::addRef(*this), kj::none);
+    }
+
+    return startRequest(kj::mv(metadata), kj::none, {}, kj::none, false, kj::mv(limitEnforcer));
+  }
+
   // Get whether self-tokens should be persistent, which is the case if the
   // `allow_irrevocable_stub_storage` compat flag is set.
   Persistent selfTokensArePersistent() {
@@ -3874,7 +3907,8 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::StringPtr> entrypointName,
       Frankenvalue props,
       kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none,
-      bool isTracer = false) {
+      bool isTracer = false,
+      kj::Maybe<kj::Own<LimitEnforcer>> limitEnforcerOverride = kj::none) {
     TRACE_EVENT("workerd", "Server::WorkerService::startRequest()");
 
     KJ_IF_SOME(headerName, accessBlobHeaderName) {
@@ -3884,15 +3918,16 @@ class Server::WorkerService final: public Service,
       // constructed.
       return kj::heap<AccessHeaderExtractor>(kj::str(headerName), accessBindingServiceChannel,
           [this, metadata = kj::mv(metadata), entrypointName, props = kj::mv(props),
-              actor = kj::mv(actor), isTracer](
+              actor = kj::mv(actor), isTracer,
+              limitEnforcerOverride = kj::mv(limitEnforcerOverride)](
               kj::Maybe<kj::Own<AccessInfo>> accessInfo) mutable -> kj::Own<WorkerInterface> {
         return createEntrypoint(kj::mv(metadata), entrypointName, kj::mv(props), kj::mv(actor),
-            isTracer, kj::mv(accessInfo));
+            isTracer, kj::mv(accessInfo), kj::mv(limitEnforcerOverride));
       });
     }
 
-    return createEntrypoint(
-        kj::mv(metadata), entrypointName, kj::mv(props), kj::mv(actor), isTracer, kj::none);
+    return createEntrypoint(kj::mv(metadata), entrypointName, kj::mv(props), kj::mv(actor),
+        isTracer, kj::none, kj::mv(limitEnforcerOverride));
   }
 
   kj::Own<WorkerInterface> createEntrypoint(IoChannelFactory::SubrequestMetadata metadata,
@@ -3900,7 +3935,8 @@ class Server::WorkerService final: public Service,
       Frankenvalue props,
       kj::Maybe<kj::Own<Worker::Actor>> actor,
       bool isTracer,
-      kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
+      kj::Maybe<kj::Own<AccessInfo>> accessInfo,
+      kj::Maybe<kj::Own<LimitEnforcer>> limitEnforcerOverride = kj::none) {
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
     // Host collectors follow an invocation through dynamic workers only. A static service is
@@ -4054,6 +4090,24 @@ class Server::WorkerService final: public Service,
       }
     }
 
+    KJ_IF_SOME(enforcerOverride, limitEnforcerOverride) {
+      // Dynamic worker invocations carrying Standard resource limits run under a fresh
+      // per-invocation enforcer; the WorkerService itself never acts as a shared request
+      // counter, which would let concurrent invocations consume each other's budgets.
+      return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
+          kj::mv(props), kj::mv(actor), kj::mv(enforcerOverride), {},  // ioContextDependency
+          addRefToThis(), kj::mv(observer), waitUntilTasks,
+          true,                  // tunnelExceptions
+          kj::mv(workerTracer),  // workerTracer
+          kj::mv(metadata.cfBlobJson),
+          kj::none,  // versionInfo
+          kj::mv(triggerContext),
+          false,  // isDynamicDispatch
+          kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory),
+          metadata.fromPersistentStub, kj::mv(metadata.clientAddress),
+          kj::mv(metadata.dynamicWorkerTails));
+    }
+
     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
         kj::mv(props), kj::mv(actor),
         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
@@ -4066,8 +4120,7 @@ class Server::WorkerService final: public Service,
         kj::mv(triggerContext),
         false,  // isDynamicDispatch
         kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
-        kj::mv(metadata.clientAddress),
-        kj::mv(metadata.dynamicWorkerTails));
+        kj::mv(metadata.clientAddress), kj::mv(metadata.dynamicWorkerTails));
   }
 
  private:
@@ -4128,8 +4181,25 @@ class Server::WorkerService final: public Service,
       return startRequest(kj::mv(metadata), false);
     }
 
+    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata,
+        kj::Own<LimitEnforcer> limitEnforcer) override {
+      return startRequest(kj::mv(metadata), kj::mv(limitEnforcer), false);
+    }
+
     kj::Own<WorkerInterface> startRequest(
         IoChannelFactory::SubrequestMetadata metadata, bool isTracer) {
+      return startRequestImpl(kj::mv(metadata), kj::none, isTracer);
+    }
+
+    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata,
+        kj::Own<LimitEnforcer> limitEnforcer,
+        bool isTracer) {
+      return startRequestImpl(kj::mv(metadata), kj::mv(limitEnforcer), isTracer);
+    }
+
+    kj::Own<WorkerInterface> startRequestImpl(IoChannelFactory::SubrequestMetadata metadata,
+        kj::Maybe<kj::Own<LimitEnforcer>> limitEnforcerOverride,
+        bool isTracer) {
       Frankenvalue props;
       KJ_IF_SOME(p, this->props) {
         props = p.clone();
@@ -4163,7 +4233,8 @@ class Server::WorkerService final: public Service,
             kj::refcounted<StaticServiceSelfTokenFactory>(kj::addRef(*worker), kj::addRef(*this));
       }
 
-      return worker->startRequest(kj::mv(metadata), entrypoint, kj::mv(props), kj::none, isTracer);
+      return worker->startRequest(kj::mv(metadata), entrypoint, kj::mv(props), kj::none, isTracer,
+          kj::mv(limitEnforcerOverride));
     }
 
     bool hasHandler(kj::StringPtr handlerName) override {
@@ -4275,6 +4346,13 @@ class Server::WorkerService final: public Service,
       return service->startRequest(kj::mv(metadata), className, {}, kj::mv(actor));
     }
 
+    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata,
+        kj::Own<Worker::Actor> actor,
+        kj::Own<LimitEnforcer> limitEnforcer) override {
+      return service->startRequest(
+          kj::mv(metadata), className, {}, kj::mv(actor), false, kj::mv(limitEnforcer));
+    }
+
     kj::Own<ActorClass> forProps(Frankenvalue props, Persistent persistent) override {
       if (this->props != kj::none) {
         // This entrypoint is already specialized. Delegate to the default implementation (which
@@ -4328,6 +4406,13 @@ class Server::WorkerService final: public Service,
   bool isDynamic;
   bool inheritDynamicWorkerTails = false;
   kj::Maybe<kj::Function<kj::Own<WorkerStubChannel>()>> retainDynamicOwner;
+
+  // Present for every dynamic worker: the shared Standard isolate state (condemnation,
+  // watchdog target) and effective per-invocation request dimensions. Static workers are
+  // unlimited.
+  kj::Maybe<kj::Rc<StandaloneIsolateLimitState>> isolateLimitState;
+  EffectiveResourceLimits requestLimits;
+
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
   kj::Maybe<kj::String> accessBlobHeaderName;
   kj::Maybe<kj::uint> accessBindingServiceChannel;
@@ -5240,6 +5325,14 @@ struct Server::WorkerDef {
   // source contains a clone of the source bundle, this will take ownership.
   kj::Maybe<kj::Own<void>> maybeOwnedSourceCode;
 
+  // Present for every dynamic worker: the shared Standard state used by the isolate and
+  // request limit enforcers. Static workers are always unlimited.
+  kj::Maybe<kj::Rc<StandaloneIsolateLimitState>> isolateLimitState;
+
+  // Effective per-invocation request limits; meaningful only when `isolateLimitState` is
+  // present. Omitted dimensions are unlimited (defaults are materialized by the loader host).
+  EffectiveResourceLimits requestLimits;
+
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
@@ -5458,27 +5551,64 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
 
     kj::Own<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
         kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
-      JSG_REQUIRE(limits == kj::none, Error,
-          "Dynamic Worker resource limits are not supported by this runtime.");
-      return kj::refcounted<SubrequestChannelImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
+      // Request-time resolution applies the WorkerCode budget to every invocation; the
+      // entrypoint budget can only narrow it per dimension.
+      return kj::refcounted<SubrequestChannelImpl>(
+          addRefToThis(), kj::mv(name), kj::mv(props), validateEntrypointLimits(limits));
     }
 
     kj::Own<IoChannelFactory::ActorClassChannel> getActorClassResolved(
         kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
-      JSG_REQUIRE(limits == kj::none, Error,
-          "Dynamic Worker resource limits are not supported by this runtime.");
-      return kj::refcounted<ActorClassImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
+      return kj::refcounted<ActorClassImpl>(
+          addRefToThis(), kj::mv(name), kj::mv(props), validateEntrypointLimits(limits));
     }
 
    private:
     kj::WeakRc<WorkerLoaderNamespace> owner;
     kj::Maybe<kj::String> cacheKey;
 
+    // Every loaded Worker has the shared per-isolate state backing Standard memory, startup,
+    // simultaneous-connection, condemnation, and watchdog enforcement. Request dimensions
+    // omitted by WorkerCode remain unlimited until an entrypoint narrows them.
+    kj::Maybe<kj::Rc<StandaloneIsolateLimitState>> limitState;
+    kj::Maybe<EffectiveResourceLimits> requestLimits;
+
     kj::Maybe<kj::Own<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;        // resolves when `service` is non-null
 
     kj::TaskSet& cleanupTaskSet;
     bool unlinked = false;
+
+    // Validates the entrypoint limits DTO eagerly (range checks do not depend on startup).
+    kj::Maybe<EffectiveResourceLimits> validateEntrypointLimits(
+        const kj::Maybe<ResourceLimits>& limits) {
+      return limits.map([](const ResourceLimits& l) { return validateResourceLimits(l); });
+    }
+
+    // Resolves the invocation's request enforcer when the request starts (the WorkerCode
+    // limits are only known once the source has been fetched and validated). The WorkerCode
+    // budget applies to every invocation; a declared entrypoint budget can only narrow it.
+    kj::Maybe<kj::Own<LimitEnforcer>> newInvocationEnforcer(
+        const kj::Maybe<EffectiveResourceLimits>& entrypointLimits) {
+      KJ_IF_SOME(limits, entrypointLimits) {
+        auto effective = minEffectiveResourceLimits(KJ_ASSERT_NONNULL(requestLimits), limits);
+        return newRequestLimitEnforcer(kj::addRef(*KJ_ASSERT_NONNULL(limitState)), effective);
+      }
+      KJ_IF_SOME(state, limitState) {
+        requireNotCondemned();
+        return newRequestLimitEnforcer(kj::addRef(*state), KJ_ASSERT_NONNULL(requestLimits));
+      }
+      return kj::none;
+    }
+
+    void requireNotCondemned() {
+      KJ_IF_SOME(state, limitState) {
+        if (state->isCondemned()) {
+          kj::throwRecoverableException(state->takeCondemnedException(
+              state->violation().orDefault(StandaloneLimitViolation::CPU)));
+        }
+      }
+    }
 
     void onAbortIsolate() {
       KJ_IF_SOME(ns, owner.tryGet()) {
@@ -5504,11 +5634,16 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
       auto source = co_await fetchSource();
       requireActiveNamespace();
-      // Standalone has no resource budget enforcer. Reject an explicit budget before compiling
-      // the child, including an empty limits object, rather than accepting a sandbox constraint
-      // that will not be enforced. The API layer still forwards limits to other runtime hosts.
-      JSG_REQUIRE(source.limits == kj::none, Error,
-          "Dynamic Worker resource limits are not supported by this runtime.");
+      // Every Dynamic Worker gets the fixed Standard isolate and simultaneous-connection
+      // limits. CPU and subrequest dimensions remain absent only when neither WorkerCode nor
+      // the selected entrypoint declared them.
+      limitState = kj::rc<StandaloneIsolateLimitState>();
+      KJ_ASSERT_NONNULL(limitState)->setEvictionCallback([this]() { onAbortIsolate(); });
+      KJ_IF_SOME(limits, source.limits) {
+        requestLimits = validateResourceLimits(limits);
+      } else {
+        requestLimits = EffectiveResourceLimits{};
+      }
       KJ_IF_SOME(ns, owner.tryGet()) {
         JSG_REQUIRE(ns.mode != DELEGATED || source.streamingTails.size() == 0, Error,
             "Streaming tails are not supported by delegated WorkerLoaders.");
@@ -5607,6 +5742,10 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         // ownership issues. For the downstream use, however, we need to be careful
         // to not copy the ownContent if it is an RPC response.
         .maybeOwnedSourceCode = kj::mv(source.ownContent),
+        .isolateLimitState = limitState.map([](kj::Rc<StandaloneIsolateLimitState>& state) {
+          return kj::addRef(*state);
+        }),
+        .requestLimits = KJ_ASSERT_NONNULL(requestLimits),
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
@@ -5637,11 +5776,14 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
 
     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
      public:
-      SubrequestChannelImpl(
-          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props)
+      SubrequestChannelImpl(kj::Rc<WorkerStubImpl> isolate,
+          kj::Maybe<kj::String> entrypointName,
+          Frankenvalue props,
+          kj::Maybe<EffectiveResourceLimits> entrypointLimits)
           : isolate(kj::mv(isolate)),
             entrypointName(kj::mv(entrypointName)),
-            props(kj::mv(props)) {}
+            props(kj::mv(props)),
+            entrypointLimits(entrypointLimits) {}
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata) override {
@@ -5672,10 +5814,14 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       kj::Rc<WorkerStubImpl> isolate;
       kj::Maybe<kj::String> entrypointName;
       Frankenvalue props;  // moved away when `entrypointService` is initialized
+      kj::Maybe<EffectiveResourceLimits> entrypointLimits;
 
       kj::Maybe<kj::Own<Service>> entrypointService;
 
       kj::Own<WorkerInterface> startRequestImpl(IoChannelFactory::SubrequestMetadata metadata) {
+        // One enforcer per invocation, created here so concurrent invocations never share
+        // counters. kj::none for unlimited dynamic workers.
+        auto enforcer = isolate->newInvocationEnforcer(entrypointLimits);
         auto& service = KJ_ASSERT_NONNULL(isolate->service);
         if (entrypointService == kj::none) {
           entrypointService = service->getEntrypoint(entrypointName, kj::mv(props));
@@ -5691,6 +5837,9 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           // because it was a temporary expression), the SubrequestChannelImpl is destroyed,
           // the WorkerStubImpl refcount drops to zero, unlink() clears the WorkerService's
           // LinkedIoChannels, and the child worker's IoContext crashes accessing them.
+          KJ_IF_SOME(e, enforcer) {
+            return ep->startRequest(kj::mv(metadata), kj::mv(e)).attach(kj::addRef(*this));
+          }
           return ep->startRequest(kj::mv(metadata)).attach(kj::addRef(*this));
         } else {
           KJ_IF_SOME(en, entrypointName) {
@@ -5704,12 +5853,15 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
 
     class ActorClassImpl final: public ActorClass {
      public:
-      ActorClassImpl(
-          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props)
+      ActorClassImpl(kj::Rc<WorkerStubImpl> isolate,
+          kj::Maybe<kj::String> entrypointName,
+          Frankenvalue props,
+          kj::Maybe<EffectiveResourceLimits> entrypointLimits)
           : isolate(kj::mv(isolate)),
             limiter(IoContext::current().getDynamicWorkerLimiter()),
             entrypointName(kj::mv(entrypointName)),
-            props(kj::mv(props)) {}
+            props(kj::mv(props)),
+            entrypointLimits(entrypointLimits) {}
 
       void requireAllowsTransfer() override {
         throwDynamicEntrypointTransferError();
@@ -5759,6 +5911,12 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           IoChannelFactory::SubrequestMetadata metadata, kj::Own<Worker::Actor> actor) override {
         isolate->requireActiveNamespace();
         auto lease = limiter->acquire(isolate.get());
+        // One enforcer per invocation; kj::none for unlimited dynamic workers.
+        KJ_IF_SOME(enforcer, isolate->newInvocationEnforcer(entrypointLimits)) {
+          return getInner()
+              .startRequest(kj::mv(metadata), kj::mv(actor), kj::mv(enforcer))
+              .attach(kj::addRef(*this), kj::mv(lease));
+        }
         return getInner()
             .startRequest(kj::mv(metadata), kj::mv(actor))
             .attach(kj::addRef(*this), kj::mv(lease));
@@ -5769,6 +5927,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       kj::Rc<DynamicWorkerLimiter> limiter;
       kj::Maybe<kj::String> entrypointName;
       Frankenvalue props;  // moved away when `inner` is initialized
+      kj::Maybe<EffectiveResourceLimits> entrypointLimits;
 
       kj::Maybe<kj::Own<ActorClass>> inner;
 
@@ -6006,7 +6165,15 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
   auto observer = kj::atomicRefcounted<IsolateObserver>();
-  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  // Dynamic workers run under the standalone Standard isolate enforcer (memory + startup CPU);
+  // static platform workers keep the unlimited enforcer.
+  kj::Own<IsolateLimitEnforcer> limitEnforcer;
+  KJ_IF_SOME(state, def.isolateLimitState) {
+    limitEnforcer = kj::refcounted<StandaloneIsolateLimitEnforcer>(
+        kj::addRef(*state), StandaloneLimitWatchdog::defaultInstance());
+  } else {
+    limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  }
 
   // Create the FsMap that will be used to map known file system
   // roots to configurable locations.
@@ -6247,6 +6414,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // extracted beforehand.
   auto abortIsolateCallback = kj::mv(def.abortIsolateCallback);
   auto accessBlobHeaderName = kj::mv(def.accessBlobHeaderName);
+  auto workerServiceLimitState = def.isolateLimitState.map(
+      [](kj::Rc<StandaloneIsolateLimitState>& state) { return kj::addRef(*state); });
+  auto workerServiceRequestLimits = def.requestLimits;
 
   auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
                           Worker::ValidationErrorReporter& errorReporter) mutable {
@@ -6260,7 +6430,14 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
         def.subrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT +
         entrypointNames.size() + workerService.hasDefaultEntrypoint() + (hasAccessBinding ? 1 : 0));
 
+    bool enforceConnections = def.isDynamic;
+
     auto globalService = kj::mv(def.globalOutbound).lookup(*this);
+    if (enforceConnections) {
+      // Track the invocation's simultaneous outbound connections (Standard limit: 6, queued
+      // beyond that) on the global outbound, including fetch() traffic.
+      globalService = newConnectionAccountingChannel(kj::mv(globalService));
+    }
 
     // Bind both "next" and "null" to the global outbound. (The difference between these is a
     // legacy artifact that no one should be depending on.)
@@ -6269,7 +6446,12 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     services.add(kj::mv(globalService));
 
     for (auto& channel: def.subrequestChannels) {
-      services.add(kj::mv(channel).lookup(*this));
+      auto resolved = kj::mv(channel).lookup(*this);
+      if (enforceConnections) {
+        // Env capabilities (service bindings) can also open tunneled connections.
+        resolved = newConnectionAccountingChannel(kj::mv(resolved));
+      }
+      services.add(kj::mv(resolved));
     }
 
     // Link the ctx.exports self-referential channels. Note that it's important these are added
@@ -6388,27 +6570,34 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
     result.workerLoaders =
         KJ_MAP(il, def.workerLoaderChannels) -> kj::Own<IoChannelFactory::WorkerLoaderChannel> {
+      kj::Own<IoChannelFactory::WorkerLoaderChannel> loader;
       KJ_IF_SOME(capability, il.capability) {
-        return kj::mv(capability);
-      }
-      auto mode = il.factory ? WorkerLoaderNamespace::FACTORY : WorkerLoaderNamespace::LOADER;
-      KJ_IF_SOME(id, il.id) {
-        auto& ns = workerLoaderNamespaces.findOrCreate(
-            id, [&]() -> decltype(workerLoaderNamespaces)::Entry {
-          return {.key = kj::mv(id),
-            .value = kj::rc<WorkerLoaderNamespace>(*this, mode, il.inheritTails)};
-        });
-        if (!ns->matches(mode, il.inheritTails)) {
-          errorReporter.addError(
-              kj::str("Shared WorkerLoader bindings must use the same factory and tail policy."));
-        }
-        return ns.addRef().toOwn();
+        loader = kj::mv(capability);
       } else {
-        return anonymousWorkerLoaderNamespaces
-            .add(kj::rc<WorkerLoaderNamespace>(*this, mode, il.inheritTails))
-            .addRef()
-            .toOwn();
+        auto mode = il.factory ? WorkerLoaderNamespace::FACTORY : WorkerLoaderNamespace::LOADER;
+        KJ_IF_SOME(id, il.id) {
+          auto& ns = workerLoaderNamespaces.findOrCreate(
+              id, [&]() -> decltype(workerLoaderNamespaces)::Entry {
+            return {.key = kj::mv(id),
+              .value = kj::rc<WorkerLoaderNamespace>(*this, mode, il.inheritTails)};
+          });
+          if (!ns->matches(mode, il.inheritTails)) {
+            errorReporter.addError(
+                kj::str("Shared WorkerLoader bindings must use the same factory and tail policy."));
+          }
+          loader = ns.addRef().toOwn();
+        } else {
+          loader = anonymousWorkerLoaderNamespaces
+                       .add(kj::rc<WorkerLoaderNamespace>(*this, mode, il.inheritTails))
+                       .addRef()
+                       .toOwn();
+        }
       }
+
+      if (def.isDynamic) {
+        loader = newResourceLimitedWorkerLoaderChannel(kj::mv(loader), def.requestLimits);
+      }
+      return kj::mv(loader);
     };
 
     if (def.hasWorkerdDebugPortBinding) {
@@ -6438,13 +6627,14 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   kj::Maybe<kj::StringPtr> serviceName;
   if (!def.isDynamic) serviceName = name;
 
-  auto result = kj::refcounted<WorkerService>(channelTokenHandler, serviceName,
-      globalContext->threadContext, monotonicClock, kj::mv(worker),
-      kj::mv(errorReporter.defaultEntrypoint), kj::mv(errorReporter.namedEntrypoints),
-      kj::mv(errorReporter.actorClasses), kj::mv(linkCallback),
-      KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),
-      kj::mv(dockerPath), kj::mv(containerEgressInterceptorImage), def.isDynamic,
-      kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
+  auto result =
+      kj::refcounted<WorkerService>(channelTokenHandler, serviceName, globalContext->threadContext,
+          monotonicClock, kj::mv(worker), kj::mv(errorReporter.defaultEntrypoint),
+          kj::mv(errorReporter.namedEntrypoints), kj::mv(errorReporter.actorClasses),
+          kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors),
+          KJ_BIND_METHOD(*this, deleteAllActors), kj::mv(dockerPath),
+          kj::mv(containerEgressInterceptorImage), def.isDynamic, kj::mv(workerServiceLimitState),
+          workerServiceRequestLimits, kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
   result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;
 }

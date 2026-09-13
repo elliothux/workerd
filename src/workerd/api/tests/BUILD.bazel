@@ -1192,7 +1192,10 @@ wd_test(
     size = "large",
     src = "worker-loader-limits-test.wd-test",
     args = ["--experimental"],
-    data = ["worker-loader-limits-test.js"],
+    data = [
+        "worker-loader-limits-outbound.js",
+        "worker-loader-limits-test.js",
+    ],
 )
 
 wd_test(

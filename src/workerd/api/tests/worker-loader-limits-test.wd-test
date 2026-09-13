@@ -10,7 +10,17 @@ const unitTests :Workerd.Config = (
         compatibilityFlags = ["nodejs_compat", "experimental"],
         bindings = [
           (name = "loader", workerLoader = ()),
+          (name = "factory", workerLoader = (factory = true)),
+          (name = "outbound", service = "outbound"),
         ],
+      )
+    ),
+    ( name = "outbound",
+      worker = (
+        modules = [
+          (name = "worker", esModule = embed "worker-loader-limits-outbound.js")
+        ],
+        compatibilityFlags = ["streams_enable_constructors"],
       )
     ),
   ],
