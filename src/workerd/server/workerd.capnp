@@ -503,6 +503,10 @@ struct Worker {
       #
       # This is a workerd-only API intended for local development and testing.
 
+      hostExtensionFactory @31 :Void;
+      # A trusted host-only factory that opens operator-configured native extension sessions.
+      # Returned ports may only be transferred into a dynamic Worker's env.
+
       # TODO(someday): dispatch, other new features
     }
 

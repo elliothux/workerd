@@ -506,6 +506,36 @@ class IoChannelFactory: public virtual kj::Refcounted {
     JSG_FAIL_REQUIRE(Error, "Host facet delegation is not supported by this runtime.");
   }
 
+  // A process-local session to an operator-configured native extension. It has no token or RPC
+  // representation and can only be delegated once through a dynamic Worker's env.
+  class HostExtensionChannel: public kj::Refcounted, public Frankenvalue::CapTableEntry {
+   public:
+    struct ReadResult {
+      kj::Array<byte> payload;
+      bool eof;
+    };
+
+    class Stream: public kj::Refcounted {
+     public:
+      virtual kj::Promise<ReadResult> read(uint32_t maxBytes) = 0;
+      virtual void cancel() = 0;
+    };
+
+    kj::Own<CapTableEntry> clone() override final {
+      return kj::addRef(*this);
+    }
+    virtual kj::Promise<kj::Array<byte>> call(uint32_t method, kj::Array<byte> payload) = 0;
+    virtual kj::Promise<kj::Own<Stream>> openStream(uint32_t method, kj::Array<byte> payload) = 0;
+  };
+
+  virtual kj::Own<HostExtensionChannel> getHostExtensionChannel(uint channel) {
+    JSG_FAIL_REQUIRE(Error, "Host extensions are not supported by this runtime.");
+  }
+  virtual kj::Own<HostExtensionChannel> createHostExtensionSession(
+      uint factoryChannel, kj::String identity) {
+    JSG_FAIL_REQUIRE(Error, "Host extension factories are not supported by this runtime.");
+  }
+
   // Only trusted static factory bindings can create or revoke namespaces. The returned loader
   // can be delegated once; it does not grant access to this factory or its namespace keys.
   virtual kj::Own<WorkerLoaderChannel> createWorkerLoaderNamespace(
@@ -691,6 +721,7 @@ class IoChannelCapTableEntry final: public Frankenvalue::CapTableEntry {
     RPC,
     WORKER_LOADER,
     HOST_FACETS,
+    HOST_EXTENSION,
   };
 
   IoChannelCapTableEntry(Type type, uint channel): type(type), channel(channel) {}

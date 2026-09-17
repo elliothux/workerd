@@ -548,6 +548,10 @@ enum SerializationTag {
 
   hostFacets @19;
   # Host-only facet manager grant. One dynamic env transfer, with no RPC/storage representation.
+
+  hostExtensionPort @20;
+  # Process-local native extension session. Only supported in a dynamic env Frankenvalue; it
+  # cannot be sent over RPC or persisted as a channel token.
 }
 
 enum StreamEncoding {

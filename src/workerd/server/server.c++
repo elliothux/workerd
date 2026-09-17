@@ -23,6 +23,7 @@
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/container.capnp.h>
 #include <workerd/io/features.h>
+#include <workerd/io/host-extension.capnp.h>
 #include <workerd/io/io-context.h>
 #include <workerd/io/legacy-hibernation-manager.h>
 #include <workerd/io/limit-enforcer.h>
@@ -3480,6 +3481,201 @@ struct Server::DynamicErrorReporter final: public ErrorReporter {
   }
 };
 
+class Server::HostExtensionBroker final {
+ public:
+  HostExtensionBroker(kj::Own<kj::AsyncCapabilityStream> stream,
+      kj::LowLevelAsyncIoProvider& lowLevelProvider,
+      kj::TaskSet& tasks)
+      : stream(kj::mv(stream)),
+        lowLevelProvider(lowLevelProvider),
+        tasks(tasks) {}
+
+  kj::Promise<kj::Own<kj::AsyncCapabilityStream>> acquire(kj::String identity) {
+    KJ_REQUIRE(
+        identity.size() > 0 && identity.size() <= 128, "invalid host extension session identity");
+    auto previous = queue.addBranch();
+    auto turn = kj::newPromiseAndFulfiller<void>();
+    queue = turn.promise.fork();
+    auto result = kj::newPromiseAndFulfiller<kj::Own<kj::AsyncCapabilityStream>>();
+    // The broker stream is ordered. Keep reading this response even if the caller is canceled, or
+    // the next acquire could consume the abandoned FD and attach it to the wrong identity.
+    tasks.add(previous.then([this, identity = kj::mv(identity), done = kj::mv(turn.fulfiller),
+                                result = kj::mv(result.fulfiller)]() mutable {
+      auto frame = kj::heapArray<byte>(6 + identity.size());
+      frame[0] = 'O';
+      frame[1] = 'C';
+      frame[2] = 'H';
+      frame[3] = '1';
+      frame[4] = static_cast<byte>(identity.size() >> 8);
+      frame[5] = static_cast<byte>(identity.size());
+      frame.slice(6).copyFrom(identity.asBytes());
+      return acquireForCaller(kj::mv(frame), kj::mv(result), kj::mv(done));
+    }));
+    return kj::mv(result.promise);
+  }
+
+ private:
+  kj::Promise<void> acquireForCaller(kj::Array<byte> frame,
+      kj::Own<kj::PromiseFulfiller<kj::Own<kj::AsyncCapabilityStream>>> result,
+      kj::Own<kj::PromiseFulfiller<void>> done) {
+    KJ_DEFER(done->fulfill());
+    try {
+      auto acquired = co_await acquireOne(kj::mv(frame));
+      if (result->isWaiting()) result->fulfill(kj::mv(acquired));
+    } catch (kj::Exception& exception) {
+      if (result->isWaiting()) result->reject(kj::mv(exception));
+    }
+  }
+
+  kj::Promise<kj::Own<kj::AsyncCapabilityStream>> acquireOne(kj::Array<byte> frame) {
+    co_await stream->write(frame.asPtr());
+    byte status;
+    kj::OwnFd fd;
+    auto result = co_await stream->tryReadWithFds(&status, 1, 1, &fd, 1);
+    KJ_REQUIRE(result.byteCount == 1 && result.capCount == 1 && status == 0,
+        "invalid host extension broker response");
+    co_return lowLevelProvider.wrapUnixSocketFd(kj::mv(fd));
+  }
+
+  kj::Own<kj::AsyncCapabilityStream> stream;
+  kj::LowLevelAsyncIoProvider& lowLevelProvider;
+  kj::TaskSet& tasks;
+  kj::ForkedPromise<void> queue = kj::Promise<void>(kj::READY_NOW).fork();
+};
+
+void Server::enableHostExtensionBroker(
+    kj::Own<kj::AsyncCapabilityStream> stream, kj::LowLevelAsyncIoProvider& lowLevelProvider) {
+  KJ_REQUIRE(hostExtensionBroker == kj::none, "host extension broker already configured");
+  tasks.add(stream->whenWriteDisconnected().then(
+      []() -> kj::Promise<void> { KJ_FAIL_REQUIRE("host extension broker disconnected"); }));
+  hostExtensionBroker = kj::heap<HostExtensionBroker>(kj::mv(stream), lowLevelProvider, tasks);
+}
+
+class Server::HostExtensionSession final: public IoChannelFactory::HostExtensionChannel {
+ public:
+  HostExtensionSession(Server::HostExtensionBroker& broker, kj::String identity)
+      : broker(broker),
+        identity(kj::mv(identity)) {}
+
+  kj::Promise<kj::Array<byte>> call(uint32_t method, kj::Array<byte> payload) override {
+    // ponytail: serialize calls per port; split acquisition from RPC concurrency if extension
+    // throughput becomes material for the single-machine deployment profile.
+    auto turn = getTurn();
+    co_await turn.ready;
+    KJ_DEFER(turn.done->fulfill());
+    try {
+      if (connection == kj::none) {
+        auto stream = co_await broker.acquire(kj::str(identity));
+        connection = kj::refcounted<Connection>(kj::mv(stream));
+      }
+      auto& active = KJ_ASSERT_NONNULL(connection);
+      auto request = active->client.callRequest();
+      request.setMethod(method);
+      request.setPayload(payload);
+      auto response = co_await request.send();
+      auto result = response.getPayload();
+      KJ_REQUIRE(result.size() <= 8 * 1024 * 1024, "host extension response is too large");
+      co_return kj::heapArray<byte>(result.asBytes());
+    } catch (...) {
+      connection = kj::none;
+      throw;
+    }
+  }
+
+  kj::Promise<kj::Own<Stream>> openStream(uint32_t method, kj::Array<byte> payload) override {
+    auto turn = getTurn();
+    co_await turn.ready;
+    KJ_DEFER(turn.done->fulfill());
+    try {
+      if (connection == kj::none) {
+        auto stream = co_await broker.acquire(kj::str(identity));
+        connection = kj::refcounted<Connection>(kj::mv(stream));
+      }
+      auto active = kj::addRef(*KJ_ASSERT_NONNULL(connection));
+      auto request = active->client.openStreamRequest();
+      request.setMethod(method);
+      request.setPayload(payload);
+      auto remote = request.send().getStream();
+      co_return kj::refcounted<RemoteStream>(kj::addRef(*this), kj::mv(active), kj::mv(remote));
+    } catch (...) {
+      connection = kj::none;
+      throw;
+    }
+  }
+
+ private:
+  struct Connection: public kj::Refcounted {
+    explicit Connection(kj::Own<kj::AsyncCapabilityStream> stream)
+        : stream(kj::mv(stream)),
+          rpcSystem(*this->stream, 0),
+          client(rpcSystem.bootstrap().castAs<rpc::HostExtension>()) {}
+
+    kj::Own<kj::AsyncCapabilityStream> stream;
+    capnp::TwoPartyClient rpcSystem;
+    rpc::HostExtension::Client client;
+  };
+
+  class RemoteStream final: public Stream {
+   public:
+    RemoteStream(kj::Own<HostExtensionSession> owner,
+        kj::Own<Connection> connection,
+        rpc::HostExtensionStream::Client client)
+        : owner(kj::mv(owner)),
+          connection(kj::mv(connection)),
+          client(kj::mv(client)) {}
+
+    kj::Promise<ReadResult> read(uint32_t maxBytes) override {
+      KJ_REQUIRE(maxBytes > 0 && maxBytes <= 64 * 1024, "invalid host extension stream read size");
+      try {
+        auto request = client.readRequest();
+        request.setMaxBytes(maxBytes);
+        auto response = co_await request.send();
+        auto payload = response.getPayload();
+        KJ_REQUIRE(payload.size() <= maxBytes, "host extension stream returned an oversized chunk");
+        co_return ReadResult{
+          .payload = kj::heapArray<byte>(payload.asBytes()),
+          .eof = response.getEof(),
+        };
+      } catch (...) {
+        owner->invalidate(*connection);
+        throw;
+      }
+    }
+
+    void cancel() override {
+      client.cancelRequest().sendIgnoringResult().detach([](kj::Exception&&) {});
+    }
+
+   private:
+    kj::Own<HostExtensionSession> owner;
+    kj::Own<Connection> connection;
+    rpc::HostExtensionStream::Client client;
+  };
+
+  struct Turn {
+    kj::Promise<void> ready;
+    kj::Own<kj::PromiseFulfiller<void>> done;
+  };
+
+  Turn getTurn() {
+    auto next = kj::newPromiseAndFulfiller<void>();
+    auto ready = calls.addBranch();
+    calls = next.promise.fork();
+    return {kj::mv(ready), kj::mv(next.fulfiller)};
+  }
+
+  void invalidate(Connection& failed) {
+    KJ_IF_SOME(active, connection) {
+      if (active.get() == &failed) connection = kj::none;
+    }
+  }
+
+  Server::HostExtensionBroker& broker;
+  kj::String identity;
+  kj::Maybe<kj::Own<Connection>> connection;
+  kj::ForkedPromise<void> calls = kj::Promise<void>(kj::READY_NOW).fork();
+};
+
 class Server::WorkerService final: public Service,
                                    private kj::TaskSet::ErrorHandler,
                                    public IoChannelFactory,
@@ -3498,6 +3694,8 @@ class Server::WorkerService final: public Service,
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> streamingTails;
     kj::Array<kj::Own<IoChannelFactory::WorkerLoaderChannel>> workerLoaders;
     kj::Array<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacets;
+    kj::Array<kj::Own<IoChannelFactory::HostExtensionChannel>> hostExtensions;
+    kj::Maybe<HostExtensionBroker&> hostExtensionBroker;
     kj::Maybe<kj::Network&> workerdDebugPortNetwork;
     kj::Maybe<Server&> workerdDebugPortServer;
   };
@@ -4710,6 +4908,19 @@ class Server::WorkerService final: public Service,
     KJ_REQUIRE(channel < channels.hostFacets.size(), "invalid host facet channel number");
     return kj::addRef(*channels.hostFacets[channel]);
   }
+  kj::Own<HostExtensionChannel> getHostExtensionChannel(uint channel) override {
+    auto& channels = KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
+    KJ_REQUIRE(channel < channels.hostExtensions.size(), "invalid host extension channel number");
+    return kj::addRef(*channels.hostExtensions[channel]);
+  }
+  kj::Own<HostExtensionChannel> createHostExtensionSession(
+      uint factoryChannel, kj::String identity) override {
+    KJ_REQUIRE(factoryChannel == 0, "invalid host extension factory channel number");
+    auto& channels = KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
+    auto& broker =
+        KJ_REQUIRE_NONNULL(channels.hostExtensionBroker, "host extension broker is not configured");
+    return kj::refcounted<HostExtensionSession>(broker, kj::mv(identity));
+  }
   kj::Own<SubrequestChannel> wrapWorkerLoaderEntrypoint(uint factoryChannel,
       kj::Own<SubrequestChannel> entrypoint,
       kj::Array<kj::Own<SubrequestChannel>> tails) override;
@@ -4892,6 +5103,7 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
     kj::Vector<FutureActorClassChannel>& actorClassChannels,
     kj::Vector<FutureWorkerLoaderChannel>& workerLoaderChannels,
     bool& hasWorkerdDebugPortBinding,
+    bool& hasHostExtensionFactoryBinding,
     kj::HashMap<kj::String, kj::HashMap<kj::String, Server::ActorConfig>>& actorConfigs,
     bool experimental) {
   // creates binding object or returns null and reports an error
@@ -5114,7 +5326,7 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
         KJ_IF_SOME(global,
             createBinding(workerName, conf, innerBinding, errorReporter, subrequestChannels,
                 actorChannels, actorClassChannels, workerLoaderChannels, hasWorkerdDebugPortBinding,
-                actorConfigs, experimental)) {
+                hasHostExtensionFactoryBinding, actorConfigs, experimental)) {
           innerGlobals.add(kj::mv(global));
         } else {
           // we've already communicated the error
@@ -5259,6 +5471,15 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
       hasWorkerdDebugPortBinding = true;
       return makeGlobal(Global::WorkerdDebugPort{});
     }
+    case config::Worker::Binding::HOST_EXTENSION_FACTORY: {
+      if (!experimental) {
+        errorReporter.addError(
+            kj::str("Host extension bindings require workerd's experimental mode."));
+        return kj::none;
+      }
+      hasHostExtensionFactoryBinding = true;
+      return makeGlobal(Global::HostExtensionFactory{.channel = 0});
+    }
   }
   errorReporter.addError(kj::str(errorContext,
       "has unrecognized type. Was the config compiled with a newer version of "
@@ -5307,7 +5528,9 @@ struct Server::WorkerDef {
   kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> rpcChannels;
   kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
   bool hasWorkerdDebugPortBinding = false;
+  bool hasHostExtensionFactoryBinding = false;
   kj::Vector<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacetChannels;
+  kj::Vector<kj::Own<IoChannelFactory::HostExtensionChannel>> hostExtensionChannels;
   kj::Array<FutureSubrequestChannel> tails;
   kj::Array<FutureSubrequestChannel> streamingTails;
 
@@ -5659,6 +5882,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> rpcChannels;
       kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
       kj::Vector<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacetChannels;
+      kj::Vector<kj::Own<IoChannelFactory::HostExtensionChannel>> hostExtensionChannels;
       source.env.rewriteCaps([&](kj::Own<Frankenvalue::CapTableEntry> entry) {
         KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*entry)) {
           uint channelNumber =
@@ -5691,6 +5915,12 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           hostFacetChannels.add(kj::addRef(channel));
           return kj::heap<IoChannelCapTableEntry>(
               IoChannelCapTableEntry::HOST_FACETS, channelNumber);
+        } else KJ_IF_SOME(channel,
+            kj::tryDowncast<IoChannelFactory::HostExtensionChannel>(*entry)) {
+          uint channelNumber = hostExtensionChannels.size();
+          hostExtensionChannels.add(kj::addRef(channel));
+          return kj::heap<IoChannelCapTableEntry>(
+              IoChannelCapTableEntry::HOST_EXTENSION, channelNumber);
         } else {
           // Generally, it shouldn't be possible to get here, but just in case, let's at least
           // provide some sort of error, although it's a vague one.
@@ -5719,6 +5949,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         .rpcChannels = kj::mv(rpcChannels),
         .workerLoaderChannels = kj::mv(workerLoaderChannels),
         .hostFacetChannels = kj::mv(hostFacetChannels),
+        .hostExtensionChannels = kj::mv(hostExtensionChannels),
 
         .tails = KJ_MAP(tail, source.tails) -> FutureSubrequestChannel {
           return {
@@ -6076,14 +6307,15 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
   kj::Vector<FutureActorClassChannel> actorClassChannels;
   kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
   bool hasWorkerdDebugPortBinding = false;
+  bool hasHostExtensionFactoryBinding = false;
 
   auto confBindings = conf.getBindings();
   kj::Vector<WorkerdApi::Global> globals(confBindings.size());
   for (auto binding: confBindings) {
     KJ_IF_SOME(global,
         createBinding(name, conf, binding, errorReporter, subrequestChannels, actorChannels,
-            actorClassChannels, workerLoaderChannels, hasWorkerdDebugPortBinding, actorConfigs,
-            experimental)) {
+            actorClassChannels, workerLoaderChannels, hasWorkerdDebugPortBinding,
+            hasHostExtensionFactoryBinding, actorConfigs, experimental)) {
       globals.add(kj::mv(global));
     }
   }
@@ -6113,6 +6345,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     .actorClassChannels = kj::mv(actorClassChannels),
     .workerLoaderChannels = kj::mv(workerLoaderChannels),
     .hasWorkerdDebugPortBinding = hasWorkerdDebugPortBinding,
+    .hasHostExtensionFactoryBinding = hasHostExtensionFactoryBinding,
 
     // clang-format off
     .tails = KJ_MAP(tail, conf.getTails()) -> FutureSubrequestChannel {
@@ -6569,6 +6802,16 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
     result.streamingTails = KJ_MAP(tail, def.streamingTails) { return kj::mv(tail).lookup(*this); };
     result.hostFacets = def.hostFacetChannels.releaseAsArray();
+    result.hostExtensions = def.hostExtensionChannels.releaseAsArray();
+
+    if (def.hasHostExtensionFactoryBinding) {
+      KJ_IF_SOME(broker, hostExtensionBroker) {
+        result.hostExtensionBroker = *broker;
+      } else {
+        errorReporter.addError(
+            kj::str("Host extension factory binding requires --host-extension-fd."));
+      }
+    }
 
     result.workerLoaders =
         KJ_MAP(il, def.workerLoaderChannels) -> kj::Own<IoChannelFactory::WorkerLoaderChannel> {

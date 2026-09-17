@@ -632,6 +632,9 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         .addOptionWithArg({"control-fd"}, CLI_METHOD(enableControl), "<fd>",
             "Enable sending of control messages on descriptor <fd>. Currently this "
             "only reports the port each socket is listening on when ready.")
+        .addOptionWithArg({"host-extension-fd"}, CLI_METHOD(enableHostExtensionBroker), "<fd>",
+            "Use a private Unix capability socket on descriptor <fd> to acquire native "
+            "extension sessions.")
         .addOptionWithArg({"debug-port"}, CLI_METHOD(enableDebugPort), "<addr>",
             "Listen on the specified address for debug RPC connections. This exposes "
             "a privileged interface that allows access to all services in the process. "
@@ -893,6 +896,20 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     int fd = KJ_UNWRAP_OR(param.tryParseAs<uint>(),
         CLI_ERROR("Output value must be a file descriptor (non-negative integer)."));
     server->enableControl(fd);
+  }
+
+  void enableHostExtensionBroker(kj::StringPtr param) {
+#if _WIN32
+    (void)param;
+    CLI_ERROR("Native host extensions are not supported on Windows.");
+#else
+    int fd = KJ_UNWRAP_OR(param.tryParseAs<uint>(),
+        CLI_ERROR("Host extension value must be a file descriptor (non-negative integer)."));
+    inheritedFds.add(fd);
+    server->enableHostExtensionBroker(
+        io.lowLevelProvider->wrapUnixSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP),
+        *io.lowLevelProvider);
+#endif
   }
 
   void enableDebugPort(kj::StringPtr param) {
