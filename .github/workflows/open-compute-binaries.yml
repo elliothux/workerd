@@ -1,0 +1,61 @@
+name: Open Compute binaries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64
+            config: release_linux
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+            config: release_linux
+          - runner: macos-15
+            target: darwin-arm64
+            config: release_macos
+          - runner: macos-15
+            target: darwin-x64
+            config: release_macos_cross_x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-runner
+        with:
+          GOOGLESOURCE_COOKIE: ""
+      - name: Configure macOS linker
+        if: runner.os == 'macOS'
+        run: |
+          brew install lld
+          sudo ln -s -f "$(brew --prefix lld)/bin/ld64.lld" /usr/local/bin/ld64.lld
+          echo "build:macos --config=macos_lld_icf" >> .bazelrc
+      - name: Build
+        run: >-
+          bazel build //src/workerd/server:workerd
+          --strip=always
+          --config=${{ matrix.config }}
+          --@rules_rust//:extra_exec_rustc_flag=-Cstrip=none
+          --//:io_backend=cxx
+      - name: Record inputs
+        run: |
+          bazel --version > build-inputs.txt
+          clang --version >> build-inputs.txt 2>&1 || true
+          ld.lld --version >> build-inputs.txt 2>&1 || true
+          xcrun --show-sdk-version >> build-inputs.txt 2>&1 || true
+          bazel-bin/src/workerd/server/workerd --version >> build-inputs.txt
+          shasum -a 256 bazel-bin/src/workerd/server/workerd >> build-inputs.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workerd-${{ matrix.target }}
+          path: |
+            bazel-bin/src/workerd/server/workerd
+            build-inputs.txt
+          if-no-files-found: error
+          retention-days: 7
