@@ -750,6 +750,10 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
       }
     }
 
+    KJ_CASE_ONEOF(factory, Global::HostExtensionFactory) {
+      value = lock.wrap(context, lock.alloc<api::HostExtensionFactory>(factory.channel));
+    }
+
     KJ_CASE_ONEOF(_, Global::WorkerdDebugPort) {
       value = lock.wrap(context, lock.alloc<WorkerdDebugPortConnector>());
     }
@@ -854,6 +858,9 @@ WorkerdApi::Global WorkerdApi::Global::clone() const {
     }
     KJ_CASE_ONEOF(workerLoader, Global::WorkerLoader) {
       result.value = workerLoader.clone();
+    }
+    KJ_CASE_ONEOF(factory, Global::HostExtensionFactory) {
+      result.value = factory.clone();
     }
     KJ_CASE_ONEOF(workerdDebugPort, Global::WorkerdDebugPort) {
       result.value = workerdDebugPort.clone();

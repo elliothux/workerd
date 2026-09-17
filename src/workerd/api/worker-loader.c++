@@ -3,6 +3,7 @@
 #include <workerd/api/actor-state.h>
 #include <workerd/api/actor.h>
 #include <workerd/api/http.h>
+#include <workerd/api/streams/common.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/features.h>
 #include <workerd/io/io-context.h>
@@ -13,6 +14,61 @@
 namespace workerd::api {
 
 namespace {
+
+class HostExtensionStreamSource final: public ReadableStreamSource {
+ public:
+  explicit HostExtensionStreamSource(
+      kj::Promise<kj::Own<IoChannelFactory::HostExtensionChannel::Stream>> stream)
+      : pending(kj::mv(stream)) {}
+
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    if (eof) co_return 0;
+    if (stream == kj::none) {
+      stream = co_await kj::mv(KJ_ASSERT_NONNULL(pending));
+      pending = kj::none;
+    }
+    size_t written = 0;
+    size_t required = kj::max<size_t>(1, minBytes);
+    auto output = kj::arrayPtr(static_cast<byte*>(buffer), maxBytes);
+    while (written < required && written < maxBytes) {
+      if (remaining == 0) {
+        auto result = co_await KJ_ASSERT_NONNULL(stream)->read(1);
+        KJ_REQUIRE(result.eof && result.payload.size() == 0,
+            "host extension stream exceeded its byte limit");
+        eof = true;
+        break;
+      }
+      uint32_t requested =
+          static_cast<uint32_t>(kj::min<size_t>(64 * 1024, kj::min(maxBytes - written, remaining)));
+      auto result = co_await KJ_ASSERT_NONNULL(stream)->read(requested);
+      KJ_REQUIRE(
+          result.payload.size() <= requested, "host extension stream returned an oversized chunk");
+      KJ_REQUIRE(result.eof || result.payload.size() != 0,
+          "host extension stream returned an empty non-final chunk");
+      output.slice(written, written + result.payload.size()).copyFrom(result.payload);
+      written += result.payload.size();
+      remaining -= result.payload.size();
+      if (result.eof) {
+        eof = true;
+        break;
+      }
+    }
+    co_return written;
+  }
+
+  void cancel(kj::Exception reason) override {
+    KJ_IF_SOME(active, stream) {
+      active->cancel();
+    }
+    pending = kj::none;
+  }
+
+ private:
+  kj::Maybe<kj::Promise<kj::Own<IoChannelFactory::HostExtensionChannel::Stream>>> pending;
+  kj::Maybe<kj::Own<IoChannelFactory::HostExtensionChannel::Stream>> stream;
+  size_t remaining = 64 * 1024 * 1024;
+  bool eof = false;
+};
 
 // Maximum total (uncompressed) size of all module bodies in a dynamically-loaded Worker. This
 // mirrors the documented paid Worker uncompressed size limit (64 MB)
@@ -288,6 +344,87 @@ jsg::Ref<WorkerLoader> WorkerLoaderFactory::get(jsg::Lock& js, kj::String name) 
       ioctx.addObject(
           ioctx.getIoChannelFactory().createWorkerLoaderNamespace(channel, kj::mv(name))),
       CompatibilityDateValidation::CODE_VERSION);
+}
+
+jsg::Promise<jsg::JsRef<jsg::JsUint8Array>> HostExtensionPort::call(
+    jsg::Lock& js, uint32_t method, jsg::JsBufferSource payload) {
+  static constexpr size_t MAX_PAYLOAD = 8 * 1024 * 1024;
+  JSG_REQUIRE(payload.size() <= MAX_PAYLOAD, RangeError, "Host extension payload is too large.");
+
+  auto& ioctx = IoContext::current();
+  kj::Own<IoChannelFactory::HostExtensionChannel> capability;
+  KJ_SWITCH_ONEOF(channel) {
+    KJ_CASE_ONEOF(number, uint) {
+      capability = ioctx.getIoChannelFactory().getHostExtensionChannel(number);
+    }
+    KJ_CASE_ONEOF(local, IoOwn<IoChannelFactory::HostExtensionChannel>) {
+      capability = kj::addRef(*local);
+    }
+  }
+
+  auto bytes = kj::heapArray<byte>(payload.asArrayPtr());
+  return ioctx.awaitIo(js, capability->call(method, kj::mv(bytes)),
+      [capability = kj::mv(capability)](jsg::Lock& js, kj::Array<byte> response) mutable {
+    JSG_REQUIRE(
+        response.size() <= MAX_PAYLOAD, RangeError, "Host extension response is too large.");
+    return jsg::JsUint8Array::create(js, response.asPtr()).addRef(js);
+  });
+}
+
+JsReadableStream HostExtensionPort::stream(
+    jsg::Lock& js, uint32_t method, jsg::JsBufferSource payload) {
+  static constexpr size_t MAX_PAYLOAD = 8 * 1024 * 1024;
+  JSG_REQUIRE(payload.size() <= MAX_PAYLOAD, RangeError, "Host extension payload is too large.");
+  auto& ioctx = IoContext::current();
+  kj::Own<IoChannelFactory::HostExtensionChannel> capability;
+  KJ_SWITCH_ONEOF(channel) {
+    KJ_CASE_ONEOF(number, uint) {
+      capability = ioctx.getIoChannelFactory().getHostExtensionChannel(number);
+    }
+    KJ_CASE_ONEOF(local, IoOwn<IoChannelFactory::HostExtensionChannel>) {
+      capability = kj::addRef(*local);
+    }
+  }
+  auto bytes = kj::heapArray<byte>(payload.asArrayPtr());
+  auto opened = capability->openStream(method, kj::mv(bytes)).attach(kj::mv(capability));
+  return JsReadableStream::create(js, ioctx, kj::heap<HostExtensionStreamSource>(kj::mv(opened)));
+}
+
+void HostExtensionPort::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+  KJ_IF_SOME(handler, serializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableBuilder>(handler)) {
+      KJ_IF_SOME(local, channel.tryGet<IoOwn<IoChannelFactory::HostExtensionChannel>>()) {
+        serializer.writeRawUint32(table.add(kj::addRef(*local)));
+        return;
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(
+      DOMDataCloneError, "Host extension ports cannot be transferred again or persisted.");
+}
+
+jsg::Ref<HostExtensionPort> HostExtensionPort::deserialize(
+    jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
+  KJ_IF_SOME(handler, deserializer.getExternalHandler()) {
+    KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableReader>(handler)) {
+      auto& cap = KJ_REQUIRE_NONNULL(table.get(deserializer.readRawUint32()),
+          "serialized host extension port had invalid cap table index");
+      KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
+        return js.alloc<HostExtensionPort>(
+            channel.getChannelNumber(IoChannelCapTableEntry::HOST_EXTENSION));
+      }
+    }
+  }
+  JSG_FAIL_REQUIRE(
+      DOMDataCloneError, "Host extension ports can only be transferred into a dynamic env.");
+}
+
+jsg::Ref<HostExtensionPort> HostExtensionFactory::get(jsg::Lock& js, kj::String identity) {
+  JSG_REQUIRE(identity.size() > 0 && identity.size() <= 128, TypeError,
+      "Host extension session identity is invalid.");
+  auto& ioctx = IoContext::current();
+  return js.alloc<HostExtensionPort>(ioctx.addObject(
+      ioctx.getIoChannelFactory().createHostExtensionSession(channel, kj::mv(identity))));
 }
 
 void WorkerLoaderFactory::revoke(jsg::Lock& js, kj::String name) {

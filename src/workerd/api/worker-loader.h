@@ -1,5 +1,6 @@
 #pragma once
 
+#include <workerd/api/js-readable-stream.h>
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/io-channels.h>
@@ -235,9 +236,49 @@ class WorkerLoaderFactory: public jsg::Object {
   uint channel;
 };
 
+// A single native-extension session. It may be delegated once into a dynamic Worker's env and
+// cannot be persisted or transferred over RPC.
+class HostExtensionPort: public jsg::Object {
+ public:
+  explicit HostExtensionPort(uint channel): channel(channel) {}
+  explicit HostExtensionPort(IoOwn<IoChannelFactory::HostExtensionChannel> channel)
+      : channel(kj::mv(channel)) {}
+
+  jsg::Promise<jsg::JsRef<jsg::JsUint8Array>> call(
+      jsg::Lock& js, uint32_t method, jsg::JsBufferSource payload);
+  JsReadableStream stream(jsg::Lock& js, uint32_t method, jsg::JsBufferSource payload);
+  void serialize(jsg::Lock& js, jsg::Serializer& serializer);
+  static jsg::Ref<HostExtensionPort> deserialize(
+      jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
+
+  JSG_RESOURCE_TYPE(HostExtensionPort) {
+    JSG_METHOD(call);
+    JSG_METHOD(stream);
+  }
+  JSG_SERIALIZABLE(rpc::SerializationTag::HOST_EXTENSION_PORT);
+
+ private:
+  kj::OneOf<uint, IoOwn<IoChannelFactory::HostExtensionChannel>> channel;
+};
+
+// Host-only factory binding. Only static extension facade Workers receive this object.
+class HostExtensionFactory: public jsg::Object {
+ public:
+  explicit HostExtensionFactory(uint channel): channel(channel) {}
+
+  jsg::Ref<HostExtensionPort> get(jsg::Lock& js, kj::String identity);
+
+  JSG_RESOURCE_TYPE(HostExtensionFactory) {
+    JSG_METHOD(get);
+  }
+
+ private:
+  uint channel;
+};
+
 #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
       api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoaderFactory,          \
-      api::HostFacets, workerd::ResourceLimits
+      api::HostFacets, api::HostExtensionPort, api::HostExtensionFactory, workerd::ResourceLimits
 
 }  // namespace workerd::api

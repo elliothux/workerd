@@ -86,6 +86,36 @@ wd_cc_binary(
     ],
 )
 
+wd_cc_binary(
+    name = "host-extension-test-provider",
+    testonly = True,
+    srcs = ["host-extension-test-provider.c++"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//src/workerd/io:host-extension_capnp",
+        "//src/workerd/util:setup-async-io",
+        "@capnp-cpp//src/capnp:capnp-rpc",
+        "@capnp-cpp//src/kj:kj-async-io",
+    ],
+)
+
+kj_test(
+    src = "host-extension-test-provider-test.c++",
+    data = [":host-extension-test-provider"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//src/workerd/io:host-extension_capnp",
+        "@capnp-cpp//src/capnp:capnp-rpc",
+        "@capnp-cpp//src/kj:kj-async-io",
+    ],
+)
+
 # The CLI main()'s two backend-divergent I/O paths -- the --watch file watcher and the SIGTERM
 # graceful drain -- behind backend-agnostic entry points (workerd::server::makeFileWatcher /
 # captureSigterm / onSigterm), so workerd.c++ links them unchanged in both configs. The single

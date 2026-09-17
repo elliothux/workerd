@@ -69,6 +69,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   void enableControl(uint fd) {
     controlOverride = kj::heap<kj::FdOutputStream>(fd);
   }
+  void enableHostExtensionBroker(
+      kj::Own<kj::AsyncCapabilityStream> stream, kj::LowLevelAsyncIoProvider& lowLevelProvider);
   void enableDebugPort(kj::String addr) {
     debugPortOverride = kj::mv(addr);
   }
@@ -204,6 +206,10 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // This needs to be populated in advance of constructing any services, in order to be able to
   // correctly construct dependent services.
   kj::HashMap<kj::String, kj::HashMap<kj::String, ActorConfig>> actorConfigs;
+
+  class HostExtensionBroker;
+  class HostExtensionSession;
+  kj::Maybe<kj::Own<HostExtensionBroker>> hostExtensionBroker;
 
   kj::HashMap<kj::String, kj::Own<Service>> services;
 
