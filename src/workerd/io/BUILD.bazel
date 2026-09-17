@@ -94,6 +94,7 @@ wd_cc_library(
         ":external-pusher",
         ":features",
         ":frankenvalue",
+        ":host-extension_capnp",
         ":io-gate",
         ":io-helpers",
         ":limit-enforcer",
@@ -431,6 +432,8 @@ wd_cc_embed(
 )
 
 wd_capnp_library(src = "cdp.capnp")
+
+wd_capnp_library(src = "host-extension.capnp")
 
 wd_capnp_library(
     src = "worker-interface.capnp",

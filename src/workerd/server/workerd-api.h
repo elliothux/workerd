@@ -285,6 +285,14 @@ class WorkerdApi final: public Worker::Api {
       }
     };
 
+    struct HostExtensionFactory {
+      uint channel;
+
+      HostExtensionFactory clone() const {
+        return *this;
+      }
+    };
+
     kj::String name;
     kj::OneOf<Json,
         Fetcher,
@@ -307,6 +315,7 @@ class WorkerdApi final: public Worker::Api {
         ActorClass,
         LoopbackActorClass,
         WorkerLoader,
+        HostExtensionFactory,
         WorkerdDebugPort>
         value;
 
