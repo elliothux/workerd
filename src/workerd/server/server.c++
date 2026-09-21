@@ -4927,6 +4927,7 @@ class Server::WorkerService final: public Service,
   kj::Own<WorkerLoaderChannel> createWorkerLoaderNamespace(
       uint factoryChannel, kj::String name) override;
   void revokeWorkerLoaderNamespace(uint factoryChannel, kj::String name) override;
+  void revokeWorkerLoaderNamespacePrefix(uint factoryChannel, kj::String prefix) override;
 
   kj::Network& getWorkerdDebugPortNetwork() override {
     auto& channels =
@@ -5603,6 +5604,16 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
     JSG_REQUIRE(mode == FACTORY, Error, "This binding is not a WorkerLoader factory.");
     JSG_REQUIRE(name.size() > 0 && name.size() <= 256, TypeError,
         "WorkerLoader namespace keys must contain between 1 and 256 bytes.");
+    // ponytail: linear scan of at most 16K prefixes; index them if loader admission slows down.
+    bool prefixRevoked = false;
+    for (auto& prefix: revokedNamespacePrefixes) {
+      if (name.startsWith(prefix)) {
+        prefixRevoked = true;
+        break;
+      }
+    }
+    JSG_REQUIRE(!rejectAllNamespaces && !revokedNamespaceKeys.contains(name) && !prefixRevoked,
+        Error, "WorkerLoader namespace has been revoked.");
     auto& child = namespaces.findOrCreate(name, [&]() -> decltype(namespaces)::Entry {
       JSG_REQUIRE(namespaces.size() < 1024, Error, "WorkerLoader namespace capacity exceeded.");
       return {kj::mv(name), kj::rc<WorkerLoaderNamespace>(server, DELEGATED)};
@@ -5612,12 +5623,59 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
 
   void revokeNamespace(kj::StringPtr name) {
     JSG_REQUIRE(mode == FACTORY, Error, "This binding is not a WorkerLoader factory.");
+    JSG_REQUIRE(name.size() > 0 && name.size() <= 256, TypeError,
+        "WorkerLoader namespace keys must contain between 1 and 256 bytes.");
+    if (!rejectAllNamespaces && !revokedNamespaceKeys.contains(name)) {
+      // ponytail: bounded process-lifetime tombstones; restart workerd if 16K revocations
+      // become common enough to need persistent epoch storage.
+      if (revokedNamespaceKeys.size() + revokedNamespacePrefixes.size() >= 16384) {
+        rejectAllNamespaces = true;
+        revokedNamespaceKeys.clear();
+        revokedNamespacePrefixes.clear();
+      } else {
+        revokedNamespaceKeys.insert(kj::str(name));
+      }
+    }
     KJ_IF_SOME(child, namespaces.find(name)) {
       child->revoked = true;
-      // Existing requests retain their stubs and may drain. New invocations on retained
-      // capabilities fail even after the factory releases its cache ownership.
+      // Existing requests retain their stubs and may drain. The tombstone also prevents
+      // an already-admitted old request from recreating the same namespace after revocation.
       child->isolates.clear();
       namespaces.erase(name);
+    }
+  }
+
+  void revokeNamespacePrefix(kj::StringPtr prefix) {
+    JSG_REQUIRE(mode == FACTORY, Error, "This binding is not a WorkerLoader factory.");
+    JSG_REQUIRE(prefix.size() == 65 || prefix.size() == 82, TypeError,
+        "WorkerLoader namespace prefix is invalid.");
+    JSG_REQUIRE(prefix[64] == '/' && (prefix.size() == 65 || prefix[81] == '/'), TypeError,
+        "WorkerLoader namespace prefix is invalid.");
+    for (size_t i = 0; i < prefix.size() - 1; ++i) {
+      if (i == 64) continue;
+      JSG_REQUIRE((prefix[i] >= '0' && prefix[i] <= '9') || (prefix[i] >= 'a' && prefix[i] <= 'f'),
+          TypeError, "WorkerLoader namespace prefix is invalid.");
+    }
+    if (!rejectAllNamespaces && !revokedNamespacePrefixes.contains(prefix)) {
+      // ponytail: bounded process-lifetime tombstones; restart if 16K revocations are common.
+      if (revokedNamespacePrefixes.size() + revokedNamespaceKeys.size() >= 16384) {
+        rejectAllNamespaces = true;
+        revokedNamespacePrefixes.clear();
+        revokedNamespaceKeys.clear();
+      } else {
+        revokedNamespacePrefixes.insert(kj::str(prefix));
+      }
+    }
+    kj::Vector<kj::String> matching;
+    for (auto& entry: namespaces) {
+      if (entry.key.startsWith(prefix)) matching.add(kj::str(entry.key));
+    }
+    for (auto& key: matching) {
+      KJ_IF_SOME(child, namespaces.find(key)) {
+        child->revoked = true;
+        child->isolates.clear();
+      }
+      namespaces.erase(key);
     }
   }
 
@@ -5666,6 +5724,9 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
   bool inheritTails;
   bool revoked = false;
   kj::HashMap<kj::String, kj::Rc<WorkerLoaderNamespace>> namespaces;
+  kj::HashSet<kj::String> revokedNamespaceKeys;
+  kj::HashSet<kj::String> revokedNamespacePrefixes;
+  bool rejectAllNamespaces = false;
 
   class DelegatedChannel final: public IoChannelFactory::WorkerLoaderChannel {
    public:
@@ -5883,7 +5944,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
       kj::Vector<kj::Own<IoChannelFactory::HostFacetChannel>> hostFacetChannels;
       kj::Vector<kj::Own<IoChannelFactory::HostExtensionChannel>> hostExtensionChannels;
-      source.env.rewriteCaps([&](kj::Own<Frankenvalue::CapTableEntry> entry) {
+      auto rewriteEnvCap = [&](kj::Own<Frankenvalue::CapTableEntry> entry) {
         KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*entry)) {
           uint channelNumber =
               subrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT;
@@ -5928,7 +5989,9 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
               "Dynamic 'env' contains one or more objects that are not supported for use in "
               "'env', although they would be supported in 'props'.");
         }
-      });
+      };
+      source.env.rewriteCaps(rewriteEnvCap);
+      source.privateEnv.rewriteCaps(rewriteEnvCap);
 
       WorkerDef def{
         .featureFlags = source.compatibilityFlags,
@@ -5964,9 +6027,26 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           };
         },
 
-        .compileBindings = [env = kj::mv(source.env)](
+        .compileBindings = [env = kj::mv(source.env), privateEnv = kj::mv(source.privateEnv)](
             jsg::Lock& js, const Worker::Api& api, v8::Local<v8::Object> target) mutable {
-          env.populateJsObject(js, jsg::JsObject(target));
+          if (!privateEnv.empty()) {
+            auto importableEnv = v8::Object::New(js.v8Isolate);
+            jsg::JsObject publicBindings(importableEnv);
+            env.populateJsObject(js, publicBindings);
+            auto properties = publicBindings.getPropertyNames(js, jsg::KeyCollectionFilter::OWN_ONLY,
+                jsg::PropertyFilter::ONLY_ENUMERABLE, jsg::IndexFilter::INCLUDE_INDICES);
+            for (auto index: kj::zeroTo(properties.size())) {
+              auto property = properties.get(js, index);
+              jsg::JsObject(target).createDataProperty(
+                  js, property, publicBindings.get(js, property));
+            }
+            if (!FeatureFlags::get(js).getDisableImportableEnv()) {
+              js.setWorkerEnv(js.v8Ref(importableEnv));
+            }
+          } else {
+            env.populateJsObject(js, jsg::JsObject(target));
+          }
+          privateEnv.populateJsObject(js, jsg::JsObject(target));
         },
 
         // Note here that we always keep the ownContent from the source, even if
@@ -6250,6 +6330,16 @@ void Server::WorkerService::revokeWorkerLoaderNamespace(uint factoryChannel, kj:
   auto channel = getWorkerLoaderChannel(factoryChannel);
   KJ_IF_SOME(factory, kj::tryDowncast<WorkerLoaderNamespace>(*channel)) {
     factory.revokeNamespace(name);
+    return;
+  }
+  JSG_FAIL_REQUIRE(Error, "This binding is not a WorkerLoader factory.");
+}
+
+void Server::WorkerService::revokeWorkerLoaderNamespacePrefix(
+    uint factoryChannel, kj::String prefix) {
+  auto channel = getWorkerLoaderChannel(factoryChannel);
+  KJ_IF_SOME(factory, kj::tryDowncast<WorkerLoaderNamespace>(*channel)) {
+    factory.revokeNamespacePrefix(prefix);
     return;
   }
   JSG_FAIL_REQUIRE(Error, "This binding is not a WorkerLoader factory.");

@@ -746,7 +746,7 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
       } else {
         value = lock.wrap(context,
             lock.alloc<api::WorkerLoader>(
-                workerLoader.channel, CompatibilityDateValidation::CODE_VERSION));
+                workerLoader.channel, CompatibilityDateValidation::CODE_VERSION, true));
       }
     }
 

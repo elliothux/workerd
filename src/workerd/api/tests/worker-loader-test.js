@@ -276,6 +276,121 @@ export let passEnvCaps = {
   },
 };
 
+export let privateEnvIsNotImportable = {
+  async test(ctrl, env, ctx) {
+    const publicLoader = env.loaderFactory.get('public-private-env-test');
+    assert.throws(() => publicLoader.load({
+      compatibilityDate: '2025-01-01',
+      mainModule: 'foo.js',
+      modules: { 'foo.js': 'export default { fetch() { return new Response("ok"); } };' },
+      openComputePrivateEnv: { secret: 'forbidden' },
+    }), /host-issued WorkerLoader grant/);
+    let worker = env.loader.get('privateEnvIsNotImportable', () => ({
+      compatibilityDate: '2025-01-01',
+      mainModule: 'foo.js',
+      modules: {
+        'foo.js': `
+          import { env as importedEnv } from 'cloudflare:workers';
+          const topLevelSecret = importedEnv.secret;
+          export default {
+            async fetch(req, handlerEnv) {
+              const greeting = await handlerEnv.secret.greet('Alice');
+              return new Response(JSON.stringify({
+                greeting,
+                visible: importedEnv.visible,
+                topLevelSecret: topLevelSecret === undefined,
+                requestSecret: importedEnv.secret === undefined,
+                handlerVisible: handlerEnv.visible,
+              }));
+            },
+          };
+        `,
+      },
+      env: { visible: 'public' },
+      openComputePrivateEnv: {
+        secret: ctx.exports.GreeterLoopback({ props: { greeting: 'Hello' } }),
+      },
+    }));
+    let resp = await worker.getEntrypoint().fetch('https://example.com');
+    assert.deepStrictEqual(await resp.json(), {
+      greeting: 'Hello, Alice!',
+      visible: 'public',
+      topLevelSecret: true,
+      requestSecret: true,
+      handlerVisible: 'public',
+    });
+    worker = env.loader.get('privateEnvWithImportableEnvDisabled', () => ({
+      compatibilityDate: '2025-01-01',
+      compatibilityFlags: [
+        'disallow_importable_env',
+        'nodejs_compat',
+        'nodejs_compat_populate_process_env',
+      ],
+      mainModule: 'disabled.js',
+      modules: {
+        'disabled.js': `
+          import process from 'node:process';
+          export default {
+            fetch(req, handlerEnv) {
+              return new Response(JSON.stringify({
+                handlerVisible: handlerEnv.visible,
+                handlerSecret: handlerEnv.secret,
+                processVisible: process.env.visible,
+                processSecret: process.env.secret,
+              }));
+            },
+          };
+        `,
+      },
+      env: { visible: 'public' },
+      openComputePrivateEnv: { secret: 'private' },
+    }));
+    resp = await worker.getEntrypoint().fetch('https://example.com');
+    assert.deepStrictEqual(await resp.json(), {
+      handlerVisible: 'public',
+      handlerSecret: 'private',
+    });
+  },
+};
+
+export let privateLoaderGrantSurvivesTransfer = {
+  async test(ctrl, env) {
+    const privilegedLoader = env.loaderFactory.getPrivate('transferred-private-loader');
+    const parent = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      mainModule: 'parent.js',
+      modules: {
+        'parent.js': `export default {
+          async fetch(req, handlerEnv) {
+            let retransferDenied = false;
+            try {
+              handlerEnv.privilegedLoader.load({
+                compatibilityDate: '2025-01-01',
+                mainModule: 'forbidden.js',
+                modules: { 'forbidden.js': 'export default {};' },
+                env: { privilegedLoader: handlerEnv.privilegedLoader },
+              });
+            } catch (error) {
+              retransferDenied = error instanceof DOMException && error.name === 'DataCloneError';
+            }
+            if (!retransferDenied) throw new Error('private loader grant was retransferred');
+            const child = handlerEnv.privilegedLoader.load({
+              compatibilityDate: '2025-01-01',
+              mainModule: 'child.js',
+              modules: { 'child.js': 'export default { fetch(req, env) { return new Response(env.secret); } };' },
+              openComputePrivateEnv: { secret: 'granted' },
+            });
+            return child.getEntrypoint().fetch(req);
+          },
+        };`,
+      },
+      openComputePrivateEnv: { privilegedLoader },
+    });
+    const response = await parent.getEntrypoint().fetch('https://example.com');
+    assert.strictEqual(await response.text(), 'granted');
+  },
+};
+
 export let testOutbound = {
   async fetch(req, env, ctx) {
     return new Response('hello from testOutbound');

@@ -545,6 +545,9 @@ class IoChannelFactory: public virtual kj::Refcounted {
   virtual void revokeWorkerLoaderNamespace(uint factoryChannel, kj::String name) {
     JSG_FAIL_REQUIRE(Error, "Worker loader factories are not supported by this runtime.");
   }
+  virtual void revokeWorkerLoaderNamespacePrefix(uint factoryChannel, kj::String prefix) {
+    JSG_FAIL_REQUIRE(Error, "Worker loader factories are not supported by this runtime.");
+  }
 
   // Host-only request decoration. Collector identity stays outside the cached WorkerCode.
   virtual kj::Own<SubrequestChannel> wrapWorkerLoaderEntrypoint(uint factoryChannel,
@@ -668,6 +671,10 @@ struct DynamicWorkerSource {
   // a `Frankenvalue` (which should eventually include all binding types, RPC stubs, etc.).
   Frankenvalue env;
 
+  // Handler-only bindings for wrappers that keep transport capabilities out of
+  // the importable env. Standard WorkerCode.env remains unchanged.
+  Frankenvalue privateEnv;
+
   // Where should global fetch() (and connect()) be sent?
   kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> globalOutbound;
 
@@ -696,6 +703,7 @@ struct DynamicWorkerSource {
       .compatibilityFlags = compatibilityFlags,
       .limits = limits.map([](auto& limits) { return limits.clone(); }),
       .env = env.clone(),
+      .privateEnv = privateEnv.clone(),
       .globalOutbound = mapAddRef(globalOutbound),
       .tails = KJ_MAP(t, tails) { return kj::addRef(*t); },
       .streamingTails = KJ_MAP(t, streamingTails) { return kj::addRef(*t); },

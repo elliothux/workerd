@@ -57,14 +57,19 @@ class WorkerLoader: public jsg::Object {
   // Create a WorkerLoader backed by the given I/O channel.
   //
   // `compatDateValidation` will differ between workerd vs. production.
-  explicit WorkerLoader(uint channel, CompatibilityDateValidation compatDateValidation)
+  explicit WorkerLoader(uint channel,
+      CompatibilityDateValidation compatDateValidation,
+      bool allowOpenComputePrivateEnv = false)
       : channel(channel),
-        compatDateValidation(compatDateValidation) {}
+        compatDateValidation(compatDateValidation),
+        allowOpenComputePrivateEnv(allowOpenComputePrivateEnv) {}
 
   explicit WorkerLoader(IoOwn<IoChannelFactory::WorkerLoaderChannel> channel,
-      CompatibilityDateValidation compatDateValidation)
+      CompatibilityDateValidation compatDateValidation,
+      bool allowOpenComputePrivateEnv = false)
       : channel(kj::mv(channel)),
-        compatDateValidation(compatDateValidation) {}
+        compatDateValidation(compatDateValidation),
+        allowOpenComputePrivateEnv(allowOpenComputePrivateEnv) {}
 
   struct Module {
     // Exactly one must be filled in.
@@ -113,6 +118,10 @@ class WorkerLoader: public jsg::Object {
     // Any RPC-serializable value!
     jsg::Optional<jsg::JsRef<jsg::JsObject>> env;
 
+    // Additional bindings for the handler env only. They are not exposed through
+    // the importable cloudflare:workers env object.
+    jsg::Optional<jsg::JsRef<jsg::JsObject>> openComputePrivateEnv;
+
     // `Fetcher` (e.g. service binding) representing the loaded worker's global outbound.
     //
     // If omitted, inherit the current worker's global outbound.
@@ -133,6 +142,7 @@ class WorkerLoader: public jsg::Object {
         mainModule,
         modules,
         env,
+        openComputePrivateEnv,
         globalOutbound,
         tails,
         streamingTails);
@@ -164,6 +174,7 @@ class WorkerLoader: public jsg::Object {
  private:
   kj::OneOf<uint, IoOwn<IoChannelFactory::WorkerLoaderChannel>> channel;
   CompatibilityDateValidation compatDateValidation;
+  bool allowOpenComputePrivateEnv;
 
   kj::Own<WorkerStubChannel> loadIsolate(IoContext& ioctx,
       kj::Maybe<kj::String> name,
@@ -172,6 +183,7 @@ class WorkerLoader: public jsg::Object {
   static DynamicWorkerSource toDynamicWorkerSource(jsg::Lock& js,
       IoContext& ioctx,
       CompatibilityDateValidation compatDateValidation,
+      bool allowOpenComputePrivateEnv,
       WorkerCode code);
 
   static Worker::Script::Source extractSource(jsg::Lock& js, WorkerCode& code);
@@ -217,7 +229,9 @@ class WorkerLoaderFactory: public jsg::Object {
   explicit WorkerLoaderFactory(uint channel): channel(channel) {}
 
   jsg::Ref<WorkerLoader> get(jsg::Lock& js, kj::String name);
+  jsg::Ref<WorkerLoader> getPrivate(jsg::Lock& js, kj::String name);
   void revoke(jsg::Lock& js, kj::String name);
+  void revokePrefix(jsg::Lock& js, kj::String prefix);
   jsg::Ref<HostFacets> getFacets(jsg::Lock& js, jsg::Ref<DurableObjectFacets> facets);
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
       jsg::Ref<WorkerStub> stub,
@@ -227,7 +241,9 @@ class WorkerLoaderFactory: public jsg::Object {
 
   JSG_RESOURCE_TYPE(WorkerLoaderFactory) {
     JSG_METHOD(get);
+    JSG_METHOD(getPrivate);
     JSG_METHOD(revoke);
+    JSG_METHOD(revokePrefix);
     JSG_METHOD(getFacets);
     JSG_METHOD(getEntrypoint);
   }

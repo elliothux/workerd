@@ -329,6 +329,9 @@ kj::Promise<void> DynamicWorkerSource::ensureAllResolved() {
   KJ_IF_SOME(promise, env.resolveCaps(resolveCap)) {
     promises.add(kj::mv(promise));
   }
+  KJ_IF_SOME(promise, privateEnv.resolveCaps(resolveCap)) {
+    promises.add(kj::mv(promise));
+  }
 
   auto resolveChannelSlot = [&](kj::Own<IoChannelFactory::SubrequestChannel>& slot) {
     KJ_SWITCH_ONEOF(slot->getResolved()) {

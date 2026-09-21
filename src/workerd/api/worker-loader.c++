@@ -226,15 +226,17 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
   // WorkerStub and any entrypoint stubs in vends until they are GC'd. We don't want to create
   // a cycle where a request context holds itself open (which would block DO hibernation).
   auto reenterAndGetCode = ioctx.makeReentryCallbackWeak(
-      [getCode = kj::mv(getCode), compatDateValidation = compatDateValidation](
+      [getCode = kj::mv(getCode), compatDateValidation = compatDateValidation,
+          allowOpenComputePrivateEnv = allowOpenComputePrivateEnv](
           jsg::Lock& js, IoContext& ioctx) mutable {
     // getCode() is application-provided and may resolve its promise from a different context.
     // Binding the continuation to this context ensures that it either runs here or throws before
     // accessing the context.
     return getCode(js).then(js,
-        ioctx.addFunctor([compatDateValidation](jsg::Lock& js, IoContext& ioctx,
-                             WorkerCode code) -> DynamicWorkerSource {
-      return toDynamicWorkerSource(js, ioctx, compatDateValidation, kj::mv(code));
+        ioctx.addFunctor([compatDateValidation, allowOpenComputePrivateEnv](jsg::Lock& js,
+                             IoContext& ioctx, WorkerCode code) -> DynamicWorkerSource {
+      return toDynamicWorkerSource(
+          js, ioctx, compatDateValidation, allowOpenComputePrivateEnv, kj::mv(code));
     }));
   });
 
@@ -246,7 +248,8 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
 jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
   auto& ioctx = IoContext::current();
 
-  auto source = toDynamicWorkerSource(js, ioctx, compatDateValidation, kj::mv(code));
+  auto source = toDynamicWorkerSource(
+      js, ioctx, compatDateValidation, allowOpenComputePrivateEnv, kj::mv(code));
 
   // Annoyingly, the callback we pass to `loadIsolate()` technically may be called any number of
   // times. Yes, even though we aren't providing an ID. The runtime can actually evict the isolate
@@ -289,10 +292,12 @@ void WorkerLoader::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
           auto capability =
               IoContext::current().getIoChannelFactory().getWorkerLoaderChannel(number);
           serializer.writeRawUint32(table.add(capability->forTransfer()));
+          serializer.writeRawUint32(allowOpenComputePrivateEnv ? 1 : 0);
           return;
         }
         KJ_CASE_ONEOF(capability, IoOwn<IoChannelFactory::WorkerLoaderChannel>) {
           serializer.writeRawUint32(table.add(capability->forTransfer()));
+          serializer.writeRawUint32(allowOpenComputePrivateEnv ? 1 : 0);
           return;
         }
       }
@@ -307,10 +312,12 @@ jsg::Ref<WorkerLoader> WorkerLoader::deserialize(
     KJ_IF_SOME(table, kj::tryDowncast<Frankenvalue::CapTableReader>(handler)) {
       auto& cap = KJ_REQUIRE_NONNULL(table.get(deserializer.readRawUint32()),
           "serialized WorkerLoader had invalid cap table index");
+      auto privateFlag = deserializer.readRawUint32();
+      JSG_REQUIRE(privateFlag <= 1, DOMDataCloneError, "invalid WorkerLoader grant");
       KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
         return js.alloc<WorkerLoader>(
             channel.getChannelNumber(IoChannelCapTableEntry::WORKER_LOADER),
-            CompatibilityDateValidation::CODE_VERSION);
+            CompatibilityDateValidation::CODE_VERSION, privateFlag == 1);
       }
     }
   }
@@ -351,6 +358,14 @@ jsg::Ref<WorkerLoader> WorkerLoaderFactory::get(jsg::Lock& js, kj::String name) 
       ioctx.addObject(
           ioctx.getIoChannelFactory().createWorkerLoaderNamespace(channel, kj::mv(name))),
       CompatibilityDateValidation::CODE_VERSION);
+}
+
+jsg::Ref<WorkerLoader> WorkerLoaderFactory::getPrivate(jsg::Lock& js, kj::String name) {
+  auto& ioctx = IoContext::current();
+  return js.alloc<WorkerLoader>(
+      ioctx.addObject(
+          ioctx.getIoChannelFactory().createWorkerLoaderNamespace(channel, kj::mv(name))),
+      CompatibilityDateValidation::CODE_VERSION, true);
 }
 
 jsg::Promise<jsg::JsRef<jsg::JsUint8Array>> HostExtensionPort::call(
@@ -439,6 +454,11 @@ void WorkerLoaderFactory::revoke(jsg::Lock& js, kj::String name) {
   IoContext::current().getIoChannelFactory().revokeWorkerLoaderNamespace(channel, kj::mv(name));
 }
 
+void WorkerLoaderFactory::revokePrefix(jsg::Lock& js, kj::String prefix) {
+  IoContext::current().getIoChannelFactory().revokeWorkerLoaderNamespacePrefix(
+      channel, kj::mv(prefix));
+}
+
 jsg::Ref<Fetcher> WorkerLoaderFactory::getEntrypoint(jsg::Lock& js,
     jsg::Ref<WorkerStub> stub,
     kj::Array<jsg::Ref<Fetcher>> tails,
@@ -459,6 +479,7 @@ jsg::Ref<Fetcher> WorkerLoaderFactory::getEntrypoint(jsg::Lock& js,
 DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     IoContext& ioctx,
     CompatibilityDateValidation compatDateValidation,
+    bool allowOpenComputePrivateEnv,
     WorkerCode code) {
   auto extractedSource = extractSource(js, code);
 
@@ -509,11 +530,19 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
   Frankenvalue env;
   KJ_IF_SOME(codeEnv, code.env) {
     env = Frankenvalue::fromJs(js, codeEnv.getHandle(js));
-    auto estimate = env.estimateSize();
-    JSG_REQUIRE(estimate <= MAX_DYNAMIC_WORKER_ENV_SIZE, Error, "Dynamic Worker env size (",
-        estimate, " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_ENV_SIZE,
-        " bytes.");
   }
+  Frankenvalue privateEnv;
+  KJ_IF_SOME(codePrivateEnv, code.openComputePrivateEnv) {
+    JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
+        "Private WorkerCode bindings require a host-issued WorkerLoader grant.");
+    privateEnv = Frankenvalue::fromJs(js, codePrivateEnv.getHandle(js));
+  }
+  auto publicEstimate = env.estimateSize();
+  auto privateEstimate = privateEnv.estimateSize();
+  JSG_REQUIRE(publicEstimate <= MAX_DYNAMIC_WORKER_ENV_SIZE &&
+          privateEstimate <= MAX_DYNAMIC_WORKER_ENV_SIZE - publicEstimate,
+      Error, "Dynamic Worker env size (", publicEstimate + privateEstimate,
+      " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_ENV_SIZE, " bytes.");
 
   kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> globalOutbound;
   KJ_IF_SOME(maybeOut, code.globalOutbound) {
@@ -560,6 +589,7 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     .compatibilityFlags = compatFlags,
     .limits = code.limits,
     .env = kj::mv(env),
+    .privateEnv = kj::mv(privateEnv),
     .globalOutbound = kj::mv(globalOutbound),
     .tails = kj::mv(tailChannels),
     .streamingTails = kj::mv(streamingTailChannels),

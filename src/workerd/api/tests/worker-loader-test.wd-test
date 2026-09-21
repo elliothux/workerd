@@ -10,6 +10,7 @@ const unitTests :Workerd.Config = (
         compatibilityFlags = ["nodejs_compat","rpc","enable_ctx_exports","experimental"],
         bindings = [
           (name = "loader", workerLoader = ()),
+          (name = "loaderFactory", workerLoader = (factory = true)),
           (name = "sharedLoader1", workerLoader = (id = "shared")),
           (name = "sharedLoader2", workerLoader = (id = "shared")),
           (name = "uniqueLoader", workerLoader = (id = "nonshared")),
