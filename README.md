@@ -1,9 +1,6 @@
 <p align="center">
   <a href="https://open-compute.dev">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/logo-text-white.svg">
-      <img src="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/logo-text-black.svg" alt="open-compute" width="420">
-    </picture>
+    <img src="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/open-compute.png" alt="open-compute" width="420">
   </a>
 </p>
 
