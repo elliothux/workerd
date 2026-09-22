@@ -1,237 +1,132 @@
-# 👷 `workerd`, Cloudflare's JavaScript/Wasm Runtime
+<p align="center">
+  <a href="https://open-compute.dev">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/logo-text-white.svg">
+      <img src="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/logo-text-black.svg" alt="open-compute" width="420">
+    </picture>
+  </a>
+</p>
 
-![Banner](/docs/assets/banner.png)
+# workerd for open-compute
 
-`workerd` (pronounced: "worker-dee") is a JavaScript / Wasm server runtime based on the same code that powers [Cloudflare Workers](https://workers.dev).
+This repository is the [open-compute](https://github.com/elliothux/open-compute) fork of
+[Cloudflare workerd](https://github.com/cloudflare/workerd). It is maintained specifically as the
+native runtime used by open-compute, a self-hosted Cloudflare Workers compatible platform.
 
-You might use it:
+The fork keeps Cloudflare's workerd as its foundation and adds the native host interfaces and
+standalone runtime controls that open-compute needs. It is not a general replacement for upstream
+workerd, and its open-compute interfaces are not Cloudflare Workers APIs.
 
-* **As an application server**, to self-host applications designed for Cloudflare Workers.
-* **As a development tool**, to develop and test such code locally.
-* **As a programmable HTTP proxy** (forward or reverse), to efficiently intercept, modify, and
-  route network requests.
+## What this fork adds
 
-## Introduction
+| Area | Upstream workerd | open-compute extension |
+| --- | --- | --- |
+| Dynamic Workers | Experimental Worker Loader primitives | Host-owned loader namespaces, delegated capabilities, bounded caches, revocation, invocation accounting, tail propagation, and dynamic Durable Object facets |
+| Resource limits | Core limit interfaces and Cloudflare production integration points | Standalone enforcement for invocation CPU, subrequests, isolate memory, startup CPU, and simultaneous outbound connections |
+| Native bindings | Static capabilities configured inside workerd | Session-scoped native providers opened by a trusted host and exposed through private `HostExtensionFactory` / `HostExtensionPort` capabilities |
+| Private dynamic bindings | Public, RPC-serializable dynamic Worker environment | A handler-only private environment for one-time host capability grants, with prefix revocation and no tenant minting or onward transfer |
+| Binaries | Official workerd release artifacts | Manually triggered, source-identified binaries used by open-compute's coordinated runtime pin process |
 
-### Design Principles
+### Delegated Worker Loader namespaces
 
-* **Server-first:** Designed for servers, not CLIs nor GUIs.
+open-compute can grant a trusted system Worker an isolated `WorkerLoaderFactory`. The factory creates
+named loaders whose capabilities, cache entries, active invocations, tails, streams, and Durable
+Object facets stay inside one host-owned namespace.
 
-* **Standard-based:** Built-in APIs are based on web platform standards, such as `fetch()`.
+The fork enforces bounded namespace and cache sizes, distinguishes live references from idle cache
+entries, drains accepted work during revocation, and rejects new work after a namespace is revoked.
+These rules let open-compute load tenant code without exposing loader keys, internal routing tokens,
+or a process-wide loader authority to tenants.
 
-* **Nanoservices:** Split your application into components that are decoupled and independently-deployable like microservices, but with performance of a local function call. When one nanoservice calls another, the callee runs in the same thread and process.
+### Workers Standard resource limits
 
-* **Homogeneous deployment:** Instead of deploying different microservices to different machines in your cluster, deploy all your nanoservices to every machine in the cluster, making load balancing much easier.
+Dynamic Workers run with a native standalone limits implementation:
 
-* **Capability bindings:** `workerd` configuration uses capabilities instead of global namespaces to connect nanoservices to each other and external resources. The result is code that is more composable -- and immune to SSRF attacks.
+- per-invocation CPU accounting across JavaScript turns;
+- subrequest budgets checked before the external side effect;
+- a 128 MiB isolate heap limit and a 1 second startup CPU limit;
+- six simultaneous outbound connection slots per invocation;
+- isolate condemnation, loader-cache eviction, and clean reconstruction after a fatal limit.
 
-* **Always backwards compatible:** Updating `workerd` to a newer version will never break your JavaScript code. `workerd`'s version number is simply a date, corresponding to the maximum ["compatibility date"](https://developers.cloudflare.com/workers/platform/compatibility-dates/) supported by that version. You can always configure your worker to a past date, and `workerd` will emulate the API as it existed on that date.
+Worker code, entrypoint, and delegated child limits compose by taking the strictest value for each
+dimension, so descendants cannot widen their parent's ceiling. These limits implement the
+open-compute Standard profile; Cloudflare's hosted scheduling, billing, analytics, and fleet
+placement remain outside this repository.
 
-[Read the blog post to learn more about these principles.](https://blog.cloudflare.com/workerd-open-source-workers-runtime/)
+### User-extensible native host bindings
 
-### WARNING: `workerd` is not a hardened sandbox
+The fork provides a narrow data plane between workerd and an operator-owned native process. A
+trusted host opens a session through an inherited Unix broker FD, then workerd communicates directly
+with that provider through a session-scoped Cap'n Proto capability.
 
-`workerd` tries to isolate each Worker so that it can only access the resources it is configured to access. However, `workerd` on its own does not contain suitable defense-in-depth against the possibility of implementation bugs. When using `workerd` to run possibly-malicious code, you must run it inside an appropriate secure sandbox, such as a virtual machine. The Cloudflare Workers hosting service in particular [uses many additional layers of defense-in-depth](https://blog.cloudflare.com/mitigating-spectre-and-other-security-threats-the-cloudflare-workers-security-model/).
+`HostExtensionPort` deliberately exposes only two operations:
 
-With that said, if you discover a bug that allows malicious code to break out of `workerd`, please submit it to [Cloudflare's bug bounty program](https://hackerone.com/cloudflare?type=team) for a reward.
+```ts
+interface HostExtensionPort {
+  call(method: number, payload: Uint8Array): Promise<Uint8Array>;
+  stream(method: number, payload: Uint8Array): ReadableStream<Uint8Array>;
+}
+```
 
-## Getting Started
+The capability is private, cannot be minted by tenant code, cannot be persisted, and can be
+delegated only once into a dynamic Worker's handler environment. Provider discovery, executable
+verification, process supervision, authorization, deadlines, and protocol bounds are owned by
+open-compute's `ocd` host.
 
-### Supported Platforms
+### Private dynamic Worker grants
 
-In theory, `workerd` should work on any POSIX system that is supported by V8 and Windows.
+Trusted loaders may add `openComputePrivateEnv` bindings that are visible to the target Worker's
+handler but absent from the importable `cloudflare:workers` environment. This is the path used for
+native host ports and other non-public facets. Only loaders created through the host-only private
+factory can set it; ordinary Worker Loader users are rejected.
 
-In practice, `workerd` is tested on:
+Private grants use native capability tables rather than serialized credentials. They cannot cross a
+second RPC boundary, and the host can revoke either one namespace or a complete namespace prefix
+when an open-compute generation, deployment, or extension session ends.
 
-* Linux and macOS (x86-64 and arm64 architectures)
-* Windows (x86-64 architecture)
+## Compatibility and release policy
 
-On other platforms, you may have to do tinkering to make things work.
+- Existing workerd behavior remains governed by the upstream compatibility date and flag model
+  unless a fork extension is explicitly involved.
+- The additions above are private integration seams for open-compute. Applications should use the
+  public open-compute and Cloudflare-compatible surfaces instead of depending on them directly.
+- open-compute pins an exact fork revision and verifies source identity, archives, binaries, version
+  output, compatibility settings, and process flags. A newer commit in this repository does not
+  automatically become the production runtime.
+- Upstream changes are incorporated deliberately and retested against the fork-specific Worker
+  Loader, limits, native-provider, and revocation coverage.
+- General workerd bugs belong in the
+  [Cloudflare repository](https://github.com/cloudflare/workerd/issues). Bugs in the extensions
+  described here belong in [open-compute](https://github.com/elliothux/open-compute/issues).
 
-### Building `workerd`
+The current source and binary identity is recorded in
+[`packages/runtime/workerd.lock.json`](https://github.com/elliothux/open-compute/blob/main/packages/runtime/workerd.lock.json).
+The design and qualification evidence lives in the
+[`docs/workerd`](https://github.com/elliothux/open-compute/tree/main/docs/workerd) and
+[`docs/implemented`](https://github.com/elliothux/open-compute/tree/main/docs/implemented)
+directories.
 
-To build `workerd`, you need:
+## Building
 
-* Bazel
-  * If you use [Bazelisk](https://github.com/bazelbuild/bazelisk) (recommended), it will automatically download and use the right version of Bazel for building workerd.
-* On Linux:
-  * We use the clang/LLVM toolchain to build workerd and support version 19 and higher. Earlier versions of clang may still work, but are not officially supported.
-  * Clang 19+ (e.g. package `clang-19` on Debian Trixie). If clang is installed as `clang-<version>` please create a symlink to it in your PATH named `clang`, or use `--repo_env=CC=clang-<version>` on `bazel` command lines to specify the compiler name.
-
-  * libc++ 19+ (e.g. packages `libc++-19-dev` and `libc++abi-19-dev`)
-  * LLD 19+ (e.g. package `lld-19`).
-  * `python3`, `python3-distutils`, and `tcl8.6`
-* On macOS:
-  * Xcode 16.3 installation (available on macOS 15 and higher). Building with just the Xcode Command Line Tools is not being tested, but should work too.
-  * Homebrew installed `tcl-tk` package (provides Tcl 8.6)
-* On Windows:
-  * Install [App Installer](https://learn.microsoft.com/en-us/windows/package-manager/winget/#install-winget)
-    from the Microsoft Store for the `winget` package manager and then run
-    [install-deps.bat](tools/windows/install-deps.bat) from an administrator prompt to install
-    bazelisk, LLVM, and other dependencies required to build workerd on Windows.
-  * Add `startup --output_user_root=C:/tmp` to the `.bazelrc` file in your user directory.
-  * When developing at the command-line, run [bazel-env.bat](tools/windows/bazel-env.bat) in your shell first
-    to select tools and Windows SDK versions before running bazel.
-
-You may then build `workerd` at the command-line with:
+The build remains the upstream Bazel build:
 
 ```sh
-bazel build //src/workerd/server:workerd
+bazel build --config=release //src/workerd/server:workerd
 ```
 
-You can pass `--config=release` to compile in release mode:
+The binary is written to `bazel-bin/src/workerd/server/workerd`. See the
+[upstream README](https://github.com/cloudflare/workerd/blob/main/README.md) for supported platforms,
+toolchain setup, configuration, local development, and general workerd usage. Contributors to this
+fork should also follow [`AGENTS.md`](AGENTS.md) and the component-specific instructions in the
+source tree.
 
-```sh
-bazel build //src/workerd/server:workerd --config=release
-```
+## Security
 
-You can also build from within Visual Studio Code using the instructions in [docs/vscode.md](docs/vscode.md).
+Like upstream workerd, this runtime is not by itself a complete defense-in-depth sandbox for
+untrusted code. open-compute runs it as one component of a wider boundary that includes capability
+scoping, verified immutable inputs, loopback-only internal listeners, supervised process lifecycle,
+and host-level isolation. See [SECURITY.md](SECURITY.md) for reporting instructions.
 
-The compiled binary will be located at `bazel-bin/src/workerd/server/workerd`.
+## License
 
-If you run a Bazel build before you've installed some dependencies (like clang or libc++), and then you install the dependencies, you must resync locally cached toolchains, or clean Bazel's cache, otherwise you might get strange errors:
-
-```sh
-bazel fetch --configure --force
-```
-
-If that fails, you can try:
-
-```sh
-bazel clean --expunge
-```
-
-The cache will now be cleaned and you can try building again.
-
-If you have a fairly recent clang packages installed you can build a more performant release
-version of workerd:
-
-```sh
-bazel build --config=thin-lto //src/workerd/server:workerd
-```
-
-### Configuring `workerd`
-
-`workerd` is configured using a config file written in Cap'n Proto text format.
-
-A simple "Hello World!" config file might look like:
-
-```capnp
-using Workerd = import "/workerd/workerd.capnp";
-
-const config :Workerd.Config = (
-  services = [
-    (name = "main", worker = .mainWorker),
-  ],
-
-  sockets = [
-    # Serve HTTP on port 8080.
-    ( name = "http",
-      address = "*:8080",
-      http = (),
-      service = "main"
-    ),
-  ]
-);
-
-const mainWorker :Workerd.Worker = (
-  serviceWorkerScript = embed "hello.js",
-  compatibilityDate = "2023-02-28",
-  # Learn more about compatibility dates at:
-  # https://developers.cloudflare.com/workers/platform/compatibility-dates/
-);
-```
-
-Where `hello.js` contains:
-
-```javascript
-addEventListener("fetch", event => {
-  event.respondWith(new Response("Hello World"));
-});
-```
-
-[Complete reference documentation is provided by the comments in workerd.capnp.](src/workerd/server/workerd.capnp)
-
-[There is also a library of sample config files.](samples)
-
-### Running `workerd`
-
-To serve your config, do:
-
-`workerd serve my-config.capnp`
-
-For more details about command-line usage, use `workerd --help`.
-
-Prebuilt binaries are distributed via `npm`. Run `npx workerd ...` to use these. If you're running a prebuilt binary, you'll need to make sure your system has the right dependencies installed:
-
-* On Linux:
-  * glibc 2.35 or higher (already included on e.g. Ubuntu 22.04, Debian Bookworm)
-* On macOS:
-  * macOS 13.5 or higher
-  * The Xcode command line tools, which can be installed with `xcode-select --install`
-* x86_64 CPU with at least SSE4.2 and CLMUL ISA extensions, or arm64 CPU with CRC extension (enabled by default under armv8.1-a). These extensions are supported by all recent x86 and arm64 CPUs.
-
-### Local Worker development with `wrangler`
-
-You can use [Wrangler](https://developers.cloudflare.com/workers/wrangler/) (v3.0 or greater) to develop Cloudflare Workers locally, using `workerd`. First, run the following command to configure Miniflare to use this build of `workerd`.
-
-```
-export MINIFLARE_WORKERD_PATH="<WORKERD_REPO_DIR>/bazel-bin/src/workerd/server/workerd"
-```
-
-Then, run:
-
-`wrangler dev`
-
-### Serving in production
-
-`workerd` is designed to be unopinionated about how it runs.
-
-One good way to manage `workerd` in production is using `systemd`. Particularly useful is `systemd`'s ability to open privileged sockets on `workerd`'s behalf while running the service itself under an unprivileged user account. To help with this, `workerd` supports inheriting sockets from the parent process using the `--socket-fd` flag.
-
-Here's an example system service file, assuming your config defines two sockets named `http` and `https`:
-
-```sh
-# /etc/systemd/system/workerd.service
-[Unit]
-Description=workerd runtime
-After=local-fs.target remote-fs.target network-online.target
-Requires=local-fs.target remote-fs.target workerd.socket
-Wants=network-online.target
-
-[Service]
-Type=exec
-ExecStart=/usr/bin/workerd serve /etc/workerd/config.capnp --socket-fd http=3 --socket-fd https=4
-Sockets=workerd.socket
-
-# If workerd crashes, restart it.
-Restart=always
-
-# Run under an unprivileged user account.
-User=nobody
-Group=nogroup
-
-# Hardening measure: Do not allow workerd to run suid-root programs.
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-And corresponding sockets file:
-
-```sh
-# /etc/systemd/system/workerd.socket
-[Unit]
-Description=sockets for workerd
-PartOf=workerd.service
-
-[Socket]
-ListenStream=0.0.0.0:80
-ListenStream=0.0.0.0:443
-
-[Install]
-WantedBy=sockets.target
-```
-
-Once these files are in place you can enable the service -- see the systemd documentation or ask your favorite LLM for details.
+This fork retains workerd's upstream license and notices. See [LICENSE](LICENSE).
