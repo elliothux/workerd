@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://open-compute.dev">
-    <img src="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/open-compute.png" alt="open-compute" width="420">
+    <img src="https://raw.githubusercontent.com/elliothux/open-compute/main/share/brand/open-compute.webp" alt="open-compute" width="420">
   </a>
 </p>
 
