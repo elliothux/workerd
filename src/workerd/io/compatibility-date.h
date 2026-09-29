@@ -70,6 +70,9 @@ kj::Maybe<kj::String> normalizeCompatDate(kj::StringPtr date);
 // Returns the current date as a string formatted by CompatDate.
 kj::String currentDateStr();
 
+// Return the deterministic JSON catalog compiled from CompatibilityFlags schema annotations.
+kj::String compatibilityCatalogJson();
+
 // These values come from src/workerd/io/compatibility-date.capnp
 static constexpr uint64_t COMPAT_ENABLE_FLAG_ANNOTATION_ID = 0xb6dabbc87cd1b03eull;
 static constexpr uint64_t COMPAT_DISABLE_FLAG_ANNOTATION_ID = 0xd145cf1adc42577cull;

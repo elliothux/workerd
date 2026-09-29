@@ -51,11 +51,41 @@ jobs:
           xcrun --show-sdk-version >> build-inputs.txt 2>&1 || true
           bazel-bin/src/workerd/server/workerd --version >> build-inputs.txt
           shasum -a 256 bazel-bin/src/workerd/server/workerd >> build-inputs.txt
+      - name: Record compatibility catalog
+        run: |
+          bazel-bin/src/workerd/server/workerd compatibility-catalog > compatibility-catalog.json 2> compatibility-catalog.stderr
+          test ! -s compatibility-catalog.stderr
+          bazel-bin/src/workerd/server/workerd compatibility-catalog > compatibility-catalog.second.json
+          cmp compatibility-catalog.json compatibility-catalog.second.json
+          if bazel-bin/src/workerd/server/workerd compatibility-catalog unexpected > compatibility-catalog.unexpected.stdout 2> compatibility-catalog.unexpected.stderr; then
+            exit 1
+          fi
+          test ! -s compatibility-catalog.unexpected.stdout
+          test -s compatibility-catalog.unexpected.stderr
+          shasum -a 256 compatibility-catalog.json >> build-inputs.txt
       - uses: actions/upload-artifact@v7
         with:
           name: workerd-${{ matrix.target }}
           path: |
             bazel-bin/src/workerd/server/workerd
             build-inputs.txt
+            compatibility-catalog.json
           if-no-files-found: error
           retention-days: 7
+
+  compare-catalogs:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: workerd-*
+          path: artifacts
+      - name: Require byte-identical target catalogs
+        run: |
+          mapfile -t catalogs < <(find artifacts -name compatibility-catalog.json -type f | sort)
+          test "${#catalogs[@]}" -eq 4
+          for catalog in "${catalogs[@]:1}"; do
+            cmp "${catalogs[0]}" "$catalog"
+          done
+          shasum -a 256 "${catalogs[0]}"

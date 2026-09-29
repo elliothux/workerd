@@ -745,5 +745,69 @@ KJ_TEST("isNewModuleRegistryEnabled ignores the flag for Python workers") {
   KJ_EXPECT(!check(false, true));
 }
 
+KJ_TEST("compatibility catalog projects every input flag deterministically") {
+  auto first = compatibilityCatalogJson();
+  auto second = compatibilityCatalogJson();
+  KJ_EXPECT(first == second);
+  KJ_EXPECT(first.startsWith(
+      "{\"schemaVersion\":1,\"validation\":\"code_version\",\"binaryMaximumDate\":"));
+  KJ_EXPECT(first.endsWith("]}\n"));
+
+  auto count = [](kj::StringPtr text, kj::StringPtr needle) {
+    size_t result = 0;
+    for (size_t offset = 0; offset + needle.size() <= text.size(); ++offset) {
+      if (text.slice(offset, offset + needle.size()) == needle) ++result;
+    }
+    return result;
+  };
+  size_t expectedFeatures = 0;
+  size_t expectedEnableFlags = 0;
+  size_t expectedDisableFlags = 0;
+  size_t expectedDefaultDates = 0;
+  size_t expectedAllDates = 0;
+  size_t expectedExperimental = 0;
+  size_t expectedPythonSnapshots = 0;
+  size_t expectedImplications = 0;
+  auto schema = capnp::Schema::from<CompatibilityFlags>();
+  for (auto field: schema.getFields()) {
+    bool feature = false;
+    for (auto annotation: field.getProto().getAnnotations()) {
+      if (annotation.getId() == COMPAT_ENABLE_FLAG_ANNOTATION_ID) {
+        feature = true;
+        ++expectedEnableFlags;
+        auto quoted = kj::str('"', annotation.getValue().getText(), '"');
+        KJ_EXPECT(first.findFirst(quoted) != kj::none, annotation.getValue().getText());
+      } else if (annotation.getId() == COMPAT_DISABLE_FLAG_ANNOTATION_ID) {
+        feature = true;
+        ++expectedDisableFlags;
+        auto quoted = kj::str('"', annotation.getValue().getText(), '"');
+        KJ_EXPECT(first.findFirst(quoted) != kj::none, annotation.getValue().getText());
+      } else if (annotation.getId() == COMPAT_ENABLE_DATE_ANNOTATION_ID) {
+        ++expectedDefaultDates;
+        auto quoted = kj::str('"', annotation.getValue().getText(), '"');
+        KJ_EXPECT(first.findFirst(quoted) != kj::none, annotation.getValue().getText());
+      } else if (annotation.getId() == COMPAT_ENABLE_ALL_DATES_ANNOTATION_ID) {
+        ++expectedAllDates;
+      } else if (annotation.getId() == EXPERIMENTAl_ANNOTATION_ID) {
+        ++expectedExperimental;
+      } else if (annotation.getId() == PYTHON_SNAPSHOT_RELEASE_ANNOTATION_ID) {
+        ++expectedPythonSnapshots;
+      } else if (annotation.getId() == IMPLIED_BY_AFTER_DATE_ANNOTATION_ID) {
+        ++expectedImplications;
+      }
+    }
+    expectedFeatures += feature;
+  }
+  KJ_EXPECT(count(first, "\"field\":"_kj) == expectedFeatures);
+  KJ_EXPECT(count(first, "\"enableFlag\":"_kj) == expectedEnableFlags);
+  KJ_EXPECT(count(first, "\"disableFlag\":"_kj) == expectedDisableFlags);
+  KJ_EXPECT(count(first, "\"defaultOnDate\":"_kj) == expectedDefaultDates);
+  KJ_EXPECT(count(first, "\"enabledForAllDates\":true"_kj) == expectedAllDates);
+  KJ_EXPECT(count(first, "\"experimental\":true"_kj) == expectedExperimental);
+  KJ_EXPECT(
+      count(first, "\"pythonSnapshotRelease\":true"_kj) == expectedPythonSnapshots);
+  KJ_EXPECT(count(first, "\"impliedBy\":["_kj) == expectedImplications);
+}
+
 }  // namespace
 }  // namespace workerd

@@ -532,6 +532,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
           .addSubCommand("fuzzilli", KJ_BIND_METHOD(*this, getFuzz), "run reprl for fuzzing")
 #endif
           .addSubCommand("test", KJ_BIND_METHOD(*this, getTest), "run unit tests")
+          .addSubCommand("compatibility-catalog", KJ_BIND_METHOD(*this, getCompatibilityCatalog),
+              "print the compiled compatibility catalog as JSON")
           .addSubCommand("pyodide-lock", KJ_BIND_METHOD(*this, getPyodideLock),
               "outputs the package lock file used by Pyodide")
           .addSubCommand("make-pyodide-baseline-snapshot",
@@ -549,6 +551,20 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
           "This binary has an embedded configuration.");
       return addServeOptions(builder);
     }
+  }
+
+  kj::MainFunc getCompatibilityCatalog() {
+    return kj::MainBuilder(context, getVersionString(),
+        "Print the compiled compatibility catalog as deterministic JSON.", "")
+        .callAfterParsing([]() {
+      auto catalog = workerd::compatibilityCatalogJson();
+#if _WIN32
+      kj::FdOutputStream(_fileno(stdout)).write(catalog.asBytes());
+#else
+      kj::FdOutputStream(STDOUT_FILENO).write(catalog.asBytes());
+#endif
+      return true;
+    }).build();
   }
 
   kj::MainBuilder& addConfigParsingOptionsNoConstName(kj::MainBuilder& builder) {

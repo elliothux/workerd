@@ -23,6 +23,51 @@ using kj::uint;
 
 namespace {
 
+kj::String jsonString(kj::StringPtr text) {
+  static constexpr char HEX[] = "0123456789abcdef";
+  kj::Vector<char> escaped(text.size() + 1);
+  for (char c: text) {
+    switch (c) {
+      case '"':
+        escaped.addAll("\\\""_kj);
+        break;
+      case '\\':
+        escaped.addAll("\\\\"_kj);
+        break;
+      case '\b':
+        escaped.addAll("\\b"_kj);
+        break;
+      case '\f':
+        escaped.addAll("\\f"_kj);
+        break;
+      case '\n':
+        escaped.addAll("\\n"_kj);
+        break;
+      case '\r':
+        escaped.addAll("\\r"_kj);
+        break;
+      case '\t':
+        escaped.addAll("\\t"_kj);
+        break;
+      default:
+        if (static_cast<uint8_t>(c) < 0x20) {
+          escaped.addAll("\\u00"_kj);
+          auto byte = static_cast<uint8_t>(c);
+          escaped.add(HEX[byte / 16]);
+          escaped.add(HEX[byte % 16]);
+        } else {
+          escaped.add(c);
+        }
+    }
+  }
+  return kj::str('"', escaped.releaseAsArray(), '"');
+}
+
+void requireUniqueInputFlag(kj::HashSet<kj::String>& seen, kj::StringPtr flag) {
+  KJ_REQUIRE(seen.find(flag) == kj::none, "duplicate compatibility input flag", flag);
+  seen.insert(kj::str(flag));
+}
+
 struct CompatDate {
   uint year;
   uint month;
@@ -94,6 +139,82 @@ struct CompatDate {
   }
 };
 }  // namespace
+
+kj::String compatibilityCatalogJson() {
+  auto schema = capnp::Schema::from<CompatibilityFlags>();
+  kj::HashSet<kj::String> inputFlags;
+  kj::Vector<kj::String> features;
+
+  for (auto field: schema.getFields()) {
+    kj::Maybe<kj::StringPtr> enableFlag;
+    kj::Maybe<kj::StringPtr> disableFlag;
+    kj::Maybe<kj::StringPtr> defaultOnDate;
+    bool enabledForAllDates = false;
+    bool experimental = false;
+    bool pythonSnapshotRelease = false;
+    kj::Vector<kj::String> implications;
+
+    for (auto annotation: field.getProto().getAnnotations()) {
+      if (annotation.getId() == COMPAT_ENABLE_FLAG_ANNOTATION_ID) {
+        KJ_REQUIRE(enableFlag == kj::none, "duplicate enable flag annotation");
+        enableFlag = annotation.getValue().getText();
+      } else if (annotation.getId() == COMPAT_DISABLE_FLAG_ANNOTATION_ID) {
+        KJ_REQUIRE(disableFlag == kj::none, "duplicate disable flag annotation");
+        disableFlag = annotation.getValue().getText();
+      } else if (annotation.getId() == COMPAT_ENABLE_DATE_ANNOTATION_ID) {
+        KJ_REQUIRE(defaultOnDate == kj::none, "duplicate enable date annotation");
+        defaultOnDate = annotation.getValue().getText();
+      } else if (annotation.getId() == COMPAT_ENABLE_ALL_DATES_ANNOTATION_ID) {
+        KJ_REQUIRE(!enabledForAllDates, "duplicate all-dates annotation");
+        enabledForAllDates = true;
+      } else if (annotation.getId() == EXPERIMENTAl_ANNOTATION_ID) {
+        KJ_REQUIRE(!experimental, "duplicate experimental annotation");
+        experimental = true;
+      } else if (annotation.getId() == PYTHON_SNAPSHOT_RELEASE_ANNOTATION_ID) {
+        KJ_REQUIRE(!pythonSnapshotRelease, "duplicate Python snapshot annotation");
+        pythonSnapshotRelease = true;
+      } else if (annotation.getId() == IMPLIED_BY_AFTER_DATE_ANNOTATION_ID) {
+        auto implied = annotation.getValue().getStruct().as<ImpliedByAfterDate>();
+        kj::Vector<kj::String> names;
+        if (implied.hasName()) {
+          names.add(jsonString(implied.getName()));
+        } else {
+          KJ_REQUIRE(implied.hasNames(), "invalid implied compatibility annotation");
+          for (auto name: implied.getNames()) names.add(jsonString(name));
+        }
+        KJ_REQUIRE(!names.empty(), "empty implied compatibility annotation");
+        implications.add(kj::str("{\"flags\":[", kj::strArray(names, ","),
+            "],\"afterDate\":", jsonString(implied.getDate()), '}'));
+      }
+    }
+
+    if (enableFlag == kj::none && disableFlag == kj::none) continue;
+    kj::Vector<kj::String> members;
+    members.add(kj::str("\"field\":", jsonString(field.getProto().getName())));
+    KJ_IF_SOME(flag, enableFlag) {
+      requireUniqueInputFlag(inputFlags, flag);
+      members.add(kj::str("\"enableFlag\":", jsonString(flag)));
+    }
+    KJ_IF_SOME(flag, disableFlag) {
+      requireUniqueInputFlag(inputFlags, flag);
+      members.add(kj::str("\"disableFlag\":", jsonString(flag)));
+    }
+    KJ_IF_SOME(date, defaultOnDate) {
+      members.add(kj::str("\"defaultOnDate\":", jsonString(date)));
+    }
+    members.add(kj::str("\"enabledForAllDates\":", enabledForAllDates ? "true" : "false"));
+    members.add(kj::str("\"experimental\":", experimental ? "true" : "false"));
+    members.add(kj::str("\"pythonSnapshotRelease\":", pythonSnapshotRelease ? "true" : "false"));
+    if (!implications.empty()) {
+      members.add(kj::str("\"impliedBy\":[", kj::strArray(implications, ","), ']'));
+    }
+    features.add(kj::str('{', kj::strArray(members, ","), '}'));
+  }
+
+  return kj::str("{\"schemaVersion\":1,\"validation\":\"code_version\",",
+      "\"binaryMaximumDate\":", jsonString(MAXIMUM_COMPATIBILITY_DATE),
+      ",\"futureDatesAllowed\":false,\"features\":[", kj::strArray(features, ","), "]}\n");
+}
 
 kj::String currentDateStr() {
   return CompatDate::today().toString();
