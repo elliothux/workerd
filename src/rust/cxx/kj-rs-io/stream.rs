@@ -54,6 +54,10 @@
 use std::future::Future;
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::fd::BorrowedFd;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use tokio::io::Interest;
@@ -105,7 +109,7 @@ impl Socket {
     /// Borrows the live tokio socket's fd (tokio streams implement `AsFd`), for dup-based
     /// operations that must not conjure a raw fd out of an integer.
     #[cfg(unix)]
-    fn as_borrowed_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    fn as_borrowed_fd(&self) -> BorrowedFd<'_> {
         use std::os::fd::AsFd;
         match self {
             Self::Tcp(s) => s.as_fd(),
@@ -261,6 +265,52 @@ async fn write_all(inner: &Inner, buf: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) struct CapabilityRead {
+    pub(crate) byte_count: usize,
+    pub(crate) fds: Vec<OwnedFd>,
+}
+
+#[cfg(unix)]
+async fn read_with_fds(
+    inner: &Inner,
+    buf: &mut [MaybeUninit<u8>],
+    min_bytes: usize,
+    max_fds: usize,
+) -> Result<CapabilityRead> {
+    let min_bytes = min_bytes.min(buf.len());
+    let mut byte_count = 0;
+    let mut fds = Vec::new();
+    while byte_count < buf.len() {
+        if inner
+            .read_aborted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            break;
+        }
+        match crate::ffi::try_recvmsg(
+            inner.socket.as_borrowed_fd(),
+            &mut buf[byte_count..],
+            max_fds.saturating_sub(fds.len()),
+        ) {
+            Ok(received) => {
+                fds.extend(received.fds);
+                if received.byte_count == 0 {
+                    break;
+                }
+                byte_count += received.byte_count;
+                if byte_count >= min_bytes {
+                    break;
+                }
+            }
+            Err(error) if would_block(&error) => inner.wait_readable().await?,
+            Err(error) if interrupted(&error) => {}
+            Err(error) => return Err(op("recvmsg()")(error)),
+        }
+    }
+    Ok(CapabilityRead { byte_count, fds })
 }
 
 /// Write-all semantics over several pieces, as one operation: `writev` until every piece is
@@ -434,6 +484,17 @@ impl TokioStream {
     ) -> impl Future<Output = Result<()>> + use<'b> {
         let inner = self.shared();
         async move { write_all_pieces(&inner, pieces).await }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn read_with_fds<'b>(
+        &self,
+        buf: &'b mut [MaybeUninit<u8>],
+        min_bytes: usize,
+        max_fds: usize,
+    ) -> impl Future<Output = Result<CapabilityRead>> + use<'b> {
+        let inner = self.shared();
+        async move { read_with_fds(&inner, buf, min_bytes, max_fds).await }
     }
 
     /// `kj::AsyncIoStream::whenWriteDisconnected` as a future owning its share of the stream.

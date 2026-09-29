@@ -35,6 +35,7 @@ pub use bridge::KjPieces;
 pub use bridge::PeerCredentials;
 pub use bridge::PeerStream;
 pub use bridge::ReceivedDatagram;
+pub use bridge::ReceivedFds;
 pub use bridge::SocketAddress;
 pub use bridge::kj_piece;
 pub use bridge::kj_pieces_count;
@@ -42,6 +43,7 @@ pub use bridge::kj_pieces_count;
 use crate::error::KjIoError;
 use crate::error::Result;
 use crate::error::op;
+use crate::loopback::LoopbackRegistry;
 use crate::net::TokioAddress;
 use crate::net::TokioDatagram;
 use crate::net::TokioListener;
@@ -95,6 +97,9 @@ mod bridge {
         UnixAbstract,
         /// No fields: `accept(2)` on a unix socket reports this for an unbound peer.
         UnixUnnamed,
+        /// `name`: a `loopback:` name (loopback.rs). Not a socket address: it has no `struct
+        /// sockaddr` form and is not subject to `restrictPeers()`.
+        Loopback,
     }
 
     /// One socket address, typed. This is the only form an address takes on the bridge: Rust
@@ -128,6 +133,13 @@ mod bridge {
         truncated: bool,
     }
 
+    /// Bytes and owned descriptors returned by one capability-stream read. Ownership of every
+    /// descriptor transfers to the C++ adapter with this value.
+    struct ReceivedFds {
+        byte_count: usize,
+        fds: Vec<i32>,
+    }
+
     /// `kj::LocalPeerIdentity::Credentials`: `pid` / `uid` of a unix-socket peer, each with a
     /// validity flag (kj::Maybe has no cxx mapping).
     struct PeerCredentials {
@@ -147,6 +159,7 @@ mod bridge {
         type TokioListener;
         type TokioAddress;
         type TokioDatagram;
+        type LoopbackRegistry;
 
         // --- kj::AsyncIoStream (stream.rs). `buf` is the caller's, uninitialized storage
         // allowed, valid until the promise settles (KJ's contract): hence `unsafe`.
@@ -156,6 +169,13 @@ mod bridge {
             len: usize,
             min_bytes: usize,
         ) -> Result<usize>;
+        async unsafe fn stream_read_with_fds(
+            stream: &TokioStream,
+            buf: *mut u8,
+            len: usize,
+            min_bytes: usize,
+            max_fds: usize,
+        ) -> Result<ReceivedFds>;
         async unsafe fn stream_write<'a>(stream: &'a TokioStream, buf: &'a [u8]) -> Result<()>;
         async unsafe fn stream_write_pieces<'a>(
             stream: &'a TokioStream,
@@ -172,11 +192,23 @@ mod bridge {
 
         // --- kj::Network / kj::NetworkAddress (net.rs). Peer filtering is the C++ adapter's:
         // `address_targets` lists what connect() would try, in order, for it to filter and
-        // connect one at a time; `listener_accept` reports the peer for it to judge.
-        async fn network_parse_address(addr: &[u8], port_hint: u16) -> Result<Box<TokioAddress>>;
+        // connect one at a time; `listener_accept` reports the peer for it to judge. Every
+        // kj::Network holds a LoopbackRegistry (loopback.rs), the namespace `loopback:`
+        // addresses resolve in once enabled; restrictPeers() children share their parent's.
+        fn new_loopback_registry() -> Box<LoopbackRegistry>;
+        fn loopback_registry_clone(registry: &LoopbackRegistry) -> Box<LoopbackRegistry>;
+        fn loopback_registry_enable(registry: &LoopbackRegistry);
+        async fn network_parse_address(
+            addr: &[u8],
+            port_hint: u16,
+            loopback: &LoopbackRegistry,
+        ) -> Result<Box<TokioAddress>>;
         fn network_address_from(addr: &SocketAddress) -> Result<Box<TokioAddress>>;
         fn address_targets(addr: &TokioAddress) -> Result<Vec<SocketAddress>>;
-        async fn connect_target(target: SocketAddress) -> Result<Box<TokioStream>>;
+        async fn connect_target(
+            addr: &TokioAddress,
+            target: SocketAddress,
+        ) -> Result<Box<TokioStream>>;
         fn address_listen(addr: &TokioAddress) -> Result<Box<TokioListener>>;
         fn address_bind_datagram(addr: &TokioAddress) -> Result<Box<TokioDatagram>>;
         fn address_clone(addr: &TokioAddress) -> Box<TokioAddress>;
@@ -261,14 +293,69 @@ pub unsafe fn stream_try_read(
     stream.try_read_min(buf, min_bytes)
 }
 
+/// # Safety
+///
+/// The buffer follows [`stream_try_read`]'s contract. Every returned descriptor is transferred
+/// to the C++ adapter, which must immediately adopt it into `kj::OwnFd`.
+pub unsafe fn stream_read_with_fds(
+    stream: &TokioStream,
+    buf: *mut u8,
+    len: usize,
+    min_bytes: usize,
+    max_fds: usize,
+) -> impl Future<Output = Result<ReceivedFds>> + use<> {
+    // Safety: forwarded from this function's contract; the future is the buffer's lifetime.
+    let buf = unsafe { uninit_slice(buf, len) };
+    #[cfg(unix)]
+    {
+        use std::os::fd::IntoRawFd;
+        let read = stream.read_with_fds(buf, min_bytes, max_fds);
+        return async move {
+            let received = read.await?;
+            Ok(ReceivedFds {
+                byte_count: received.byte_count,
+                fds: received
+                    .fds
+                    .into_iter()
+                    .map(IntoRawFd::into_raw_fd)
+                    .collect(),
+            })
+        };
+    }
+    #[cfg(windows)]
+    async move {
+        let _ = (stream, buf, min_bytes, max_fds);
+        Err(KjIoError::other(
+            "recvmsg()",
+            "capability streams are unavailable on Windows",
+        ))
+    }
+}
+
 /// Copies the address text before the future exists (KJ's `parseAddress` only guarantees the
 /// caller's buffer for the duration of the call).
 pub fn network_parse_address(
     addr: &[u8],
     port_hint: u16,
+    loopback: &LoopbackRegistry,
 ) -> impl Future<Output = Result<Box<TokioAddress>>> + use<> {
     let addr = addr.to_vec();
-    async move { parse_address(&addr, port_hint).await }
+    let loopback = loopback.clone_handle();
+    async move { parse_address(&addr, port_hint, &loopback).await }
+}
+
+#[expect(clippy::unnecessary_box_returns)]
+pub fn new_loopback_registry() -> Box<LoopbackRegistry> {
+    Box::new(LoopbackRegistry::new())
+}
+
+#[expect(clippy::unnecessary_box_returns)]
+pub fn loopback_registry_clone(registry: &LoopbackRegistry) -> Box<LoopbackRegistry> {
+    Box::new(registry.clone_handle())
+}
+
+pub fn loopback_registry_enable(registry: &LoopbackRegistry) {
+    registry.enable();
 }
 
 // ======================================================================================
@@ -372,6 +459,88 @@ fn set_nonblocking(fd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
         fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(nix_error("fcntl(F_SETFL)"))?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) struct RawRecvmsg {
+    pub(crate) byte_count: usize,
+    pub(crate) fds: Vec<std::os::fd::OwnedFd>,
+}
+
+/// One non-blocking `recvmsg(2)` attempt with enough ancillary space to avoid descriptor leaks
+/// on kernels that do not close truncated `SCM_RIGHTS` payloads.
+#[cfg(unix)]
+pub(crate) fn try_recvmsg(
+    socket: std::os::fd::BorrowedFd<'_>,
+    buf: &mut [MaybeUninit<u8>],
+    max_fds: usize,
+) -> std::io::Result<RawRecvmsg> {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+
+    const RECEIVE_FDS: usize = 512;
+    let control_bytes =
+        unsafe { libc::CMSG_SPACE((RECEIVE_FDS * std::mem::size_of::<i32>()) as _) as usize };
+    let words = control_bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut control = vec![0usize; words];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // Safety: zero is a valid empty msghdr; pointers and lengths are filled below.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control_bytes as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flags = 0;
+    // Safety: `message` points only into live, exclusively borrowed buffers for this call.
+    let amount = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, flags) };
+    if amount < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut received_fds = Vec::new();
+    // Safety: the kernel initialized the ancillary region described by `message`.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        // Safety: `header` was returned by CMSG_FIRSTHDR/NXTHDR for this message.
+        let current = unsafe { &*header };
+        if current.cmsg_level == libc::SOL_SOCKET && current.cmsg_type == libc::SCM_RIGHTS {
+            let base = unsafe { libc::CMSG_LEN(0) as usize };
+            let length = (current.cmsg_len as usize).min(message.msg_controllen as usize);
+            if length >= base {
+                let count = (length - base) / std::mem::size_of::<i32>();
+                // Safety: an SCM_RIGHTS cmsg contains `count` aligned descriptors after its header.
+                let descriptors = unsafe {
+                    std::slice::from_raw_parts(libc::CMSG_DATA(header).cast::<i32>(), count)
+                };
+                for descriptor in descriptors {
+                    // Safety: descriptors returned by recvmsg are newly owned by this process.
+                    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(*descriptor) };
+                    received_fds.push(owned);
+                }
+            }
+        }
+        // Safety: advances within the kernel-reported ancillary region or returns null.
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+    }
+    for owned in &received_fds {
+        let old = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) };
+        if old < 0
+            || unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, old | libc::FD_CLOEXEC) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    received_fds.truncate(max_fds);
+    Ok(RawRecvmsg {
+        byte_count: amount as usize,
+        fds: received_fds,
+    })
 }
 
 #[cfg(unix)]

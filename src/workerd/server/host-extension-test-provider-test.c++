@@ -101,9 +101,9 @@ KJ_TEST("host extension provider accepts an FD session and serves unary and stre
 
   auto io = kj::setupAsyncIo();
   {
-    auto stream = io.lowLevelProvider->wrapUnixSocketFd(
-        session[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
-    capnp::TwoPartyClient client(*stream, 0);
+    auto stream =
+        io.lowLevelProvider->wrapSocketFd(session[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+    capnp::TwoPartyClient client(*stream);
     auto extension = client.bootstrap().castAs<rpc::HostExtension>();
 
     auto list = extension.callRequest();

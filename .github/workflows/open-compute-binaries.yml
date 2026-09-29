@@ -41,8 +41,7 @@ jobs:
           bazel build //src/workerd/server:workerd
           --strip=always
           --config=${{ matrix.config }}
-          --@rules_rust//:extra_exec_rustc_flag=-Cstrip=none
-          --//:io_backend=cxx
+          --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
       - name: Record inputs
         run: |
           bazel --version > build-inputs.txt

@@ -118,33 +118,10 @@ class FileProvider final: public rpc::HostExtension::Server {
   }
 };
 
-class Session {
- public:
-  explicit Session(kj::Own<kj::AsyncCapabilityStream> stream): server(kj::heap<FileProvider>()) {
-    server.accept(kj::mv(stream), 0);
-  }
-
-  kj::Promise<void> run() {
-    co_await server.drain();
-  }
-
- private:
-  capnp::TwoPartyServer server;
-};
-
-class SessionErrors final: public kj::TaskSet::ErrorHandler {
- public:
-  void taskFailed(kj::Exception&& exception) override {
-    if (exception.getType() == kj::Exception::Type::DISCONNECTED) return;
-    KJ_LOG(ERROR, "host extension fixture session failed", exception);
-  }
-};
-
 kj::Promise<void> runProvider(kj::AsyncIoContext& io) {
   auto control =
       io.lowLevelProvider->wrapUnixSocketFd(3, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
-  SessionErrors errors;
-  kj::TaskSet sessions(errors);
+  capnp::TwoPartyServer server(kj::heap<FileProvider>());
   try {
     for (;;) {
       kj::byte magic[4];
@@ -154,8 +131,8 @@ kj::Promise<void> runProvider(kj::AsyncIoContext& io) {
       KJ_REQUIRE(result.byteCount == sizeof(magic) && result.capCount == 1 &&
               memcmp(magic, "OCP1", sizeof(magic)) == 0,
           "invalid host extension fixture attach");
-      auto session = kj::heap<Session>(io.lowLevelProvider->wrapUnixSocketFd(kj::mv(fd)));
-      sessions.add(session->run().attach(kj::mv(session)));
+      auto session = io.lowLevelProvider->wrapSocketFd(kj::mv(fd));
+      server.accept(kj::mv(session));
       const kj::byte ack = 0;
       co_await control->write(kj::arrayPtr(ack));
     }

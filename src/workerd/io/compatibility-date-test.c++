@@ -128,6 +128,8 @@ KJ_TEST("compatibility flag parsing") {
       "(formDataParserSupportsFiles = true, fetchRefusesUnknownProtocols = true)");
   expectCompileCompatibilityFlags("2021-11-04", {"fetch_refuses_unknown_protocols"_kj},
       "(formDataParserSupportsFiles = true, fetchRefusesUnknownProtocols = true)");
+  expectCompileCompatibilityFlags("2021-05-17", {"durable_object_io_tasks_prevent_eviction"_kj},
+      "(durableObjectIoTasksPreventEviction = true)");
 
   // Test errors.
   expectCompileCompatibilityFlags("abcd", {}, "()", {"Invalid compatibility date: abcd"});
@@ -561,6 +563,20 @@ KJ_TEST("encode to full flag list") {
     // But other date-enabled flags still appear.
     KJ_EXPECT(contains(strings, "minimal_subrequests"_kj));
   }
+
+  {
+    // durable_object_io_tasks_prevent_eviction is enabled by date on 2026-10-06 and can be
+    // disabled explicitly.
+    constexpr auto flag = "durable_object_io_tasks_prevent_eviction"_kj;
+    KJ_EXPECT(!contains(
+        decompileCompatibilityFlags(compileOwnFeatureFlags("2026-10-05", {}).get()), flag));
+    KJ_EXPECT(contains(
+        decompileCompatibilityFlags(compileOwnFeatureFlags("2026-10-06", {}).get()), flag));
+    KJ_EXPECT(!contains(decompileCompatibilityFlags(compileOwnFeatureFlags(
+                            "2026-10-06", {"durable_object_io_tasks_do_not_prevent_eviction"_kj})
+                                                        .get()),
+        flag));
+  }
 }
 
 KJ_TEST("compatibility dates must be Tuesday, Wednesday, or Thursday") {
@@ -771,32 +787,44 @@ KJ_TEST("compatibility catalog projects every input flag deterministically") {
   auto schema = capnp::Schema::from<CompatibilityFlags>();
   for (auto field: schema.getFields()) {
     bool feature = false;
+    size_t fieldDefaultDates = 0;
+    size_t fieldAllDates = 0;
+    size_t fieldExperimental = 0;
+    size_t fieldPythonSnapshots = 0;
+    size_t fieldImplications = 0;
     for (auto annotation: field.getProto().getAnnotations()) {
       if (annotation.getId() == COMPAT_ENABLE_FLAG_ANNOTATION_ID) {
         feature = true;
         ++expectedEnableFlags;
         auto quoted = kj::str('"', annotation.getValue().getText(), '"');
-        KJ_EXPECT(first.findFirst(quoted) != kj::none, annotation.getValue().getText());
+        KJ_EXPECT(first.contains(quoted), annotation.getValue().getText());
       } else if (annotation.getId() == COMPAT_DISABLE_FLAG_ANNOTATION_ID) {
         feature = true;
         ++expectedDisableFlags;
         auto quoted = kj::str('"', annotation.getValue().getText(), '"');
-        KJ_EXPECT(first.findFirst(quoted) != kj::none, annotation.getValue().getText());
+        KJ_EXPECT(first.contains(quoted), annotation.getValue().getText());
       } else if (annotation.getId() == COMPAT_ENABLE_DATE_ANNOTATION_ID) {
-        ++expectedDefaultDates;
+        ++fieldDefaultDates;
         auto quoted = kj::str('"', annotation.getValue().getText(), '"');
-        KJ_EXPECT(first.findFirst(quoted) != kj::none, annotation.getValue().getText());
+        KJ_EXPECT(first.contains(quoted), annotation.getValue().getText());
       } else if (annotation.getId() == COMPAT_ENABLE_ALL_DATES_ANNOTATION_ID) {
-        ++expectedAllDates;
+        ++fieldAllDates;
       } else if (annotation.getId() == EXPERIMENTAl_ANNOTATION_ID) {
-        ++expectedExperimental;
+        ++fieldExperimental;
       } else if (annotation.getId() == PYTHON_SNAPSHOT_RELEASE_ANNOTATION_ID) {
-        ++expectedPythonSnapshots;
+        ++fieldPythonSnapshots;
       } else if (annotation.getId() == IMPLIED_BY_AFTER_DATE_ANNOTATION_ID) {
-        ++expectedImplications;
+        ++fieldImplications;
       }
     }
     expectedFeatures += feature;
+    if (feature) {
+      expectedDefaultDates += fieldDefaultDates;
+      expectedAllDates += fieldAllDates;
+      expectedExperimental += fieldExperimental;
+      expectedPythonSnapshots += fieldPythonSnapshots;
+      expectedImplications += fieldImplications;
+    }
   }
   KJ_EXPECT(count(first, "\"field\":"_kj) == expectedFeatures);
   KJ_EXPECT(count(first, "\"enableFlag\":"_kj) == expectedEnableFlags);
@@ -804,8 +832,7 @@ KJ_TEST("compatibility catalog projects every input flag deterministically") {
   KJ_EXPECT(count(first, "\"defaultOnDate\":"_kj) == expectedDefaultDates);
   KJ_EXPECT(count(first, "\"enabledForAllDates\":true"_kj) == expectedAllDates);
   KJ_EXPECT(count(first, "\"experimental\":true"_kj) == expectedExperimental);
-  KJ_EXPECT(
-      count(first, "\"pythonSnapshotRelease\":true"_kj) == expectedPythonSnapshots);
+  KJ_EXPECT(count(first, "\"pythonSnapshotRelease\":true"_kj) == expectedPythonSnapshots);
   KJ_EXPECT(count(first, "\"impliedBy\":["_kj) == expectedImplications);
 }
 

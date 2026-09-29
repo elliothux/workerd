@@ -28,7 +28,6 @@ const {
   AbortControllerAbort,
   AbortControllerSignalGet,
   ArrayBufferPrototypeByteLengthGet,
-  DataViewPrototypeGetByteLength,
   NumberIsNaN,
   ObjectDefineProperties,
   ObjectDefineProperty,
@@ -42,17 +41,11 @@ const {
   SymbolFor,
   SymbolToStringTag,
   TypeError,
-  TypedArrayPrototypeGetByteLength,
   uncurryThis,
 } = primordials;
 
-const {
-  isArrayBuffer,
-  isArrayBufferView,
-  isDataView,
-  isPromise,
-  markPromiseHandled,
-} = utils;
+const { isArrayBuffer, isArrayBufferView, isPromise, markPromiseHandled } =
+  utils;
 
 // The native backend (see the fence conventions in native.ts). The cast
 // restores the real shape.
@@ -61,6 +54,10 @@ const { nativeStreamInternals } = require('webstreams/native') as {
   nativeStreamInternals: NativeStreamInternals;
 };
 const { kExtractNativeSink, isNativeUnderlyingSink } = nativeStreamInternals;
+
+import type { ViewExtentHelpers } from './view-extent';
+const { viewByteLength } =
+  require('webstreams/view-extent') as ViewExtentHelpers;
 
 const { RingBuffer } = require('webstreams/ring-buffer') as {
   RingBuffer: RingBufferConstructor;
@@ -119,6 +116,20 @@ function assertPrivateSymbol(symbol: symbol): void {
   if (symbol !== kPrivateSymbol) {
     throw new TypeError('Illegal constructor');
   }
+}
+
+// WebIDL "a promise resolved with" a value: a new promise resolved with it.
+// For a promise or thenable, its reactions run one microtask after the
+// value's (two if the value settles before the resolution job subscribes
+// to it), where PromiseResolve adopts a native promise as is. The
+// controllers here and in readable.ts settle their start() results this
+// way, as the transformer's cancel and flush are (transform.ts); that
+// timing is observable, as in WPT transform-streams/cancel.any.js.
+function promiseResolvedWith(value: unknown): Promise<void> {
+  const { promise, resolve } =
+    PromiseWithResolvers() as PromiseWithResolversType<void>;
+  resolve(value as void);
+  return promise;
 }
 
 type WritableState = 'writable' | 'erroring' | 'errored' | 'closed';
@@ -295,6 +306,10 @@ let setWritableStreamAbortHook: <W>(
   stream: WritableStream<W>,
   hook: (() => void) | undefined
 ) => void;
+let setWritableStreamInteropErrorHook: <W>(
+  stream: WritableStream<W>,
+  hook: ((reason: unknown) => void) | undefined
+) => void;
 // Internal writer operations: the pipe implementation must never dispatch
 // through the public prototype methods (user-interceptable once the classes
 // are installed on the global).
@@ -344,6 +359,11 @@ class WritableStream<W = unknown> {
   #readyHook: (() => void) | undefined;
   // An internal sink's wake-up on abort (internalsForPipe.setAbortHook).
   #abortHook?: (() => void) | undefined;
+  // A transform pair's notification when the Node.js interop hook errors
+  // this half (internalsForPipe.setInteropErrorHook). Dropped when the
+  // stream reaches 'closed' or 'errored', so a settled half does not retain
+  // the pair.
+  #interopErrorHook?: ((reason: unknown) => void) | undefined;
   // The Node.js interop closed-promise (see kIsClosedPromise), created on
   // first request and settled when the stream reaches 'closed' or
   // 'errored'.
@@ -403,6 +423,9 @@ class WritableStream<W = unknown> {
     };
     setWritableStreamAbortHook = (stream, hook) => {
       stream.#abortHook = hook;
+    };
+    setWritableStreamInteropErrorHook = (stream, hook) => {
+      stream.#interopErrorHook = hook;
     };
     setWritableStreamWriter = (stream, writer) => {
       stream.#writer = writer;
@@ -628,6 +651,7 @@ class WritableStream<W = unknown> {
       // assert: state 'erroring', no operations in flight
       stream.#state = 'errored';
       settleClosedPromise(stream);
+      stream.#interopErrorHook = undefined;
       const controller = stream.#controller;
       if (controller !== undefined) {
         controllerErrorSteps(controller); // reset the controller queue
@@ -742,6 +766,7 @@ class WritableStream<W = unknown> {
       }
       stream.#state = 'closed';
       settleClosedPromise(stream);
+      stream.#interopErrorHook = undefined;
       const writer = stream.#writer;
       if (writer !== undefined) {
         writerResolveClosedPromise(writer);
@@ -898,12 +923,25 @@ class WritableStream<W = unknown> {
   }
 
   // Node.js interop (see kControllerErrorFunction): errors a writable
-  // stream from outside, as its controller's error() does — a no-op unless
-  // the stream is still 'writable'.
+  // stream from outside, as its controller's error() does. The sink's abort
+  // algorithm does not run, so a transform pair learns of it through its
+  // interop error hook, once this half is erroring: the entry half always
+  // goes first, so the pair's rejections land writable-then-readable here
+  // (TransformStreamError's land readable-then-writable; nothing depends on
+  // the order). The 'writable' check is what gates the hook — the
+  // controller's errorIfNeeded is already a no-op past 'writable' — so that
+  // an 'erroring' writable, whose pair is already being torn down, does not
+  // fire it again with a second reason.
   [kControllerErrorFunction](reason: unknown): void {
     assertIsWritableStream(this);
+    if (this.#state !== 'writable') return;
+    // Taken before the error, which may reach 'errored' synchronously and
+    // drop the slot; like the abort hook, it fires once.
+    const hook = this.#interopErrorHook;
+    this.#interopErrorHook = undefined;
     const controller = this.#controller;
     if (controller !== undefined) controllerErrorIfNeeded(controller, reason);
+    if (hook !== undefined) hook(reason);
   }
 }
 
@@ -1020,9 +1058,11 @@ class WritableStreamDefaultController<
     };
 
     // WritableStreamDefaultControllerGetChunkSize (spec §5.5.4)
-    // Runs the strategy size algorithm; on failure, errors the stream and
+    // Runs the strategy size algorithm; if it throws, errors the stream and
     // returns 1 (spec step 3).  Called BEFORE state checks / write-request
-    // enqueue per WritableStreamDefaultWriterWrite step 4.
+    // enqueue per WritableStreamDefaultWriterWrite step 4. The result is
+    // validated only on enqueue (controllerWrite), so a write the state
+    // checks reject never errors the stream with an invalid size.
     controllerGetChunkSize = <W>(
       controller: WritableStreamDefaultController<W>,
       chunk: W
@@ -1030,11 +1070,7 @@ class WritableStreamDefaultController<
       const sizeAlgorithm = controller.#sizeAlgorithm;
       if (sizeAlgorithm === undefined) return 1;
       try {
-        const size = +sizeAlgorithm(chunk);
-        if (NumberIsNaN(size) || size < 0 || size === Infinity) {
-          throw new RangeError('Invalid chunk size');
-        }
-        return size;
+        return +sizeAlgorithm(chunk);
       } catch (e) {
         controller.#errorIfNeeded(e);
         return 1;
@@ -1049,6 +1085,12 @@ class WritableStreamDefaultController<
       chunk: W,
       chunkSize: number
     ) => {
+      // EnqueueValueWithSize: an invalid size errors the stream, which
+      // rejects the write request just added.
+      if (NumberIsNaN(chunkSize) || chunkSize < 0 || chunkSize === Infinity) {
+        controller.#errorIfNeeded(new RangeError('Invalid chunk size'));
+        return;
+      }
       controller.#queue.push({ value: chunk, size: chunkSize });
       controller.#queueTotalSize += chunkSize;
       const stream = controller.#stream;
@@ -1144,7 +1186,7 @@ class WritableStreamDefaultController<
         ? undefined
         : uncurryThis(startFn)(underlyingSink, this);
     PromisePrototypeThen(
-      PromiseResolve(startResult),
+      promiseResolvedWith(startResult),
       () => {
         this.#started = true;
         this.#advanceQueueIfNeeded();
@@ -1798,9 +1840,8 @@ function writableStreamFlush<W>(stream: WritableStream<W>): Promise<void> {
 // heuristic).
 function byteSizeOf(chunk: unknown): number {
   if (isArrayBufferView(chunk)) {
-    return isDataView(chunk)
-      ? DataViewPrototypeGetByteLength(chunk)
-      : TypedArrayPrototypeGetByteLength(chunk);
+    // A detached or out-of-bounds view counts 0 (see view-extent.ts).
+    return viewByteLength(chunk);
   }
   if (isArrayBuffer(chunk)) {
     return ArrayBufferPrototypeByteLengthGet(chunk);
@@ -1930,6 +1971,15 @@ module.exports = {
       stream: WritableStream<W>,
       hook: (() => void) | undefined
     ): void => setWritableStreamAbortHook(stream, hook),
+    // A transform pair's notification, called synchronously with the
+    // reason after the Node.js interop hook has errored this stream (the
+    // only external error path that bypasses the sink). Fires at most once;
+    // the stream drops it on reaching 'closed' or 'errored'. undefined
+    // clears it.
+    setInteropErrorHook: <W>(
+      stream: WritableStream<W>,
+      hook: ((reason: unknown) => void) | undefined
+    ): void => setWritableStreamInteropErrorHook(stream, hook),
     // Whether a writer.write() issued NOW would be accepted (enqueued for a
     // sink step) rather than rejected by the state checks. The writer
     // machinery runs the strategy size() callback BEFORE those checks, so
@@ -1950,6 +2000,7 @@ module.exports = {
       getWriterReadyPromiseInternal(writer),
     getWriterClosedPromise: <W>(writer: WritableStreamDefaultWriter<W>) =>
       getWriterClosedPromiseInternal(writer),
+    promiseResolvedWith,
   },
 
   // Part of the internal implementation. Do not re-export to user code
