@@ -1,8 +1,6 @@
 
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: '0 0 * * *'
 name: Semgrep config
 jobs:
   semgrep:
@@ -18,7 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: semgrep ci
-
 
 
 
