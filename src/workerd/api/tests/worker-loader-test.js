@@ -279,12 +279,19 @@ export let passEnvCaps = {
 export let privateEnvIsNotImportable = {
   async test(ctrl, env, ctx) {
     const publicLoader = env.loaderFactory.get('public-private-env-test');
-    assert.throws(() => publicLoader.load({
-      compatibilityDate: '2025-01-01',
-      mainModule: 'foo.js',
-      modules: { 'foo.js': 'export default { fetch() { return new Response("ok"); } };' },
-      openComputePrivateEnv: { secret: 'forbidden' },
-    }), /host-issued WorkerLoader grant/);
+    assert.throws(
+      () =>
+        publicLoader.load({
+          compatibilityDate: '2025-01-01',
+          mainModule: 'foo.js',
+          modules: {
+            'foo.js':
+              'export default { fetch() { return new Response("ok"); } };',
+          },
+          openComputePrivateEnv: { secret: 'forbidden' },
+        }),
+      /host-issued WorkerLoader grant/
+    );
     let worker = env.loader.get('privateEnvIsNotImportable', () => ({
       compatibilityDate: '2025-01-01',
       mainModule: 'foo.js',
@@ -355,7 +362,9 @@ export let privateEnvIsNotImportable = {
 
 export let privateLoaderGrantSurvivesTransfer = {
   async test(ctrl, env) {
-    const privilegedLoader = env.loaderFactory.getPrivate('transferred-private-loader');
+    const privilegedLoader = env.loaderFactory.getPrivate(
+      'transferred-private-loader'
+    );
     const parent = env.loader.load({
       compatibilityDate: '2025-01-01',
       mainModule: 'parent.js',

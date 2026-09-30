@@ -228,8 +228,14 @@ export const revokeRetainedCapabilities = {
       stub.getEntrypoint().value(),
       /namespace has been revoked/
     );
-    assert.throws(() => env.factory.get('revoked'), /namespace has been revoked/);
-    assert.throws(() => env.factory.getPrivate('revoked'), /namespace has been revoked/);
+    assert.throws(
+      () => env.factory.get('revoked'),
+      /namespace has been revoked/
+    );
+    assert.throws(
+      () => env.factory.getPrivate('revoked'),
+      /namespace has been revoked/
+    );
     const replacement = env.factory.get('replacement');
     assert.equal(
       await replacement
@@ -239,7 +245,10 @@ export const revokeRetainedCapabilities = {
       'new'
     );
     env.factory.revoke('absent');
-    assert.throws(() => env.factory.get('absent'), /namespace has been revoked/);
+    assert.throws(
+      () => env.factory.get('absent'),
+      /namespace has been revoked/
+    );
   },
 };
 
@@ -252,14 +261,32 @@ export const revokeNamespacePrefix = {
     const retained = first.get('child', () => code('old')).getEntrypoint();
     assert.equal(await retained.value(), 'old');
     env.factory.revokePrefix(old);
-    assert.throws(() => first.load(code('denied')), /namespace has been revoked/);
+    assert.throws(
+      () => first.load(code('denied')),
+      /namespace has been revoked/
+    );
     await assert.rejects(retained.value(), /namespace has been revoked/);
-    assert.throws(() => env.factory.get(old + 'b'.repeat(64)), /namespace has been revoked/);
-    assert.throws(() => env.factory.getPrivate(old + 'c'.repeat(64)), /namespace has been revoked/);
-    assert.equal(await env.factory.get(next + 'b'.repeat(64))
-        .get('child', () => code('next')).getEntrypoint().value(), 'next');
+    assert.throws(
+      () => env.factory.get(old + 'b'.repeat(64)),
+      /namespace has been revoked/
+    );
+    assert.throws(
+      () => env.factory.getPrivate(old + 'c'.repeat(64)),
+      /namespace has been revoked/
+    );
+    assert.equal(
+      await env.factory
+        .get(next + 'b'.repeat(64))
+        .get('child', () => code('next'))
+        .getEntrypoint()
+        .value(),
+      'next'
+    );
     env.factory.revokePrefix(worker);
-    assert.throws(() => env.factory.get(next + 'b'.repeat(64)), /namespace has been revoked/);
+    assert.throws(
+      () => env.factory.get(next + 'b'.repeat(64)),
+      /namespace has been revoked/
+    );
     assert.throws(() => env.factory.revokePrefix('bad'), /prefix is invalid/);
   },
 };
@@ -523,8 +550,14 @@ export const sharedFactoryAcrossServices = {
     assert.equal(await env.peer.read('shared-factory', 'second'), 'first');
     await env.peer.revoke('shared-factory');
     await assert.rejects(original.value(), /namespace has been revoked/);
-    await assert.rejects(env.peer.read('shared-factory', 'second'), /namespace has been revoked/);
-    assert.equal(await env.peer.read('shared-factory-next', 'second'), 'second');
+    await assert.rejects(
+      env.peer.read('shared-factory', 'second'),
+      /namespace has been revoked/
+    );
+    assert.equal(
+      await env.peer.read('shared-factory-next', 'second'),
+      'second'
+    );
     await assert.rejects(original.value(), /namespace has been revoked/);
     env.factory.revoke('shared-factory');
   },
