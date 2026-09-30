@@ -550,6 +550,7 @@ wd_cc_library(
         "@capnp-cpp//src/kj:kj-async-io",
         "@capnp-cpp//src/kj:kj-async-os-hdrs",
     ],
+    alwayslink = True,
 )
 
 # Runtime check through the public entry point: kj::setupAsyncIo() must hand back the tokio
