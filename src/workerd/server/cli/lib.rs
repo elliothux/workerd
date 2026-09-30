@@ -444,6 +444,7 @@ fn serve_options<T: CommandFactory>(
             .collect(),
         socket_fd_overrides,
         control_fd: serve.control_fd.into(),
+        host_extension_fd: serve.host_extension_fd.into(),
         debug_port: serve.debug_port.into(),
     };
     (options, inherited)

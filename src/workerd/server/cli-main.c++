@@ -199,6 +199,16 @@ class CliMain {
     KJ_IF_SOME(fd, options.control_fd) {
       server->enableControl(fd);
     }
+    KJ_IF_SOME(fd, options.host_extension_fd) {
+#if _WIN32
+      KJ_FAIL_REQUIRE("Native host extensions are not supported on Windows.");
+#else
+      server->enableHostExtensionBroker(
+          io.lowLevelProvider->wrapUnixSocketFd(static_cast<kj::LowLevelAsyncIoProvider::Fd>(fd),
+              kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP),
+          *io.lowLevelProvider);
+#endif
+    }
     KJ_IF_SOME(addr, options.debug_port) {
       server->enableDebugPort(kj::str(addr));
     }

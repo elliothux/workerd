@@ -277,6 +277,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "fd", value_parser = parse_control_fd)]
     pub control_fd: Option<u32>,
 
+    /// Use a private Unix capability socket on descriptor <fd> to acquire native extension
+    /// sessions.
+    #[arg(long, value_name = "fd", value_parser = parse_control_fd)]
+    pub host_extension_fd: Option<u32>,
+
     /// Listen on the specified address for debug RPC connections. This exposes a privileged
     /// interface that allows access to all services in the process. For use by miniflare and local
     /// development only.
@@ -515,6 +520,7 @@ mod tests {
             "--socket-addr",
             "http=*:8080",
             "--control-fd=3",
+            "--host-extension-fd=4",
             "--inspector-addr=127.0.0.1:9229",
             "--inspector-addr=127.0.0.1:9230",
         ])
@@ -534,6 +540,7 @@ mod tests {
             Some("127.0.0.1:9230")
         );
         assert_eq!(serve.control_fd, Some(3));
+        assert_eq!(serve.host_extension_fd, Some(4));
         assert_eq!(
             serve.socket_addr_overrides,
             [Override {

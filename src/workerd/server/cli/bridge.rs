@@ -67,6 +67,7 @@ pub mod ffi {
         socket_addr_overrides: Vec<Override>,
         socket_fd_overrides: Vec<SocketFd>,
         control_fd: KjMaybe<u32>,
+        host_extension_fd: KjMaybe<u32>,
         debug_port: KjMaybe<String>,
     }
 
