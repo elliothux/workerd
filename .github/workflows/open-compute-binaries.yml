@@ -36,6 +36,8 @@ jobs:
           brew install lld
           sudo ln -s -f "$(brew --prefix lld)/bin/ld64.lld" /usr/local/bin/ld64.lld
           echo "build:macos --config=macos_lld_icf" >> .bazelrc
+      - name: Check Tokio I/O graph
+        run: ./build/rust_io_graph_check.sh --config=${{ matrix.config }}
       - name: Build
         run: >-
           bazel build //src/workerd/server:workerd
