@@ -524,7 +524,8 @@ wd_cc_library(
         "//src/workerd/jsg",
         "//src/workerd/util:exception",
         "@capnp-cpp//src/kj",
-        "@capnp-cpp//src/kj:kj-async",
+        "@capnp-cpp//src/kj:kj-async-core",
+        "@capnp-cpp//src/kj:kj-async-io",
     ],
 )
 
@@ -544,7 +545,8 @@ wd_cc_library(
         "//src/workerd/jsg",
         "//src/workerd/util:exception",
         "@capnp-cpp//src/kj",
-        "@capnp-cpp//src/kj:kj-async",
+        "@capnp-cpp//src/kj:kj-async-core",
+        "@capnp-cpp//src/kj:kj-async-io",
     ],
 )
 
@@ -657,7 +659,8 @@ kj_test(
         ":thread-cpu-clock",
         "//src/workerd/util:test-util",
         "@capnp-cpp//src/kj",
-        "@capnp-cpp//src/kj:kj-async",
+        "@capnp-cpp//src/kj:kj-async-core",
+        "@capnp-cpp//src/kj:kj-async-io",
     ],
 )
 
@@ -670,6 +673,7 @@ kj_test(
         ":thread-cpu-clock",
         "//src/workerd/util:test-util",
         "@capnp-cpp//src/kj",
-        "@capnp-cpp//src/kj:kj-async",
+        "@capnp-cpp//src/kj:kj-async-core",
+        "@capnp-cpp//src/kj:kj-async-io",
     ],
 )
