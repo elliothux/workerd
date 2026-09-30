@@ -2,6 +2,11 @@ name: Open Compute binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Release tag, for example v1.20260930.0-open-compute-r4.012345678
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -74,19 +79,61 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  compare-catalogs:
+  publish:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
         with:
           pattern: workerd-*
           path: artifacts
-      - name: Require byte-identical target catalogs
+      - name: Validate and package release assets
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
+          set -euo pipefail
+          [[ "$RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-open-compute-[A-Za-z0-9._-]+$ ]]
           mapfile -t catalogs < <(find artifacts -name compatibility-catalog.json -type f | sort)
           test "${#catalogs[@]}" -eq 4
           for catalog in "${catalogs[@]:1}"; do
             cmp "${catalogs[0]}" "$catalog"
           done
-          shasum -a 256 "${catalogs[0]}"
+          mkdir release
+          cp "${catalogs[0]}" release/compatibility-catalog.json
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            binary="artifacts/workerd-$target/workerd"
+            test -f "$binary"
+            case "$target" in
+              darwin-x64) archive=workerd-darwin-64.gz ;;
+              linux-x64) archive=workerd-linux-64.gz ;;
+              *) archive="workerd-$target.gz" ;;
+            esac
+            gzip -9n -c "$binary" > "release/$archive"
+            cp "artifacts/workerd-$target/build-inputs.txt" "release/build-inputs-$target.txt"
+          done
+          (
+            cd release
+            sha256sum workerd-*.gz compatibility-catalog.json build-inputs-*.txt > SHA256SUMS
+          )
+      - name: Publish immutable release inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: >-
+          gh release create "$RELEASE"
+          release/workerd-darwin-arm64.gz
+          release/workerd-darwin-64.gz
+          release/workerd-linux-arm64.gz
+          release/workerd-linux-64.gz
+          release/compatibility-catalog.json
+          release/build-inputs-darwin-arm64.txt
+          release/build-inputs-darwin-x64.txt
+          release/build-inputs-linux-arm64.txt
+          release/build-inputs-linux-x64.txt
+          release/SHA256SUMS
+          --target "$GITHUB_SHA"
+          --title "$RELEASE"
+          --notes "Four-platform open-compute workerd build from $GITHUB_SHA."
