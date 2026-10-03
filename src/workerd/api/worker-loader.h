@@ -118,9 +118,28 @@ class WorkerLoader: public jsg::Object {
     // Any RPC-serializable value!
     jsg::Optional<jsg::JsRef<jsg::JsObject>> env;
 
-    // Additional bindings for the handler env only. They are not exposed through
-    // the importable cloudflare:workers env object.
+    // Host-owned bindings, never exposed through the importable cloudflare:workers env.
+    // With openComputeHostPolicy they are delivered only to the config-owned policy factory;
+    // otherwise the host's handler adapter receives and filters them.
     jsg::Optional<jsg::JsRef<jsg::JsObject>> openComputePrivateEnv;
+
+    struct HostBinding {
+      kj::String kind;
+      jsg::Ref<Fetcher> fetcher;
+      jsg::Optional<kj::String> wrapperModule;
+
+      JSG_STRUCT(kind, fetcher, wrapperModule);
+    };
+
+    // Typed product capabilities constructed only by a host-issued private loader. The raw
+    // fetcher is materialized as a native or internal wrapped binding in the child isolate.
+    jsg::Optional<jsg::Dict<HostBinding>> openComputeBindings;
+
+    // Execute the fixed config-owned environment/export policy before tenant entrypoints.
+    jsg::Optional<bool> openComputeHostPolicy;
+
+    // Dedicated Python snapshot selected and authenticated by the trusted host.
+    jsg::Optional<kj::Array<const byte>> openComputePythonSnapshot;
 
     // `Fetcher` (e.g. service binding) representing the loaded worker's global outbound.
     //
@@ -129,11 +148,12 @@ class WorkerLoader: public jsg::Object {
     // If `null`, block the global outbound (all requests throw errors).
     jsg::Optional<kj::Maybe<jsg::Ref<Fetcher>>> globalOutbound;
 
+    // Cache API backend selected only by a host-issued private loader. It is not an env binding.
+    jsg::Optional<jsg::Ref<Fetcher>> openComputeCache;
+
     // Specify tail workers.
     jsg::Optional<kj::Array<jsg::Ref<Fetcher>>> tails;
     jsg::Optional<kj::Array<jsg::Ref<Fetcher>>> streamingTails;
-
-    // TODO(someday): cache API outbound?
 
     JSG_STRUCT(compatibilityDate,
         compatibilityFlags,
@@ -143,7 +163,11 @@ class WorkerLoader: public jsg::Object {
         modules,
         env,
         openComputePrivateEnv,
+        openComputeBindings,
+        openComputeHostPolicy,
+        openComputePythonSnapshot,
         globalOutbound,
+        openComputeCache,
         tails,
         streamingTails);
 
@@ -158,6 +182,9 @@ class WorkerLoader: public jsg::Object {
   // Shortcut for `get(null, () => code)`.
   jsg::Ref<WorkerStub> load(jsg::Lock& js, WorkerCode code);
 
+  // Host-only deploy-time validation. Returns a dedicated snapshot without invoking a handler.
+  jsg::Promise<jsg::JsRef<jsg::JsUint8Array>> preparePython(jsg::Lock& js, WorkerCode code);
+
   void serialize(jsg::Lock& js, jsg::Serializer& serializer);
   static jsg::Ref<WorkerLoader> deserialize(
       jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
@@ -165,6 +192,7 @@ class WorkerLoader: public jsg::Object {
   JSG_RESOURCE_TYPE(WorkerLoader) {
     JSG_METHOD(get);
     JSG_METHOD(load);
+    JSG_METHOD(preparePython);
 
     JSG_TS_ROOT();
   }
@@ -228,6 +256,11 @@ class WorkerLoaderFactory: public jsg::Object {
  public:
   explicit WorkerLoaderFactory(uint channel): channel(channel) {}
 
+  // The host must refuse private capability assembly without native env isolation.
+  uint getHostPolicyVersion() const {
+    return 1;
+  }
+
   jsg::Ref<WorkerLoader> get(jsg::Lock& js, kj::String name);
   jsg::Ref<WorkerLoader> getPrivate(jsg::Lock& js, kj::String name);
   void revoke(jsg::Lock& js, kj::String name);
@@ -240,6 +273,7 @@ class WorkerLoaderFactory: public jsg::Object {
       jsg::Optional<WorkerStub::EntrypointOptions> options);
 
   JSG_RESOURCE_TYPE(WorkerLoaderFactory) {
+    JSG_READONLY_PROTOTYPE_PROPERTY(hostPolicyVersion, getHostPolicyVersion);
     JSG_METHOD(get);
     JSG_METHOD(getPrivate);
     JSG_METHOD(revoke);
@@ -294,7 +328,8 @@ class HostExtensionFactory: public jsg::Object {
 
 #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
-      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoaderFactory,          \
-      api::HostFacets, api::HostExtensionPort, api::HostExtensionFactory, workerd::ResourceLimits
+      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode,                                    \
+      api::WorkerLoader::WorkerCode::HostBinding, api::WorkerLoaderFactory, api::HostFacets,       \
+      api::HostExtensionPort, api::HostExtensionFactory, workerd::ResourceLimits
 
 }  // namespace workerd::api

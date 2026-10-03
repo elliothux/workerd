@@ -270,6 +270,33 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
 
+jsg::Promise<jsg::JsRef<jsg::JsUint8Array>> WorkerLoader::preparePython(
+    jsg::Lock& js, WorkerCode code) {
+  JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
+      "Python preparation requires a host-issued WorkerLoader grant.");
+  JSG_REQUIRE(code.mainModule.endsWith(".py"_kj), TypeError,
+      "Python preparation requires a Python main module.");
+  JSG_REQUIRE(code.openComputePythonSnapshot == kj::none, TypeError,
+      "Python preparation does not accept an existing snapshot.");
+  auto& ioctx = IoContext::current();
+  auto source = toDynamicWorkerSource(js, ioctx, compatDateValidation, true, kj::mv(code));
+  JSG_REQUIRE(source.compatibilityFlags.getPythonDedicatedSnapshot(), TypeError,
+      "Python preparation requires dedicated snapshots to be enabled.");
+  source.preparePython = true;
+  // Preparation is a single-use operation: its stub is retained only until the result settles.
+  auto isolate = loadIsolate(
+      ioctx, kj::none, [source = kj::mv(source)]() mutable -> kj::Promise<DynamicWorkerSource> {
+    return kj::mv(source);
+  });
+  auto result = isolate->takePythonSnapshot();
+  return ioctx.awaitIo(js, kj::mv(result),
+      [isolate = kj::mv(isolate)](jsg::Lock& js, kj::Array<byte> snapshot) mutable {
+    JSG_REQUIRE(snapshot.size() >= 16 && snapshot.size() <= 128 * 1024 * 1024, RangeError,
+        "Prepared Python snapshot size is invalid.");
+    return jsg::JsUint8Array::create(js, snapshot.asPtr()).addRef(js);
+  });
+}
+
 kj::Own<WorkerStubChannel> WorkerLoader::loadIsolate(IoContext& ioctx,
     kj::Maybe<kj::String> name,
     kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
@@ -527,14 +554,79 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
   auto ownCompatFlags = extractCompatFlags(js, code, compatDateValidation);
   CompatibilityFlags::Reader compatFlags = *ownCompatFlags;
 
+  KJ_IF_SOME(policy, code.openComputeHostPolicy) {
+    JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
+        "Host policy requires a host-issued WorkerLoader grant.");
+    JSG_REQUIRE(policy, TypeError, "Host policy must be enabled when specified.");
+  }
+
+  KJ_IF_SOME(snapshot, code.openComputePythonSnapshot) {
+    JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
+        "Prepared Python snapshots require a host-issued WorkerLoader grant.");
+    JSG_REQUIRE(code.mainModule.endsWith(".py"_kj), TypeError,
+        "Prepared Python snapshots require a Python main module.");
+    JSG_REQUIRE(compatFlags.getPythonDedicatedSnapshot(), TypeError,
+        "Prepared Python snapshots require dedicated snapshots to be enabled.");
+    JSG_REQUIRE(snapshot.size() >= 16 && snapshot.size() <= 128 * 1024 * 1024, RangeError,
+        "Prepared Python snapshot size is invalid.");
+  }
+
   Frankenvalue env;
   KJ_IF_SOME(codeEnv, code.env) {
     env = Frankenvalue::fromJs(js, codeEnv.getHandle(js));
+  }
+  KJ_IF_SOME(bindings, code.openComputeBindings) {
+    JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
+        "Typed WorkerCode bindings require a host-issued WorkerLoader grant.");
+    JSG_REQUIRE(bindings.fields.size() <= 128, RangeError, "Too many typed WorkerCode bindings.");
+    if (code.env == kj::none) env = Frankenvalue::fromJs(js, js.obj());
+    for (auto& binding: bindings.fields) {
+      JSG_REQUIRE(binding.name.size() > 0 && binding.name.size() <= 64 &&
+              binding.name != "__proto__"_kj && binding.name != "constructor"_kj &&
+              binding.name != "prototype"_kj,
+          TypeError, "Invalid typed WorkerCode binding name.");
+      KJ_IF_SOME(codeEnv, code.env) {
+        JSG_REQUIRE(!codeEnv.getHandle(js).has(js, binding.name, jsg::JsObject::HasOption::OWN),
+            TypeError, "Typed WorkerCode binding conflicts with env.");
+      }
+      auto& value = binding.value;
+      uint16_t tag;
+      if (value.kind == "kvNamespace"_kj) {
+        tag = static_cast<uint16_t>(rpc::SerializationTag::KV_NAMESPACE);
+      } else if (value.kind == "r2Bucket"_kj) {
+        tag = static_cast<uint16_t>(rpc::SerializationTag::R2_BUCKET);
+      } else if (value.kind == "queue"_kj) {
+        tag = static_cast<uint16_t>(rpc::SerializationTag::WORKER_QUEUE);
+      } else if (value.kind == "service"_kj) {
+        tag = static_cast<uint16_t>(rpc::SerializationTag::OPEN_COMPUTE_SERVICE_FETCHER);
+      } else if (value.kind == "wrapped"_kj) {
+        tag = static_cast<uint16_t>(rpc::SerializationTag::SERVICE_STUB);
+      } else {
+        JSG_FAIL_REQUIRE(TypeError, "Unsupported typed WorkerCode binding kind.");
+      }
+      JSG_REQUIRE((value.kind == "wrapped"_kj) == (value.wrapperModule != kj::none), TypeError,
+          "Only wrapped WorkerCode bindings require an internal wrapper module.");
+      KJ_IF_SOME(wrapper, value.wrapperModule) {
+        JSG_REQUIRE(wrapper.size() <= 128 && wrapper.startsWith("cloudflare-internal:"_kj),
+            TypeError, "Typed WorkerCode wrappers must be internal modules.");
+      }
+      auto transport = value.fetcher->getSubrequestChannel(ioctx);
+      transport->requireAllowsTransfer();
+      auto capability = [&]() {
+        KJ_IF_SOME(wrapper, value.wrapperModule) {
+          return Frankenvalue::fromWrappedCapability(tag, kj::mv(transport), kj::mv(wrapper));
+        }
+        return Frankenvalue::fromCapability(tag, kj::mv(transport));
+      }();
+      env.setProperty(kj::mv(binding.name), kj::mv(capability));
+    }
   }
   Frankenvalue privateEnv;
   KJ_IF_SOME(codePrivateEnv, code.openComputePrivateEnv) {
     JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
         "Private WorkerCode bindings require a host-issued WorkerLoader grant.");
+    JSG_REQUIRE(code.openComputeHostPolicy.orDefault(false), TypeError,
+        "Private WorkerCode bindings require the configured host policy.");
     privateEnv = Frankenvalue::fromJs(js, codePrivateEnv.getHandle(js));
   }
   auto publicEstimate = env.estimateSize();
@@ -561,6 +653,15 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     // outbound of the parent, it must be OK to be the global outbound of the child.
     globalOutbound =
         ioctx.getIoChannelFactory().getSubrequestChannel(IoContext::NULL_CLIENT_CHANNEL);
+  }
+
+  kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> cacheApiOutbound;
+  KJ_IF_SOME(cache, code.openComputeCache) {
+    JSG_REQUIRE(allowOpenComputePrivateEnv, TypeError,
+        "Cache backend requires a host-issued WorkerLoader grant.");
+    auto channel = cache->getSubrequestChannel(ioctx);
+    channel->requireAllowsTransfer();
+    cacheApiOutbound = kj::mv(channel);
   }
 
   kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tailChannels;
@@ -590,7 +691,10 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     .limits = code.limits,
     .env = kj::mv(env),
     .privateEnv = kj::mv(privateEnv),
+    .hostPolicy = code.openComputeHostPolicy.orDefault(false),
+    .pythonSnapshot = kj::mv(code.openComputePythonSnapshot),
     .globalOutbound = kj::mv(globalOutbound),
+    .cacheApiOutbound = kj::mv(cacheApiOutbound),
     .tails = kj::mv(tailChannels),
     .streamingTails = kj::mv(streamingTailChannels),
     .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),

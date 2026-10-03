@@ -2293,7 +2293,7 @@ jsg::Promise<jsg::Ref<Response>> Fetcher::fetch(jsg::Lock& js,
   return fetchImpl(js, JSG_THIS, kj::mv(requestOrUrl), kj::mv(requestInit));
 }
 
-kj::Maybe<jsg::Ref<JsRpcProperty>> Fetcher::getRpcMethod(jsg::Lock& js, kj::String name) {
+kj::Maybe<jsg::JsValue> Fetcher::getRpcMethod(jsg::Lock& js, kj::String name) {
   // This is like JsRpcStub::getRpcMethod(), but we also initiate a whole new JS RPC session
   // each time the method is called (handled by `getClientForOneCall()`, below).
 
@@ -2323,7 +2323,11 @@ kj::Maybe<jsg::Ref<JsRpcProperty>> Fetcher::getRpcMethod(jsg::Lock& js, kj::Stri
     return kj::none;
   }
 
-  return getRpcMethodInternal(js, kj::mv(name));
+  KJ_IF_SOME(property, getRpcMethodInternal(js, kj::mv(name))) {
+    auto& handler = KJ_ASSERT_NONNULL(js.tryGetTypeHandler<jsg::Ref<JsRpcProperty>>());
+    return jsg::JsValue(handler.wrap(js, kj::mv(property)));
+  }
+  return kj::none;
 }
 
 kj::Maybe<jsg::Ref<JsRpcProperty>> Fetcher::getRpcMethodInternal(jsg::Lock& js, kj::String name) {
@@ -2801,6 +2805,10 @@ Fetcher::ClientWithTracing Fetcher::wrapWithInnerSpan(
 Fetcher::ClientWithTracing Fetcher::buildClient(IoContext& ioContext,
     kj::Maybe<kj::String> cfStr,
     kj::ConstString operationName) {
+  if (channelOrClientFactory.is<jsg::Ref<Fetcher>>()) {
+    return buildClient(ioContext, kj::mv(cfStr), kj::mv(operationName),
+        [](TraceContext&) -> kj::Maybe<SpanParent> { return kj::none; });
+  }
   KJ_SWITCH_ONEOF(channelOrClientFactory) {
     KJ_CASE_ONEOF(channel, uint) {
       auto traceContext = ioContext.makeUserTraceSpan(kj::mv(operationName));
@@ -2834,6 +2842,9 @@ Fetcher::ClientWithTracing Fetcher::buildClient(IoContext& ioContext,
       auto result = outgoingFactory->newSingleUseClient(ioContext, kj::mv(cfStr),
           [](TraceContext&) -> kj::Maybe<SpanParent> { return kj::none; });
       return wrapWithInnerSpan(kj::mv(result), kj::mv(operationName));
+    }
+    KJ_CASE_ONEOF(transport, jsg::Ref<Fetcher>) {
+      KJ_UNREACHABLE;
     }
   }
   KJ_UNREACHABLE;
@@ -2920,6 +2931,26 @@ Fetcher::ClientWithTracing Fetcher::buildClient(IoContext& ioContext,
       });
       return ClientWithTracing{kj::mv(result.client), kj::mv(traceContext)};
     }
+    KJ_CASE_ONEOF(transport, jsg::Ref<Fetcher>) {
+      auto traceContext = ioContext.makeUserTraceSpan(kj::mv(operationName));
+      auto userSpanParent = traceContext.getUserSpanParent();
+      KJ_IF_SOME(parent, makeUserSpanParent(traceContext)) {
+        userSpanParent = kj::mv(parent);
+      }
+      auto channel = transport->getSubrequestChannel(ioContext);
+      auto client = ioContext.getSubrequestNoChecks(
+          [&](TraceContext& tracing, IoChannelFactory&) {
+        return channel->startRequest({.cfBlobJson = kj::mv(cfStr),
+            .parentSpan = tracing.getInternalSpanParent(),
+            .userSpanParent = kj::mv(userSpanParent),
+            .dynamicWorkerTails = ioContext.getDynamicWorkerTails()});
+      }, {
+        .inHouse = true,
+        .wrapMetrics = false,
+        .existingTraceContext = traceContext,
+      }, CountSubrequest::NO);
+      return ClientWithTracing{kj::mv(client), kj::mv(traceContext)};
+    }
   }
   KJ_UNREACHABLE;
 }
@@ -2937,6 +2968,9 @@ kj::Own<IoChannelFactory::SubrequestChannel> Fetcher::getSubrequestChannel(IoCon
     }
     KJ_CASE_ONEOF(outgoingFactory, kj::Own<CrossContextOutgoingFactory>) {
       return outgoingFactory->getSubrequestChannel(ioContext);
+    }
+    KJ_CASE_ONEOF(transport, jsg::Ref<Fetcher>) {
+      JSG_FAIL_REQUIRE(TypeError, "Private control transports cannot be transferred.");
     }
   }
   KJ_UNREACHABLE;

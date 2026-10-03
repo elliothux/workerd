@@ -32,13 +32,13 @@ struct StandaloneIsolateLimitEnforcer::StartupScope final {
         limitErrorOrTime(limitErrorOrTime),
         turnStart(enforcer.watchdog.clock().currentThreadCpu()),
         token(enforcer.watchdog.registerTurn(
-            *enforcer.isolateState, &enforcer, STANDARD_STARTUP_CPU_LIMIT)) {}
+            *enforcer.isolateState, &enforcer, enforcer.startupCpuLimit)) {}
 
   ~StartupScope() noexcept(false) {
     auto turnEnd = enforcer.watchdog.clock().currentThreadCpu();
     auto delta = turnEnd - turnStart;
     enforcer.watchdog.finishTurn(token, delta);
-    if (delta > STANDARD_STARTUP_CPU_LIMIT) {
+    if (delta > enforcer.startupCpuLimit) {
       // Terminated by the watchdog (or a boundary-exact overrun): the startup fails
       // permanently with the stable CPU-limit exception.
       limitErrorOrTime =
@@ -61,9 +61,14 @@ kj::Own<void> StandaloneIsolateLimitEnforcer::enterBoundedStartup(
 // IsolateLimitEnforcer
 
 StandaloneIsolateLimitEnforcer::StandaloneIsolateLimitEnforcer(
-    kj::Rc<StandaloneIsolateLimitState> isolateStateParam, StandaloneLimitWatchdog& watchdogParam)
+    kj::Rc<StandaloneIsolateLimitState> isolateStateParam,
+    StandaloneLimitWatchdog& watchdogParam,
+    kj::Duration startupCpuLimit)
     : isolateState(kj::mv(isolateStateParam)),
-      watchdog(watchdogParam) {}
+      watchdog(watchdogParam),
+      startupCpuLimit(startupCpuLimit) {
+  KJ_REQUIRE(startupCpuLimit > 0 * kj::SECONDS && startupCpuLimit <= 30 * kj::SECONDS);
+}
 
 v8::Isolate::CreateParams StandaloneIsolateLimitEnforcer::getCreateParams() {
   v8::ResourceConstraints constraints;

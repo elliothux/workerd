@@ -113,6 +113,33 @@ KJ_TEST("startup overrun condemns the isolate and reports the stable CPU excepti
   KJ_EXPECT_THROW_RECOVERABLE(OVERLOADED, inFlight.wait(waitScope));
 }
 
+KJ_TEST("host preparation budget is bounded independently of Standard startup") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  (void)waitScope;
+  Fixture fix;
+  auto enforcer = kj::refcounted<StandaloneIsolateLimitEnforcer>(
+      kj::addRef(*fix.state), fix.watchdog, 30 * kj::SECONDS);
+  kj::OneOf<kj::Exception, kj::Duration> result;
+  {
+    auto scope = enforcer->enterBoundedStartup(result);
+    fix.fake.now = 2 * kj::SECONDS;
+    fix.watchdog.pollOnce();
+    KJ_EXPECT(!fix.state->isCondemned());
+  }
+  KJ_EXPECT(result.tryGet<kj::Exception>() == kj::none);
+  {
+    auto scope = enforcer->enterBoundedStartup(result);
+    fix.fake.now = 33 * kj::SECONDS;
+    fix.watchdog.pollOnce();
+  }
+  KJ_EXPECT(result.tryGet<kj::Exception>() != kj::none);
+  KJ_EXPECT(fix.state->isCondemned());
+  KJ_EXPECT_THROW_MESSAGE("startupCpuLimit",
+      kj::refcounted<StandaloneIsolateLimitEnforcer>(
+          kj::addRef(*fix.state), fix.watchdog, 31 * kj::SECONDS));
+}
+
 KJ_TEST("late watchdog events cannot condemn a finished startup") {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);

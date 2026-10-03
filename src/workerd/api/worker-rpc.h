@@ -318,6 +318,10 @@ class JsRpcClientProvider: public jsg::Object {
   // Append this provider's property path, if any, without resolving the destination client.
   virtual void appendPath(kj::Vector<kj::StringPtr>&) {}
 
+  // Private dispatch must retain transient RPC ownership checks without opening a native call.
+  // Root Fetchers are intentionally context-independent; properties inherit their parent's owner.
+  virtual void checkRpcPolicyContext() {}
+
   // Whether this provider dispatches to a Durable Object, and whether that target can create fresh
   // retry attempts. Calls through a pending result pipeline remain actor calls but cannot create a
   // fresh attempt independently of the call that produced the pipeline.
@@ -374,6 +378,7 @@ class JsRpcReplayMemoryTracker final: public kj::Refcounted {
 // but rather our own custom thenable, so that we can support pipelining on it.
 class JsRpcPromise: public JsRpcClientProvider {
  public:
+  void checkRpcPolicyContext() override;
   using PendingPipeline =
       kj::OneOf<IoOwn<rpc::JsRpcTarget::CallResults::Pipeline>, IoOwn<JsRpcCallRetryState>>;
 
@@ -399,6 +404,9 @@ class JsRpcPromise: public JsRpcClientProvider {
       kj::Maybe<ActorCallTargetRetryable> actorTargetRetryability,
       kj::Maybe<IoOwn<JsRpcReplayMemoryTracker>> replayMemoryTracker,
       kj::Maybe<IoOwn<JsRpcCallAttemptObserver>> attemptObserver);
+  // INTERNAL binding policies retain their existing dispatch pipeline without a loopback RPC hop.
+  JsRpcPromise(jsg::Lock& js, jsg::JsValue policy);
+  static jsg::Ref<JsRpcPromise> fromPolicy(jsg::Lock& js, jsg::JsValue policy);
   ~JsRpcPromise() noexcept(false);
 
   void resolve(jsg::Lock& js, jsg::JsValue result);
@@ -471,11 +479,15 @@ class JsRpcPromise: public JsRpcClientProvider {
     IoPtr<JsRpcPromise> ctxCheck;
   };
   struct Disposed {};
+  struct PrivatePolicy {
+    jsg::Value value;
+    IoPtr<JsRpcPromise> ctxCheck;
+  };
 
   // Note we don't have a "rejected" state because it works fine to just leave the state as
   // "Pending" -- calls to `pipeline` will rethrow the same exception, and holding the pipeline
   // open won't actually hold anything open on the server.
-  kj::OneOf<Pending, Resolved, Disposed> state;
+  kj::OneOf<Pending, Resolved, Disposed, PrivatePolicy> state;
 
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(inner);
@@ -485,6 +497,9 @@ class JsRpcPromise: public JsRpcClientProvider {
         visitor.visit(resolved.result);
       }
       KJ_CASE_ONEOF(disposed, Disposed) {}
+      KJ_CASE_ONEOF(policy, PrivatePolicy) {
+        visitor.visit(policy.value);
+      }
     }
   }
 };
@@ -492,6 +507,9 @@ class JsRpcPromise: public JsRpcClientProvider {
 // Represents a property -- possibly, a method -- of a remote RPC object.
 class JsRpcProperty: public JsRpcClientProvider {
  public:
+  void checkRpcPolicyContext() override {
+    parent->checkRpcPolicyContext();
+  }
   // Maximum depth of pipelined property chains. Prevents stack overflow when a chain of
   // JsRpcProperty objects is destructed recursively. 64 is beyond any legitimate RPC pipelining
   // depth.
@@ -501,6 +519,15 @@ class JsRpcProperty: public JsRpcClientProvider {
       : parent(kj::mv(parent)),
         name(kj::mv(name)),
         depth(depth) {}
+  JsRpcProperty(jsg::Lock& js,
+      jsg::Ref<JsRpcClientProvider> parent,
+      kj::String name,
+      jsg::JsValue policy,
+      uint depth = 0)
+      : parent(kj::mv(parent)),
+        name(kj::mv(name)),
+        depth(depth),
+        policy(jsg::Value(js.v8Isolate, policy)) {}
 
   void appendPath(kj::Vector<kj::StringPtr>& path) override;
   kj::Maybe<ActorCallTargetRetryable> getActorTargetRetryability() override {
@@ -569,11 +596,16 @@ class JsRpcProperty: public JsRpcClientProvider {
   // Number of JsRpcProperty links above this one in the chain. Used to enforce
   // MAX_PROPERTY_DEPTH and prevent native stack overflow on destruction.
   uint depth;
+  kj::Maybe<jsg::Value> policy;
 
   void visitForGc(jsg::GcVisitor& visitor) {
-    visitor.visit(parent);
+    visitor.visit(parent, policy);
   }
 };
+
+// Wrap a private member policy with the actual native property resource at binding boundaries.
+jsg::JsValue newRpcPolicyProperty(
+    jsg::Lock& js, jsg::Ref<JsRpcClientProvider> parent, kj::String name, jsg::JsValue policy);
 
 // A JsRpcStub object forwards JS method calls to the remote Worker/Durable Object over RPC.
 // Since methods are not known until runtime, JsRpcStub doesn't define any JS methods.
@@ -589,6 +621,7 @@ class JsRpcProperty: public JsRpcClientProvider {
 // `JsRpcStub::sendJsRpc()`.
 class JsRpcStub: public JsRpcClientProvider {
  public:
+  void checkRpcPolicyContext() override;
   // Only deserialize() needs ExternalMemoryAdjustment for allocations made while extracting a new
   // capability from an RPC response; dup() and constructor() do not create those allocations.
 
@@ -634,6 +667,11 @@ class JsRpcStub: public JsRpcClientProvider {
 
   jsg::Ref<JsRpcStub> dup(jsg::Lock& js);
   void dispose();
+  void disposeForJs(jsg::Lock& js);
+
+  // Only the INTERNAL binding factory may install a Service authority policy. Native entry
+  // points dispatch in the caller's current frame instead of adding a local RPC event.
+  void setServicePolicy(jsg::Lock& js, jsg::JsObject policy);
 
   // Given a JsRpcTarget, make an RPC stub from it.
   //
@@ -653,13 +691,14 @@ class JsRpcStub: public JsRpcClientProvider {
   static bool shouldImplicitlyStubify(jsg::Lock& js, jsg::JsObject object);
 
   // Call the stub itself as a function.
-  jsg::Ref<JsRpcPromise> call(const v8::FunctionCallbackInfo<v8::Value>& args);
+  jsg::JsValue call(const v8::FunctionCallbackInfo<v8::Value>& args,
+      const jsg::TypeHandler<jsg::Ref<JsRpcPromise>>& handler);
 
-  kj::Maybe<jsg::Ref<JsRpcProperty>> getRpcMethod(jsg::Lock& js, kj::String name);
+  kj::Maybe<jsg::JsValue> getRpcMethod(jsg::Lock& js, kj::String name);
 
   JSG_RESOURCE_TYPE(JsRpcStub) {
     JSG_METHOD(dup);
-    JSG_DISPOSE(dispose);
+    JSG_DISPOSE(disposeForJs);
     JSG_CALLABLE(call);
     JSG_WILDCARD_PROPERTY(getRpcMethod);
   }
@@ -671,6 +710,13 @@ class JsRpcStub: public JsRpcClientProvider {
   JSG_SERIALIZABLE(rpc::SerializationTag::JS_RPC_STUB);
 
  private:
+  kj::Maybe<jsg::JsRef<jsg::JsObject>> servicePolicy;
+  bool servicePolicyDisposed = false;
+
+  void visitForGc(jsg::GcVisitor& visitor) {
+    visitor.visit(servicePolicy);
+  }
+
   // Nulled out upon dispose().
   kj::Maybe<IoOwn<rpc::JsRpcTarget::Client>> capnpClient;
   kj::Maybe<IoOwn<IoChannelFactory::RpcChannel>> rpcChannel;

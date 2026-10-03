@@ -651,6 +651,11 @@ struct ResourceLimits {
 // any requests sent to the Worker will fail, propagating the exception.
 class WorkerStubChannel: public kj::Refcounted {
  public:
+  // Private deploy-time operation; ordinary Worker stubs cannot return interpreter memory.
+  virtual kj::Promise<kj::Array<byte>> takePythonSnapshot() {
+    JSG_FAIL_REQUIRE(Error, "Python preparation is not supported by this runtime.");
+  }
+
   // As with IoChannelFactory::getSubrequestChannel(), the non-virtual method waits for `props` to
   // resolve first, then calls the virtual method.
   kj::Own<IoChannelFactory::SubrequestChannel> getEntrypoint(
@@ -683,8 +688,18 @@ struct DynamicWorkerSource {
   // the importable env. Standard WorkerCode.env remains unchanged.
   Frankenvalue privateEnv;
 
+  // Fixed config-owned policy receives privateEnv without exposing it to tenant handlers.
+  bool hostPolicy = false;
+
+  // Host-authenticated dedicated Python snapshot; absent for ordinary Dynamic Workers.
+  kj::Maybe<kj::Array<const byte>> pythonSnapshot;
+  bool preparePython = false;
+
   // Where should global fetch() (and connect()) be sent?
   kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> globalOutbound;
+
+  // Host-owned backend for the native Cache API, absent for unconfigured dynamic workers.
+  kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> cacheApiOutbound;
 
   // Tail workers that should receive tail events for invocations of the dynamic worker.
   kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tails;
@@ -712,7 +727,12 @@ struct DynamicWorkerSource {
       .limits = limits.map([](auto& limits) { return limits.clone(); }),
       .env = env.clone(),
       .privateEnv = privateEnv.clone(),
+      .hostPolicy = hostPolicy,
+      .pythonSnapshot =
+          pythonSnapshot.map([](auto& snapshot) { return kj::heapArray<const byte>(snapshot); }),
+      .preparePython = preparePython,
       .globalOutbound = mapAddRef(globalOutbound),
+      .cacheApiOutbound = mapAddRef(cacheApiOutbound),
       .tails = KJ_MAP(t, tails) { return kj::addRef(*t); },
       .streamingTails = KJ_MAP(t, streamingTails) { return kj::addRef(*t); },
       .ownContent = kj::mv(newOwnContent),

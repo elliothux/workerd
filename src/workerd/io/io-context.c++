@@ -590,6 +590,27 @@ void IoContext::addTask(kj::Promise<void> promise) {
   tasks.add(kj::mv(promise));
 }
 
+kj::Arc<jsg::AsyncContextFrame::StorageKey> IoContext::getWaitUntilObserverKey() {
+  if (waitUntilObserverKey == kj::none) {
+    waitUntilObserverKey = kj::arc<jsg::AsyncContextFrame::StorageKey>();
+  }
+  return KJ_ASSERT_NONNULL(waitUntilObserverKey).addRef();
+}
+
+void IoContext::addWaitUntil(jsg::Lock& js, jsg::Promise<void> promise) {
+  addWaitUntil(awaitJs(js, promise.whenResolved(js)));
+  KJ_IF_SOME(key, waitUntilObserverKey) {
+    KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(js)) {
+      KJ_IF_SOME(value, frame.get(*key)) {
+        auto observer =
+            JSG_REQUIRE_NONNULL(jsg::JsValue(value.getHandle(js)).tryCast<jsg::JsFunction>(),
+                TypeError, "Invalid waitUntil observer");
+        observer.callNoReceiver(js, jsg::JsValue(promise.consumeHandle(js)));
+      }
+    }
+  }
+}
+
 void IoContext::addWaitUntil(kj::Promise<void> promise) {
   kj::Own<Worker::Actor::WaitUntilTaskHandle> handle;
   KJ_IF_SOME(a, actor) {

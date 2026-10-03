@@ -120,6 +120,9 @@ kj::Own<ActorIdFactory> ActorIdFactoryImpl::cloneWithJurisdiction(
 }
 
 bool ActorIdFactoryImpl::matchesJurisdiction(const ActorId& id) {
+  // Platform namespaces use a distinct validated identity holder. Reject it at admission rather
+  // than letting the native actor channel downcast it after a request has already started.
+  JSG_REQUIRE(kj::tryDowncast<const ActorIdImpl>(id) != kj::none, TypeError, "DO_ID_INVALID");
   return true;
 }
 

@@ -269,6 +269,39 @@ KJ_TEST("unlimited dimensions never reject") {
   KJ_EXPECT(enforcer->getLimitsExceeded() == kj::none);
 }
 
+KJ_TEST("actor event top-up replenishes exactly one request budget") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  (void)waitScope;
+  EnforcerFixture fix;
+  auto enforcer = newRequestLimitEnforcer(kj::addRef(*fix.isolate.state),
+      EffectiveResourceLimits{.cpu = kj::none, .subrequests = 2u}, fix.watchdog);
+
+  enforcer->newSubrequest(false);
+  enforcer->newSubrequest(true);
+  KJ_EXPECT_THROW_MESSAGE("Too many subrequests.", enforcer->newSubrequest(false));
+  enforcer->topUpActor();
+  enforcer->topUpActor();  // Replenishment replaces the budget; it does not accumulate credit.
+  enforcer->newSubrequest(true);
+  enforcer->newSubrequest(false);
+  KJ_EXPECT_THROW_MESSAGE("Too many subrequests.", enforcer->newSubrequest(false));
+}
+
+KJ_TEST("actor event top-up cannot revive a condemned isolate") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  (void)waitScope;
+  EnforcerFixture fix;
+  auto enforcer = newRequestLimitEnforcer(kj::addRef(*fix.isolate.state),
+      EffectiveResourceLimits{.cpu = 1 * kj::SECONDS, .subrequests = 2u}, fix.watchdog);
+
+  fix.isolate.state->takeCondemnedException(StandaloneLimitViolation::CPU);
+  KJ_EXPECT_THROW_RECOVERABLE(OVERLOADED, enforcer->topUpActor());
+  KJ_EXPECT_THROW_RECOVERABLE(OVERLOADED, enforcer->newSubrequest(false));
+  KJ_EXPECT(enforcer->getLimitsExceeded() == EventOutcome::EXCEEDED_CPU);
+  KJ_EXPECT(fix.isolate.evictions == 1);
+}
+
 KJ_TEST("condemned isolate fails new subrequests and reports the matching outcome") {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);
@@ -313,6 +346,7 @@ KJ_TEST("six simultaneous outbound connections pass; the seventh queues") {
   for (uint i = 0; i < STANDARD_MAX_SIMULTANEOUS_OUTBOUND_CONNECTIONS; ++i) {
     leases.add(enforcer->newOutboundConnection().wait(waitScope));
   }
+  enforcer->topUpActor();  // A new event must not release another event's live connections.
 
   // The seventh connect must queue without producing a side effect: no lease, no resolution.
   auto queued = enforcer->newOutboundConnection();

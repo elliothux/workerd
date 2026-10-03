@@ -127,7 +127,7 @@ enum class SerializeArrayBufferBehavior {
   SHALLOW_REFERENCE,
 };
 
-Serialized serialize(jsg::Lock& js,
+Serialized serializeMessage(jsg::Lock& js,
     const jsg::JsValue& body,
     kj::StringPtr contentType,
     SerializeArrayBufferBehavior bufferBehavior) {
@@ -235,10 +235,72 @@ jsg::JsValue deserialize(jsg::Lock& js, rpc::QueueMessage::Reader message) {
 }
 }  // namespace
 
+jsg::JsValue QueueWireCodec::decodeV8(jsg::Lock& js, jsg::JsBufferSource input) {
+  JSG_REQUIRE(
+      !input.isSharedArrayBuffer() && !input.isResizable(), TypeError, "QUEUE_V8_UNSUPPORTED");
+  auto bytes = input.asArrayPtr();
+  JSG_REQUIRE(bytes.size() <= 128000, RangeError, "QUEUE_MESSAGE_TOO_LARGE");
+  // WorkerQueue::serializeV8 writes this exact version-15 header. Reject other formats before JSG
+  // emits header diagnostics, which must never contain user data.
+  JSG_REQUIRE(
+      bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 15, TypeError, "QUEUE_V8_MALFORMED");
+  jsg::Deserializer decoder(
+      js, bytes, kj::none, kj::none, jsg::Deserializer::Options{.preserveStackInErrors = false});
+  return decoder.readValue(js);
+}
+
+void WorkerQueue::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+  JSG_FAIL_REQUIRE(DOMDataCloneError, "A Queue producer binding cannot be serialized.");
+}
+
+jsg::Ref<WorkerQueue> WorkerQueue::deserialize(
+    jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer) {
+  auto& handler = KJ_REQUIRE_NONNULL(
+      deserializer.getExternalHandler(), "got WorkerQueue on non-RPC serialized object?");
+  auto& capTable = KJ_REQUIRE_NONNULL(kj::tryDowncast<Frankenvalue::CapTableReader>(handler),
+      "WorkerQueue can only be deserialized from a Frankenvalue capability.");
+  auto& cap = KJ_REQUIRE_NONNULL(capTable.get(deserializer.readRawUint32()),
+      "serialized WorkerQueue had invalid cap table index");
+  KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(cap)) {
+    return js.alloc<WorkerQueue>(IoContext::current().addObject(kj::addRef(channel)));
+  } else KJ_IF_SOME(channel, kj::tryDowncast<IoChannelCapTableEntry>(cap)) {
+    return js.alloc<WorkerQueue>(
+        channel.getChannelNumber(IoChannelCapTableEntry::Type::SUBREQUEST));
+  } else {
+    KJ_FAIL_REQUIRE("WorkerQueue capability in Frankenvalue is not a SubrequestChannel?");
+  }
+}
+
+kj::Own<kj::HttpClient> WorkerQueue::getHttpClient(
+    IoContext& context, kj::ConstString operationName) {
+  KJ_SWITCH_ONEOF(subrequestChannel) {
+    KJ_CASE_ONEOF(channel, uint) {
+      return context.getHttpClient(channel, true, kj::none, kj::mv(operationName));
+    }
+    KJ_CASE_ONEOF(channel, IoOwn<IoChannelFactory::SubrequestChannel>) {
+      auto worker = context.getSubrequest([&](TraceContext& tracing, IoChannelFactory&) {
+        return channel->startRequest({
+          .cfBlobJson = kj::none,
+          .parentSpan = tracing.getInternalSpanParent(),
+          .userSpanParent = tracing.getUserSpanParent(),
+        });
+      }, {.inHouse = true, .wrapMetrics = false, .operationName = kj::mv(operationName)});
+      return asHttpClient(kj::mv(worker));
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+void WorkerQueue::setPublicationPolicy(jsg::Lock& js, jsg::JsObject policy) {
+  JSG_REQUIRE(publicationPolicy == kj::none, Error, "QUEUE_INVARIANT_VIOLATION");
+  publicationPolicy = policy.addRef(js);
+}
+
 jsg::Promise<WorkerQueue::SendResponse> WorkerQueue::send(jsg::Lock& js,
     jsg::JsValue body,
     jsg::Optional<SendOptions> options,
-    const jsg::TypeHandler<SendResponse>& responseHandler) {
+    const jsg::TypeHandler<SendResponse>& responseHandler,
+    const jsg::TypeHandler<Publish>& policyHandler) {
   auto& context = IoContext::current();
 
   JSG_REQUIRE(!body.isUndefined(), TypeError, "Message body cannot be undefined");
@@ -260,16 +322,30 @@ jsg::Promise<WorkerQueue::SendResponse> WorkerQueue::send(jsg::Lock& js,
 
   Serialized serialized;
   KJ_IF_SOME(type, contentType) {
-    serialized = serialize(js, body, type, SerializeArrayBufferBehavior::DEEP_COPY);
+    serialized = serializeMessage(js, body, type, SerializeArrayBufferBehavior::DEEP_COPY);
   } else if (workerd::FeatureFlags::get(js).getQueuesJsonMessages()) {
+    contentType = IncomingQueueMessage::ContentType::JSON;
     headers.addPtrPtr("X-Msg-Fmt", IncomingQueueMessage::ContentType::JSON);
-    serialized = serialize(
+    serialized = serializeMessage(
         js, body, IncomingQueueMessage::ContentType::JSON, SerializeArrayBufferBehavior::DEEP_COPY);
   } else {
     serialized = serializeV8(js, body);
   }
 
-  auto client = context.getHttpClient(subrequestChannel, true, kj::none, "queue_send"_kjc);
+  KJ_IF_SOME(policy, publicationPolicy) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(policyHandler.tryUnwrap(js, policy.getHandle(js).get(js, "send"_kj)),
+            Error, "QUEUE_INVARIANT_VIOLATION");
+    // Copy synchronously while the isolate lock owns the serialized buffer's lifetime.
+    jsg::Optional<int> delay;
+    KJ_IF_SOME(opts, options) {
+      delay = opts.delaySeconds;
+    }
+    return fn(js, jsg::JsUint8Array::create(js, serialized.data),
+        contentType.map([](auto type) { return kj::str(type); }), delay);
+  }
+
+  auto client = getHttpClient(context, "queue_send"_kjc);
   const auto& headerIds = context.getHeaderIds();
   const auto exposeErrorCodes = workerd::FeatureFlags::get(js).getQueueExposeErrorCodes();
 
@@ -305,13 +381,21 @@ jsg::Promise<WorkerQueue::SendResponse> WorkerQueue::send(jsg::Lock& js,
           [](SendResponse& r) -> auto& { return r.metadata.metrics.oldestMessageTimestamp; }));
 }
 
-jsg::Promise<WorkerQueue::Metrics> WorkerQueue::metrics(
-    jsg::Lock& js, const jsg::TypeHandler<Metrics>& metricsHandler) {
+jsg::Promise<WorkerQueue::Metrics> WorkerQueue::metrics(jsg::Lock& js,
+    const jsg::TypeHandler<Metrics>& metricsHandler,
+    const jsg::TypeHandler<ReadMetrics>& policyHandler) {
   auto& context = IoContext::current();
+
+  KJ_IF_SOME(policy, publicationPolicy) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(policyHandler.tryUnwrap(js, policy.getHandle(js).get(js, "metrics"_kj)),
+            Error, "QUEUE_INVARIANT_VIOLATION");
+    return fn(js);
+  }
 
   auto headers = kj::HttpHeaders(context.getHeaderTable());
 
-  auto client = context.getHttpClient(subrequestChannel, true, kj::none, "queue_metrics"_kjc);
+  auto client = getHttpClient(context, "queue_metrics"_kjc);
   auto req = client->request(
       kj::HttpMethod::GET, "https://fake-host/metrics"_kjc, headers, static_cast<uint64_t>(0));
   const auto& headerIds = context.getHeaderIds();
@@ -335,7 +419,8 @@ jsg::Promise<WorkerQueue::Metrics> WorkerQueue::metrics(
 jsg::Promise<WorkerQueue::SendBatchResponse> WorkerQueue::sendBatch(jsg::Lock& js,
     jsg::Sequence<MessageSendRequest> batch,
     jsg::Optional<SendBatchOptions> options,
-    const jsg::TypeHandler<SendBatchResponse>& responseHandler) {
+    const jsg::TypeHandler<SendBatchResponse>& responseHandler,
+    const jsg::TypeHandler<PublishBatch>& policyHandler) {
   auto& context = IoContext::current();
 
   JSG_REQUIRE(batch.size() > 0, TypeError, "sendBatch() requires at least one message");
@@ -355,10 +440,11 @@ jsg::Promise<WorkerQueue::SendBatchResponse> WorkerQueue::sendBatch(jsg::Lock& j
 
     KJ_IF_SOME(contentType, message.contentType) {
       item.contentType = validateContentType(contentType);
-      item.body = serialize(js, body, contentType, SerializeArrayBufferBehavior::SHALLOW_REFERENCE);
+      item.body =
+          serializeMessage(js, body, contentType, SerializeArrayBufferBehavior::SHALLOW_REFERENCE);
     } else if (workerd::FeatureFlags::get(js).getQueuesJsonMessages()) {
       item.contentType = IncomingQueueMessage::ContentType::JSON;
-      item.body = serialize(js, body, IncomingQueueMessage::ContentType::JSON,
+      item.body = serializeMessage(js, body, IncomingQueueMessage::ContentType::JSON,
           SerializeArrayBufferBehavior::SHALLOW_REFERENCE);
     } else {
       item.body = serializeV8(js, body);
@@ -400,7 +486,18 @@ jsg::Promise<WorkerQueue::SendBatchResponse> WorkerQueue::sendBatch(jsg::Lock& j
   kj::String body(bodyBuilder.releaseAsArray());
   KJ_DASSERT(jsg::JsValue::fromJson(js, body).isObject());
 
-  auto client = context.getHttpClient(subrequestChannel, true, kj::none, "queue_send"_kjc);
+  KJ_IF_SOME(policy, publicationPolicy) {
+    auto fn = JSG_REQUIRE_NONNULL(
+        policyHandler.tryUnwrap(js, policy.getHandle(js).get(js, "sendBatch"_kj)), Error,
+        "QUEUE_INVARIANT_VIOLATION");
+    jsg::Optional<int> delay;
+    KJ_IF_SOME(opts, options) {
+      delay = opts.delaySeconds;
+    }
+    return fn(js, kj::mv(body), delay);
+  }
+
+  auto client = getHttpClient(context, "queue_send"_kjc);
 
   auto headers = kj::HttpHeaders(context.getHeaderTable());
   headers.addPtr("CF-Queue-Batch-Count"_kj, kj::str(messageCount));

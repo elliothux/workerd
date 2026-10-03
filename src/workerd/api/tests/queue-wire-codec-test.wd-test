@@ -1,0 +1,26 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+     esModule = embed "queue-wire-codec-test-internal.js")
+  ])],
+  services = [
+    (name = "check", worker = (
+      compatibilityFlags = ["experimental"],
+      modules = [(name = "test.js", esModule = embed "queue-wire-codec-test.js")],
+      bindings = [
+        (name = "CODEC", openComputeQueueCodec = void),
+        (name = "FACTORY", workerLoader = (factory = true)),
+        (name = "QUEUE", queue = "backend"),
+      ],
+      globalOutbound = "blocked",
+    )),
+    (name = "backend", worker = (
+      modules = [(name = "test.js", esModule = embed "queue-wire-codec-test.js")],
+      bindings = [(name = "CODEC", openComputeQueueCodec = void)],
+      globalOutbound = "blocked",
+    )),
+    (name = "blocked", network = (allow = [])),
+  ],
+);

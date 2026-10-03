@@ -2107,7 +2107,7 @@ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
 
 Worker::Worker(kj::Own<const Script> scriptParam,
     kj::Own<WorkerObserver> metricsParam,
-    kj::FunctionParam<void(jsg::Lock& lock,
+    kj::FunctionParam<kj::Maybe<jsg::V8Ref<v8::Function>>(jsg::Lock& lock,
         const Api& api,
         v8::Local<v8::Object> target,
         v8::Local<v8::Object> ctxExports)> compileBindings,
@@ -2228,7 +2228,13 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
             v8::Local<v8::Object> ctxExports = v8::Object::New(lock.v8Isolate);
 
-            compileBindings(lock, script->isolate->getApi(), bindingsScope, ctxExports);
+            kj::Maybe<jsg::V8Ref<v8::Function>> hostPolicy;
+            {
+              auto limitScope =
+                  script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
+              hostPolicy =
+                  compileBindings(lock, script->isolate->getApi(), bindingsScope, ctxExports);
+            }
 
             // Execute script.
             currentSpan = maybeMakeSpan("lw:top_level_execution"_kjc);
@@ -2273,8 +2279,18 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                     lock.setWorkerExports(lock.v8Ref(ctxExports));
                   }
 
+                  v8::Local<v8::Value> exports = ns;
+                  if (hostPolicy != kj::none) {
+                    auto& policy = KJ_ASSERT_NONNULL(hostPolicy);
+                    auto limitScope =
+                        script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
+                    auto function = policy.getHandle(js);
+                    exports = jsg::check(function->Call(context, context->Global(), 1, &exports));
+                    JSG_REQUIRE(exports->IsObject() && !exports->IsPromise(), TypeError,
+                        "Host policy must return synchronous exports.");
+                  }
                   auto& api = script->isolate->getApi();
-                  auto handlers = api.unwrapExports(lock, ns);
+                  auto handlers = api.unwrapExports(lock, exports);
                   auto entrypointClasses = api.getEntrypointClasses(lock);
 
                   for (auto& handler: handlers.fields) {

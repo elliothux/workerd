@@ -1,0 +1,19 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "cloudflare-internal:native-id-test", internal = true,
+     esModule = embed "durable-object-native-id-test-internal.js")
+  ])],
+  services = [
+    (name = "check", worker = (
+      compatibilityFlags = ["experimental", "nodejs_compat"],
+      modules = [(name = "test.js", esModule = embed "durable-object-native-id-test.js")],
+      bindings = [(name = "IDS", wrapped = (moduleName = "cloudflare-internal:native-id-test"))],
+      durableObjectNamespaces = [(className = "Native", uniqueKey = "native-id-test")],
+      durableObjectStorage = (inMemory = void),
+      globalOutbound = "blocked",
+    )),
+    (name = "blocked", network = (allow = [])),
+  ],
+);

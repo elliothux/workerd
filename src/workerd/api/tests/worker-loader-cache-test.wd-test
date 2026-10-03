@@ -1,0 +1,19 @@
+using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  services = [
+    (name = "cache-loader", worker = (
+      compatibilityFlags = ["experimental"],
+      modules = [(name = "main.js", esModule = embed "worker-loader-cache-test.js")],
+      bindings = [
+        (name = "factory", workerLoader = (id = "cache-loader", factory = true)),
+        (name = "backend", service = "cache-backend")
+      ],
+      cacheApiOutbound = "cache-backend",
+      globalOutbound = "blocked"
+    )),
+    (name = "cache-backend", worker = (
+      modules = [(name = "main.js", esModule = embed "worker-loader-cache-test-backend.js")]
+    )),
+    (name = "blocked", network = (allow = []))
+  ]
+);

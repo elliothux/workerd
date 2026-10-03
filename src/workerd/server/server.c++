@@ -258,6 +258,8 @@ Server::Server(kj::Filesystem& fs,
       tasks(*this) {}
 
 struct Server::GlobalContext {
+  // Services and background I/O borrow this table until Server teardown.
+  kj::Own<kj::HttpHeaderTable> ownHeaderTable;
   jsg::V8System& v8System;
   capnp::ByteStreamFactory byteStreamFactory;
   capnp::HttpOverCapnpFactory httpOverCapnpFactory;
@@ -5620,6 +5622,13 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
       hasHostExtensionFactoryBinding = true;
       return makeGlobal(Global::HostExtensionFactory{.channel = 0});
     }
+    case config::Worker::Binding::OPEN_COMPUTE_QUEUE_CODEC: {
+      if (!experimental) {
+        errorReporter.addError(kj::str("Queue codec host bindings require experimental mode."));
+        return kj::none;
+      }
+      return makeGlobal(Global::QueueWireCodec{});
+    }
   }
   errorReporter.addError(kj::str(errorContext,
       "has unrecognized type. Was the config compiled with a newer version of "
@@ -5660,6 +5669,9 @@ struct Server::WorkerDef {
   const kj::HashMap<kj::String, ActorConfig>& localActorConfigs;
   bool isDynamic;
 
+  kj::Maybe<kj::Array<const byte>> pythonSnapshot;
+  kj::Maybe<kj::Function<void(kj::Array<byte>)>> pythonSnapshotReceiver;
+
   FutureSubrequestChannel globalOutbound;
   kj::Maybe<FutureSubrequestChannel> cacheApiOutbound;
   kj::Vector<FutureSubrequestChannel> subrequestChannels;
@@ -5687,7 +5699,8 @@ struct Server::WorkerDef {
   // Similar to the `compileBindings` callback passed into `Worker`'s constructor, except that
   // `ctx.exports` is taken care of separately. This is provided as a callback since `env` is
   // constructed in a vastly different way for dynamically-loaded workers.
-  kj::Function<void(jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target)>
+  kj::Function<kj::Maybe<jsg::V8Ref<v8::Function>>(
+      jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target)>
       compileBindings;
 
   // If the WorkerDef was created from a DymamicWorkerSource and that
@@ -5951,6 +5964,15 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
       return startupTask.addBranch();
     }
 
+    kj::Promise<kj::Array<byte>> takePythonSnapshot() override {
+      co_await startupTask.addBranch();
+      requireActiveNamespace();
+      auto snapshot = kj::mv(KJ_REQUIRE_NONNULL(
+          preparedPythonSnapshot, "Worker did not produce a prepared Python snapshot."));
+      preparedPythonSnapshot = kj::none;
+      co_return snapshot;
+    }
+
     ~WorkerStubImpl() {
       // Defer unlink and destruction of `WorkerService` to the next turn of the event loop. This
       // is needed because worker stubs are typically destroyed while some other isolate is
@@ -6003,7 +6025,8 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
     kj::Maybe<EffectiveResourceLimits> requestLimits;
 
     kj::Maybe<kj::Own<WorkerService>> service;  // null if still starting up
-    kj::ForkedPromise<void> startupTask;        // resolves when `service` is non-null
+    kj::Maybe<kj::Array<byte>> preparedPythonSnapshot;
+    kj::ForkedPromise<void> startupTask;  // resolves when `service` is non-null
 
     kj::TaskSet& cleanupTaskSet;
     bool unlinked = false;
@@ -6142,6 +6165,11 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         .moduleFallback = kj::none,
         .localActorConfigs = EMPTY_ACTOR_CONFIGS,
         .isDynamic = true,
+        .pythonSnapshot = kj::mv(source.pythonSnapshot),
+        .pythonSnapshotReceiver = source.preparePython
+            ? kj::Maybe<kj::Function<void(kj::Array<byte>)>>(
+                  [this](kj::Array<byte> snapshot) { preparedPythonSnapshot = kj::mv(snapshot); })
+            : kj::none,
 
         // clang-format off
         .globalOutbound{
@@ -6149,6 +6177,10 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
               .orDefault([]() { return kj::refcounted<NullGlobalOutboundChannel>(); }),
           .errorContext = kj::str("Worker's globalOutbound"),
         },
+
+        .cacheApiOutbound = source.cacheApiOutbound.map([](auto& channel) -> FutureSubrequestChannel {
+          return {.designator = kj::mv(channel), .errorContext = kj::str("Worker's cacheApiOutbound")};
+        }),
 
         .subrequestChannels = kj::mv(subrequestChannels),
         .actorClassChannels = kj::mv(actorClassChannels),
@@ -6170,26 +6202,35 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           };
         },
 
-        .compileBindings = [env = kj::mv(source.env), privateEnv = kj::mv(source.privateEnv)](
-            jsg::Lock& js, const Worker::Api& api, v8::Local<v8::Object> target) mutable {
-          if (!privateEnv.empty()) {
-            auto importableEnv = v8::Object::New(js.v8Isolate);
-            jsg::JsObject publicBindings(importableEnv);
-            env.populateJsObject(js, publicBindings);
-            auto properties = publicBindings.getPropertyNames(js, jsg::KeyCollectionFilter::OWN_ONLY,
-                jsg::PropertyFilter::ONLY_ENUMERABLE, jsg::IndexFilter::INCLUDE_INDICES);
-            for (auto index: kj::zeroTo(properties.size())) {
-              auto property = properties.get(js, index);
-              jsg::JsObject(target).createDataProperty(
-                  js, property, publicBindings.get(js, property));
-            }
-            if (!FeatureFlags::get(js).getDisableImportableEnv()) {
-              js.setWorkerEnv(js.v8Ref(importableEnv));
-            }
-          } else {
+        .compileBindings = [env = kj::mv(source.env), privateEnv = kj::mv(source.privateEnv),
+                               hostPolicy = source.hostPolicy](jsg::Lock& js, const Worker::Api& api,
+                               v8::Local<v8::Object> target) mutable
+            -> kj::Maybe<jsg::V8Ref<v8::Function>> {
+          if (hostPolicy) {
             env.populateJsObject(js, jsg::JsObject(target));
+            auto privateBindings = v8::Object::New(js.v8Isolate);
+            privateEnv.populateJsObject(js, jsg::JsObject(privateBindings));
+            kj::Maybe<jsg::JsObject> maybeModule;
+            try {
+              maybeModule = js.resolveInternalModule("cloudflare-internal:open-compute-host-policy");
+            } catch (const kj::Exception&) {
+              JSG_FAIL_REQUIRE(TypeError, "Host policy module is missing from configuration.");
+            }
+            auto module = JSG_REQUIRE_NONNULL(maybeModule, TypeError,
+                "Host policy module is missing from configuration.");
+            auto factory = js.v8Get(module, "default");
+            JSG_REQUIRE(factory->IsFunction(), TypeError, "Host policy factory must be a function.");
+            v8::Local<v8::Value> args[] = {target, privateBindings};
+            auto policy = jsg::check(factory.As<v8::Function>()->Call(
+                js.v8Isolate->GetCurrentContext(), module, 2, args));
+            JSG_REQUIRE(policy->IsFunction(), TypeError,
+                "Host policy factory must return an export policy.");
+            return js.v8Ref(policy.As<v8::Function>());
           }
-          privateEnv.populateJsObject(js, jsg::JsObject(target));
+          JSG_REQUIRE(privateEnv.empty(), TypeError,
+              "Private WorkerCode bindings require the configured host policy.");
+          env.populateJsObject(js, jsg::JsObject(target));
+          return kj::none;
         },
 
         // Note here that we always keep the ownContent from the source, even if
@@ -6210,7 +6251,8 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
 
       DynamicErrorReporter errorReporter;
 
-      auto service = co_await server.makeWorkerImpl(isolateName, kj::mv(def), {}, errorReporter);
+      auto service = co_await server.makeWorkerImpl(
+          isolateName, kj::mv(def), server.extensions, errorReporter);
       errorReporter.throwIfErrors();
 
       KJ_IF_SOME(ns, owner.tryGet()) {
@@ -6631,8 +6673,10 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     .containerEngineConf = conf.getContainerEngine(),
 
     .compileBindings = [globals = kj::mv(globals)](
-        jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target) {
-      return WorkerdApi::from(api).compileGlobals(lock, globals, target, 1);
+        jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target)
+        -> kj::Maybe<jsg::V8Ref<v8::Function>> {
+      WorkerdApi::from(api).compileGlobals(lock, globals, target, 1);
+      return kj::none;
     },
     // clang-format on
 
@@ -6669,8 +6713,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // static platform workers keep the unlimited enforcer.
   kj::Own<IsolateLimitEnforcer> limitEnforcer;
   KJ_IF_SOME(state, def.isolateLimitState) {
-    limitEnforcer = kj::refcounted<StandaloneIsolateLimitEnforcer>(
-        kj::addRef(*state), StandaloneLimitWatchdog::defaultInstance());
+    limitEnforcer = kj::refcounted<StandaloneIsolateLimitEnforcer>(kj::addRef(*state),
+        StandaloneLimitWatchdog::defaultInstance(),
+        def.pythonSnapshotReceiver != kj::none ? 30 * kj::SECONDS : STANDARD_STARTUP_CPU_LIMIT);
   } else {
     limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
   }
@@ -6814,6 +6859,17 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
   using ArtifactBundler = workerd::api::pyodide::ArtifactBundler;
   auto artifactBundler = ArtifactBundler::makeDisabledBundler();
+  kj::Maybe<ArtifactBundler::State&> preparingArtifacts;
+  if (def.pythonSnapshotReceiver != kj::none) {
+    KJ_REQUIRE(def.pythonSnapshot == kj::none);
+    artifactBundler = kj::heap<ArtifactBundler::State>(kj::none, true, false);
+    preparingArtifacts = *artifactBundler;
+  }
+  KJ_IF_SOME(snapshot, def.pythonSnapshot) {
+    // A prepared deployment must pass the official dedicated-snapshot validation. Public
+    // Dynamic Workers continue to use their separate baseline/no-snapshot path and limits.
+    artifactBundler = kj::heap<ArtifactBundler::State>(kj::mv(snapshot), false, false);
+  }
 
   auto script = isolate->newScript(name, def.source, IsolateObserver::StartType::COLD,
       SpanParent(nullptr), workerFs.attach(kj::mv(def.maybeOwnedSourceCode)), false, errorReporter,
@@ -6833,6 +6889,17 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   auto worker = kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
       kj::mv(compileBindings), IsolateObserver::StartType::COLD, SpanParent(nullptr),
       Worker::Lock::TakeSynchronously(kj::none), errorReporter);
+
+  KJ_IF_SOME(receiver, def.pythonSnapshotReceiver) {
+    // Preserve startup/import errors collected by the caller's ErrorReporter. A missing result
+    // still fails closed when takePythonSnapshot() runs after successful startup.
+    KJ_IF_SOME(result, KJ_REQUIRE_NONNULL(preparingArtifacts).storedSnapshot) {
+      KJ_REQUIRE(result.snapshotType == "dedicated"_kj && result.snapshot.size() >= 16 &&
+              result.snapshot.size() <= 128 * 1024 * 1024,
+          "Python preparation produced an invalid snapshot.");
+      receiver(kj::mv(result.snapshot));
+    }
+  }
 
   uint totalActorChannels = 0;
 
@@ -8201,7 +8268,7 @@ kj::Promise<void> Server::run(
   // We should have registered all headers synchronously. This is important because we want to
   // be able to start handling requests as soon as the services are available, even if some other
   // services take longer to get ready.
-  auto ownHeaderTable = headerTableBuilder.build();
+  globalContext->ownHeaderTable = headerTableBuilder.build();
 
   co_await listenPromise.exclusiveJoin(kj::mv(fatalPromise));
 
@@ -8480,10 +8547,12 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
     inspectorIsolateRegistrar = kj::mv(registrar);
   }
 
+  extensions = config.getExtensions();
+
   // Second pass: Build services.
   for (auto serviceConf: config.getServices()) {
     kj::StringPtr name = serviceConf.getName();
-    auto service = co_await makeService(serviceConf, headerTableBuilder, config.getExtensions());
+    auto service = co_await makeService(serviceConf, headerTableBuilder, extensions);
 
     services.upsert(kj::str(name), kj::mv(service), [&](auto&&...) {
       reportConfigError(kj::str("Config defines multiple services named \"", name, "\"."));
@@ -8994,7 +9063,7 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System,
           /* forTest = */ true)
           .eagerlyEvaluate([](kj::Exception&& e) noexcept { kj::throwFatalException(kj::mv(e)); });
 
-  auto ownHeaderTable = headerTableBuilder.build();
+  globalContext->ownHeaderTable = headerTableBuilder.build();
 
   // TODO(someday): If the inspector is enabled, pause and wait for an inspector connection before
   //   proceeding?

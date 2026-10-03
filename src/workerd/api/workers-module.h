@@ -79,7 +79,11 @@ class EntrypointsModule: public jsg::Object {
   EntrypointsModule() = default;
   EntrypointsModule(jsg::Lock&, const jsg::Url&) {}
 
-  void waitUntil(kj::Promise<void> promise);
+  void waitUntil(jsg::Lock& js, jsg::Promise<void> promise);
+
+  // Config-owned wrappers observe native waitUntil tasks in their existing event scope.
+  jsg::JsRef<jsg::JsValue> withWaitUntilObserver(
+      jsg::Lock& js, jsg::Value observer, jsg::Function<jsg::JsRef<jsg::JsValue>()> fn);
 
   // Returns the current request's CacheContext (ctx.cache), or kj::none if there is no active
   // IoContext or cache is not available. Used by the cloudflare:workers TypeScript wrapper to
@@ -108,6 +112,7 @@ class EntrypointsModule: public jsg::Object {
     JSG_NESTED_TYPE_NAMED(Fetcher, ServiceStub);
 
     JSG_METHOD(waitUntil);
+    JSG_METHOD(withWaitUntilObserver);
     JSG_METHOD(getCtxCache);
     JSG_LAZY_INSTANCE_PROPERTY(restore, getRestoreSymbol);
     JSG_METHOD(abortIsolate);

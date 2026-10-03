@@ -52,6 +52,200 @@ function code(value, env = {}) {
   };
 }
 
+export class ProductTransport extends WorkerEntrypoint {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === '/query') {
+      return Response.json({
+        success: true,
+        results: { columns: ['value'], rows: [['database']] },
+        meta: {},
+      });
+    }
+    if (url.pathname === '/message') {
+      assert.equal(request.headers.get('X-Msg-Fmt'), 'bytes');
+      assert.equal(request.headers.get('X-Msg-Delay-Secs'), '3');
+      assert.deepEqual(
+        new Uint8Array(await request.arrayBuffer()),
+        new Uint8Array([1, 2])
+      );
+      return Response.json({
+        metadata: {
+          metrics: {
+            backlogCount: 1,
+            backlogBytes: 2,
+            oldestMessageTimestamp: 1000,
+          },
+        },
+      });
+    }
+    if (url.pathname === '/batch') {
+      assert.equal(request.headers.get('CF-Queue-Batch-Count'), '1');
+      assert.equal(request.headers.get('CF-Queue-Batch-Bytes'), '5');
+      assert.equal(request.headers.get('CF-Queue-Largest-Msg'), '5');
+      assert.equal(request.headers.get('X-Msg-Delay-Secs'), '2');
+      assert.deepEqual(await request.json(), {
+        messages: [{ body: 'aGVsbG8=', contentType: 'text', delaySecs: 1 }],
+      });
+      return Response.json({
+        metadata: {
+          metrics: {
+            backlogCount: 2,
+            backlogBytes: 7,
+            oldestMessageTimestamp: 1000,
+          },
+        },
+      });
+    }
+    if (url.pathname === '/metrics') {
+      return Response.json({
+        backlogCount: 0,
+        backlogBytes: 0,
+        oldestMessageTimestamp: 0,
+      });
+    }
+    assert.equal(url.pathname, '/key');
+    return new Response('namespace');
+  }
+}
+
+export const configuredWrappedExtension = {
+  async test(ctrl, env, ctx) {
+    const loader = env.factory.getPrivate('configured-wrapped');
+    const source = code(null, { LOADER: env.factory.get('forwarded-wrapped') });
+    source.openComputeBindings = {
+      PRODUCT: {
+        kind: 'wrapped',
+        fetcher: ctx.exports.ProductTransport({}),
+        wrapperModule: 'cloudflare-internal:workerd-test-wrapped',
+      },
+    };
+    source.modules['main.js'] = `
+      import {WorkerEntrypoint,env} from 'cloudflare:workers';
+      import {label} from 'workerd-test:public-extension';
+      export default class extends WorkerEntrypoint {
+        async value() {
+          if (env.PRODUCT !== this.env.PRODUCT) throw Error('env identity');
+          const child = env.LOADER.load({
+            compatibilityDate:'2026-08-30',mainModule:'child.js',
+            modules:{'child.js':"import {WorkerEntrypoint} from 'cloudflare:workers'; export default class extends WorkerEntrypoint { value(){return this.env.PRODUCT.ping();}}"},
+            env:{PRODUCT:env.PRODUCT},globalOutbound:null,
+          });
+          return [label,await env.PRODUCT.ping(),await child.getEntrypoint().value(),typeof env.PRODUCT.fetch];
+        }
+      }
+    `;
+    assert.throws(
+      () => env.factory.get('untrusted-extension').load(source),
+      /host-issued/
+    );
+    assert.deepEqual(await loader.load(source).getEntrypoint().value(), [
+      'configured',
+      'configured:namespace',
+      'configured:namespace',
+      'undefined',
+    ]);
+    const denied = code(null);
+    denied.modules['main.js'] =
+      "import wrapper from 'cloudflare-internal:workerd-test-wrapped'; export default {fetch(){return new Response('leaked');}};";
+    await assert.rejects(
+      loader.load(denied).getEntrypoint().fetch('https://test/'),
+      /No such module/
+    );
+  },
+};
+
+export const hostOwnedNativeBindings = {
+  async test(ctrl, env, ctx) {
+    const transport = ctx.exports.ProductTransport({});
+    const source = code(null);
+    source.openComputeBindings = {
+      KV: { kind: 'kvNamespace', fetcher: transport },
+      R2: { kind: 'r2Bucket', fetcher: transport },
+      QUEUE: { kind: 'queue', fetcher: transport },
+      DB: {
+        kind: 'wrapped',
+        fetcher: transport,
+        wrapperModule: 'cloudflare-internal:d1-api',
+      },
+    };
+    source.modules['main.js'] = `
+      import { WorkerEntrypoint, env } from 'cloudflare:workers';
+      export default class extends WorkerEntrypoint {
+        async value() {
+          if (env.KV !== this.env.KV || env.DB !== this.env.DB || env.QUEUE !== this.env.QUEUE)
+            throw new Error('env mismatch');
+          const buffer = new Uint8Array([1, 2]);
+          const sent = await env.QUEUE.send(buffer, { contentType: 'bytes', delaySeconds: 3 });
+          if (buffer.byteLength !== 0 || sent.metadata.metrics.oldestMessageTimestamp.getTime() !== 1000)
+            throw new Error('native Queue bytes/date mismatch');
+          const batch = await env.QUEUE.sendBatch([
+            { body: 'hello', contentType: 'text', delaySeconds: 1 },
+          ], { delaySeconds: 2 });
+          if (batch.metadata.metrics.backlogBytes !== 7) throw new Error('batch mismatch');
+          const metrics = await env.QUEUE.metrics();
+          if (metrics.oldestMessageTimestamp !== undefined) throw new Error('epoch sentinel');
+          try { structuredClone(env.QUEUE); throw new Error('Queue cloned'); }
+          catch (error) { if (error.name !== 'DataCloneError') throw error; }
+          return [await env.KV.get('key'), typeof env.R2.createMultipartUpload,
+            await env.DB.prepare('SELECT value').first('value'),
+            typeof env.KV.fetch, typeof env.DB.fetch, typeof env.QUEUE.fetch];
+        }
+      }
+    `;
+    assert.throws(() => env.factory.get('public').load(source), /host-issued/);
+    const loader = env.factory.getPrivate('products');
+    delete source.env;
+    assert.deepEqual(await loader.load(source).getEntrypoint().value(), [
+      'namespace',
+      'function',
+      'database',
+      'undefined',
+      'undefined',
+      'undefined',
+    ]);
+    // Configuration-owned loaders carry the same trusted grant as getPrivate().
+    assert.deepEqual(await env.system.load(source).getEntrypoint().value(), [
+      'namespace',
+      'function',
+      'database',
+      'undefined',
+      'undefined',
+      'undefined',
+    ]);
+    source.env = { KV: 'collision' };
+    assert.throws(() => loader.load(source), /conflicts with env/);
+    delete source.env.KV;
+    source.openComputeBindings.KV.kind = 'unknown';
+    assert.throws(() => loader.load(source), /Unsupported typed/);
+    source.openComputeBindings.KV.kind = 'kvNamespace';
+    source.openComputeBindings.DB.wrapperModule = 'tenant.js';
+    assert.throws(() => loader.load(source), /internal modules/);
+    source.openComputeBindings.DB.wrapperModule = 'cloudflare-internal:d1-api';
+    source.openComputeBindings.KV.wrapperModule = 'cloudflare-internal:d1-api';
+    assert.throws(() => loader.load(source), /Only wrapped/);
+    delete source.openComputeBindings.KV.wrapperModule;
+    source.openComputeBindings.DB.wrapperModule =
+      'cloudflare-internal:' + 'x'.repeat(128);
+    assert.throws(() => loader.load(source), /internal modules/);
+    source.openComputeBindings.DB.wrapperModule = 'cloudflare-internal:d1-api';
+    source.openComputeBindings.constructor = {
+      kind: 'kvNamespace',
+      fetcher: transport,
+    };
+    assert.throws(() => loader.load(source), /binding name/);
+    delete source.openComputeBindings;
+    source.openComputePythonSnapshot = new Uint8Array(16);
+    assert.throws(() => env.factory.get('public').load(source), /host-issued/);
+    assert.throws(() => loader.load(source), /Python main module/);
+    source.mainModule = 'main.py';
+    source.modules = { 'main.py': { py: 'pass' } };
+    source.compatibilityFlags = ['python_workers', 'python_dedicated_snapshot'];
+    source.openComputePythonSnapshot = new Uint8Array(15);
+    assert.throws(() => loader.load(source), /snapshot size/);
+  },
+};
+
 function parent(loader) {
   const source = code(null, { LOADER: loader });
   source.compatibilityFlags = ['nodejs_compat'];

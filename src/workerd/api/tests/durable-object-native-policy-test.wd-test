@@ -1,0 +1,17 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+     esModule = embed "durable-object-native-policy-test-internal.js")
+  ])],
+  services = [
+    (name = "check", worker = (
+      compatibilityFlags = ["experimental"],
+      modules = [(name = "test.js", esModule = embed "durable-object-native-policy-test.js")],
+      bindings = [(name = "FACTORY", workerLoader = (factory = true))],
+      globalOutbound = "blocked",
+    )),
+    (name = "blocked", network = (allow = [])),
+  ],
+);

@@ -327,6 +327,15 @@ class Fetcher: public JsRpcClientProvider {
         requiresHost(requiresHost),
         isInHouse(isInHouse) {}
 
+  // Host-only control transport. Its native channel keeps the original request owner, but
+  // infrastructure work must not spend the tenant's public subrequest budget. This copy cannot
+  // be transferred or extracted into a public binding; the source capability is unchanged.
+  explicit Fetcher(jsg::Ref<Fetcher> privateTransport)
+      : channelOrClientFactory(kj::mv(privateTransport)),
+        requiresHost(RequiresHostAndProtocol::YES),
+        isInHouse(true),
+        rpcCompatGateBypassed(RpcCompatGateBypassed::YES) {}
+
   // Returns a `WorkerInterface` that is only valid for the lifetime of the current
   // `IoContext`.
   kj::Own<WorkerInterface> getClient(
@@ -441,11 +450,11 @@ class Fetcher: public JsRpcClientProvider {
 
   jsg::Promise<ScheduledResult> scheduled(jsg::Lock& js, jsg::Optional<ScheduledOptions> options);
 
-  kj::Maybe<jsg::Ref<JsRpcProperty>> getRpcMethod(jsg::Lock& js, kj::String name);
+  virtual kj::Maybe<jsg::JsValue> getRpcMethod(jsg::Lock& js, kj::String name);
 
   // Internal method for use from bindings code. It skips compatibility flags checks.
   kj::Maybe<jsg::Ref<JsRpcProperty>> getRpcMethodInternal(jsg::Lock& js, kj::String name);
-  kj::Maybe<jsg::Ref<JsRpcProperty>> getRpcMethodForTestOnly(jsg::Lock& js, kj::String name) {
+  kj::Maybe<jsg::JsValue> getRpcMethodForTestOnly(jsg::Lock& js, kj::String name) {
     return getRpcMethod(js, kj::mv(name));
   }
 
@@ -582,7 +591,8 @@ class Fetcher: public JsRpcClientProvider {
   kj::OneOf<uint,
       IoOwn<IoChannelFactory::SubrequestChannel>,
       kj::Own<CrossContextOutgoingFactory>,
-      IoOwn<OutgoingFactory>>
+      IoOwn<OutgoingFactory>,
+      jsg::Ref<Fetcher>>
       channelOrClientFactory;
   RequiresHostAndProtocol requiresHost;
   bool isInHouse;
@@ -590,6 +600,12 @@ class Fetcher: public JsRpcClientProvider {
   // Generic stubs use the receiving isolate's compat flags. Wrapped bindings explicitly bypass
   // the gate while rebuilding their private inner fetcher.
   const RpcCompatGateBypassed rpcCompatGateBypassed = RpcCompatGateBypassed::NO;
+
+  void visitForGc(jsg::GcVisitor& visitor) {
+    KJ_IF_SOME(transport, channelOrClientFactory.tryGet<jsg::Ref<Fetcher>>()) {
+      visitor.visit(transport);
+    }
+  }
 };
 
 // Extended fetcher type that makes the getters for host/port available using the JSG API. Allows

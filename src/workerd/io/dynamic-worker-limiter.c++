@@ -43,6 +43,11 @@ class LimitedWorkerStub final: public WorkerStubChannel {
       : inner(kj::mv(inner)),
         limiter(kj::mv(limiter)) {}
 
+  kj::Promise<kj::Array<byte>> takePythonSnapshot() override {
+    auto lease = limiter->acquire(inner.get());
+    return inner->takePythonSnapshot().attach(kj::addRef(*this), kj::mv(lease));
+  }
+
   kj::Own<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
       kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
     auto channel = inner->getEntrypoint(kj::mv(name), kj::mv(props), limits);

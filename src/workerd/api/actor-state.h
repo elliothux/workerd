@@ -605,7 +605,7 @@ class DurableObjectState: public jsg::Object {
       kj::Maybe<Worker::Actor::FacetManager&> facetManager,
       kj::Maybe<ActorVersion> version = kj::none);
 
-  void waitUntil(kj::Promise<void> promise);
+  void waitUntil(jsg::Lock& js, jsg::Promise<void> promise);
 
   jsg::JsValue getExports(jsg::Lock& js) {
     return exports.getHandle(js);

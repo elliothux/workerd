@@ -1,0 +1,25 @@
+using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+     esModule = embed "worker-loader-host-policy-test-internal.js")
+  ])],
+  services = [
+    (name = "TEST_TMPDIR", disk = (writable = true)),
+    (name = "python-prepare", worker = (
+      compatibilityFlags = ["experimental", "nodejs_compat", "enable_ctx_exports"],
+      modules = [(name = "main.js", esModule = embed "worker-loader-python-prepare-test.js")],
+      durableObjectNamespaces = [(className = "PythonDoHost", uniqueKey = "python-do", enableSql = true)],
+      durableObjectStorage = (localDisk = "TEST_TMPDIR"),
+      bindings = [
+        (name = "factory", workerLoader = (id = "python-prepare", factory = true)),
+        (name = "cacheBackend", service = "cache-backend")
+      ],
+      globalOutbound = "blocked"
+    )),
+    (name = "cache-backend", worker = (
+      modules = [(name = "main.js", esModule = embed "worker-loader-cache-test-backend.js")]
+    )),
+    (name = "blocked", network = (allow = []))
+  ]
+);

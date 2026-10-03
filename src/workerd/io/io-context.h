@@ -797,6 +797,13 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // drain() waits until all such promises have completed.
   void addWaitUntil(kj::Promise<void> promise);
 
+  // Register an explicit JavaScript waitUntil task, preserving its original promise for the
+  // config-owned observer in the current async frame.
+  void addWaitUntil(jsg::Lock& js, jsg::Promise<void> promise);
+
+  // The observer key belongs to this I/O context; it is not visible to tenant modules.
+  kj::Arc<jsg::AsyncContextFrame::StorageKey> getWaitUntilObserverKey();
+
   // Returns the status of waitUntil promises. If a promise fails, this sets the status to the
   // one corresponding to the exception type.
   EventOutcome waitUntilStatus() const {
@@ -1246,6 +1253,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // last among these three.
   kj::Own<TimeoutManager> timeoutManager;
 
+  kj::Maybe<kj::Arc<jsg::AsyncContextFrame::StorageKey>> waitUntilObserverKey;
   kj::TaskSet waitUntilTasks;
   EventOutcome waitUntilStatusValue = EventOutcome::OK;
 
@@ -1792,7 +1800,11 @@ auto IoContext::makeReentryCallbackImpl(Func func, kj::Own<void> attachment) {
         "The execution context which hosts this callback is no longer running.");
 
     if constexpr (topUp == TOP_UP) {
-      ctx.getLimitEnforcer().topUpActor();
+      // A transient RPC callback can re-enter a stateless invocation. Only actor events
+      // replenish request limits; stateless re-entry shares the existing invocation budget.
+      if (ctx.getActor() != kj::none) {
+        ctx.getLimitEnforcer().topUpActor();
+      }
     }
 
     return ctx.canceler.wrap(ctx.run(

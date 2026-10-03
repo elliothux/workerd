@@ -540,6 +540,9 @@ struct Worker {
       # A trusted host-only factory that opens operator-configured native extension sessions.
       # Returned ports may only be transferred into a dynamic Worker's env.
 
+      openComputeQueueCodec @32 :Void;
+      # Non-transferable static host binding for the bounded native Queue V8 wire decoder.
+
       # TODO(someday): dispatch, other new features
     }
 

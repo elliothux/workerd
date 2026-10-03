@@ -5670,6 +5670,82 @@ KJ_TEST("Server: cache name is passed through to service") {
   }
 }
 
+KJ_TEST("Server: test completion retains headers for background service requests") {
+  TestServer test(R"((
+    services = [
+      (name = "probe", worker = (
+        compatibilityDate = "2026-09-08",
+        modules = [(name = "probe.js", esModule =
+          `export default {
+          `  async test(controller, env) {
+          `    await env.TARGET.begin();
+          `    throw new Error("intentional test failure");
+          `  }
+          `};
+        )],
+        bindings = [(name = "TARGET", service = (name = "target", entrypoint = "Target"))]
+      )),
+      (name = "target", worker = (
+        compatibilityDate = "2026-09-08",
+        modules = [(name = "target.js", esModule =
+          `import { WorkerEntrypoint } from "cloudflare:workers";
+          `export class Target extends WorkerEntrypoint {
+          `  begin() {
+          `    this.ctx.waitUntil((async () => {
+          `      await fetch("http://before/");
+          `      const response = await this.env.BACKEND.fetch("http://cleanup/", {
+          `        headers: { "x-cleanup": "owned" }
+          `      });
+          `      if (await response.text() !== "owned") throw new Error("headers lost");
+          `      await fetch("http://after/");
+          `    })());
+          `    return true;
+          `  }
+          `}
+        )],
+        bindings = [(name = "BACKEND", service = "backend")]
+      )),
+      (name = "backend", worker = (
+        compatibilityDate = "2026-09-08",
+        modules = [(name = "backend.js", esModule =
+          `export default { fetch(request) {
+          `  return new Response(request.headers.get("x-cleanup"));
+          `} };
+        )]
+      ))
+    ]
+  ))"_kj);
+  KJ_EXPECT_LOG(DBG, "[ TEST ] probe");
+  KJ_EXPECT_LOG(INFO, "Error: intentional test failure");
+  KJ_EXPECT_LOG(DBG, "[ FAIL ] probe");
+  KJ_EXPECT(!test.server.test(v8System, *test.config, "probe", "default").wait(test.ws));
+
+  // Release the parked subrequest only after the test coroutine has returned.
+  auto before = test.receiveInternetSubrequest("before");
+  before.recv(R"(
+    GET / HTTP/1.1
+    Host: before
+
+  )"_blockquote);
+  before.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  auto after = test.receiveInternetSubrequest("after");
+  after.recv(R"(
+    GET / HTTP/1.1
+    Host: after
+
+  )"_blockquote);
+  after.send(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 0
+
+  )"_blockquote);
+  kj::yieldUntilQueueEmpty().wait(test.ws);
+}
+
 // =======================================================================================
 
 KJ_TEST("Server: JS RPC over HTTP connections") {

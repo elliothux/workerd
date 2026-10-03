@@ -1,0 +1,12 @@
+using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  services = [
+    (name = "check", worker = (
+      compatibilityFlags = ["experimental"],
+      modules = [(name = "test.js", esModule = "import assert from 'node:assert/strict'; export default { async test(_ctrl,env) { const loader=env.FACTORY.getPrivate('missing'); await assert.rejects(async () => loader.load({compatibilityDate:'2026-09-08',mainModule:'main.js',modules:{'main.js':'export default {fetch(){return new Response();}};'},env:{},openComputeHostPolicy:true,openComputePrivateEnv:{PRIVATE:'host-secret'},globalOutbound:null}).getEntrypoint().fetch('https://tenant.example'), /Host policy module is missing/); } };")],
+      bindings = [(name = "FACTORY", workerLoader = (factory = true))],
+      globalOutbound = "blocked"
+    )),
+    (name = "blocked", network = (allow = []))
+  ]
+);

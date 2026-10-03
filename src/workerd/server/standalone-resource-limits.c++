@@ -159,7 +159,12 @@ class RequestLimitEnforcer final: public LimitEnforcer {
     return kj::heap<TurnScope>(*this, token, turnStart);
   }
 
-  void topUpActor() override {}
+  void topUpActor() override {
+    // Native event admission replenishes an actor's request budget, never its isolate health.
+    throwIfCondemned();
+    cpuUsed = 0 * kj::SECONDS;
+    subrequestsUsed = 0;
+  }
 
   void newSubrequest(bool isInHouse) override {
     // The in-house flag marks Cloudflare-internal service traffic in other runtime hosts. In

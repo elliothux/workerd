@@ -1,13 +1,22 @@
 using Workerd = import "/workerd/workerd.capnp";
 
 const unitTests :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "test:private-control", internal = false,
+      esModule = embed "worker-loader-private-control-extension.js"),
+  ])],
   services = [
+    (name = "TEST_TMPDIR", disk = (writable = true)),
     ( name = "worker-loader-limits-test",
       worker = (
         modules = [
           (name = "worker", esModule = embed "worker-loader-limits-test.js")
         ],
-        compatibilityFlags = ["nodejs_compat", "experimental"],
+        compatibilityFlags = ["nodejs_compat", "experimental", "enable_ctx_exports"],
+        durableObjectNamespaces = [
+          (className = "LimitsHost", uniqueKey = "LimitsHost", enableSql = true),
+        ],
+        durableObjectStorage = (localDisk = "TEST_TMPDIR"),
         bindings = [
           (name = "loader", workerLoader = ()),
           (name = "factory", workerLoader = (factory = true)),

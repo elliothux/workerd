@@ -215,33 +215,78 @@ kj::String DurableObjectId::toString() {
   return id->toString();
 }
 
-jsg::Ref<DurableObjectId> DurableObjectNamespace::newUniqueId(
-    jsg::Lock& js, jsg::Optional<NewUniqueIdOptions> options) {
+jsg::Ref<DurableObjectId> DurableObjectNamespace::newUniqueId(jsg::Lock& js,
+    jsg::Optional<NewUniqueIdOptions> options,
+    const jsg::TypeHandler<NewUniqueIdPolicy>& handler) {
+  KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(handler.tryUnwrap(js, policy.getHandle(js).get(js, "newUniqueId"_kj)),
+            Error, "DO_NAMESPACE_NOT_FOUND");
+    return fn(js, kj::mv(options));
+  }
+
+  return js.alloc<DurableObjectId>(authority.get<NativeAuthority>().idFactory->newUniqueId(
+      options.orDefault({}).jurisdiction.orDefault(kj::none)));
+}
+
+jsg::Ref<DurableObjectId> DurableObjectNamespace::idFromName(
+    jsg::Lock& js, kj::String name, const jsg::TypeHandler<IdPolicy>& handler) {
+  KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(handler.tryUnwrap(js, policy.getHandle(js).get(js, "idFromName"_kj)),
+            Error, "DO_NAMESPACE_NOT_FOUND");
+    return fn(js, kj::mv(name));
+  }
+
   return js.alloc<DurableObjectId>(
-      idFactory->newUniqueId(options.orDefault({}).jurisdiction.orDefault(kj::none)));
+      authority.get<NativeAuthority>().idFactory->idFromName(kj::mv(name)));
 }
 
-jsg::Ref<DurableObjectId> DurableObjectNamespace::idFromName(jsg::Lock& js, kj::String name) {
-  return js.alloc<DurableObjectId>(idFactory->idFromName(kj::mv(name)));
+jsg::Ref<DurableObjectId> DurableObjectNamespace::idFromString(
+    jsg::Lock& js, kj::String id, const jsg::TypeHandler<IdPolicy>& handler) {
+  KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(handler.tryUnwrap(js, policy.getHandle(js).get(js, "idFromString"_kj)),
+            Error, "DO_NAMESPACE_NOT_FOUND");
+    return fn(js, kj::mv(id));
+  }
+
+  return js.alloc<DurableObjectId>(
+      authority.get<NativeAuthority>().idFactory->idFromString(kj::mv(id)));
 }
 
-jsg::Ref<DurableObjectId> DurableObjectNamespace::idFromString(jsg::Lock& js, kj::String id) {
-  return js.alloc<DurableObjectId>(idFactory->idFromString(kj::mv(id)));
-}
+jsg::Ref<DurableObject> DurableObjectNamespace::getByName(jsg::Lock& js,
+    kj::String name,
+    jsg::Optional<GetDurableObjectOptions> options,
+    const jsg::TypeHandler<GetByNamePolicy>& handler) {
+  KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(handler.tryUnwrap(js, policy.getHandle(js).get(js, "getByName"_kj)),
+            Error, "DO_NAMESPACE_NOT_FOUND");
+    return fn(js, kj::mv(name), kj::mv(options));
+  }
 
-jsg::Ref<DurableObject> DurableObjectNamespace::getByName(
-    jsg::Lock& js, kj::String name, jsg::Optional<GetDurableObjectOptions> options) {
-  auto id = js.alloc<DurableObjectId>(idFactory->idFromName(kj::mv(name)));
+  auto id = js.alloc<DurableObjectId>(
+      authority.get<NativeAuthority>().idFactory->idFromName(kj::mv(name)));
   return getImpl(js, ActorGetMode::GET_OR_CREATE, kj::mv(id), kj::mv(options));
 }
 
-jsg::Ref<DurableObject> DurableObjectNamespace::get(
-    jsg::Lock& js, jsg::Ref<DurableObjectId> id, jsg::Optional<GetDurableObjectOptions> options) {
+jsg::Ref<DurableObject> DurableObjectNamespace::get(jsg::Lock& js,
+    jsg::Ref<DurableObjectId> id,
+    jsg::Optional<GetDurableObjectOptions> options,
+    const jsg::TypeHandler<GetPolicy>& handler) {
+  KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+    auto fn = JSG_REQUIRE_NONNULL(handler.tryUnwrap(js, policy.getHandle(js).get(js, "get"_kj)),
+        Error, "DO_NAMESPACE_NOT_FOUND");
+    return fn(js, kj::mv(id), kj::mv(options));
+  }
+
   return getImpl(js, ActorGetMode::GET_OR_CREATE, kj::mv(id), kj::mv(options));
 }
 
 jsg::Ref<DurableObject> DurableObjectNamespace::getExisting(
     jsg::Lock& js, jsg::Ref<DurableObjectId> id, jsg::Optional<GetDurableObjectOptions> options) {
+  JSG_REQUIRE(authority.is<NativeAuthority>(), Error, "DO_RPC_UNSUPPORTED");
   return getImpl(js, ActorGetMode::GET_EXISTING, kj::mv(id), kj::mv(options));
 }
 
@@ -249,7 +294,8 @@ jsg::Ref<DurableObject> DurableObjectNamespace::getImpl(jsg::Lock& js,
     ActorGetMode mode,
     jsg::Ref<DurableObjectId> id,
     jsg::Optional<GetDurableObjectOptions> options) {
-  JSG_REQUIRE(idFactory->matchesJurisdiction(id->getInner()), TypeError,
+  auto& native = authority.get<NativeAuthority>();
+  JSG_REQUIRE(native.idFactory->matchesJurisdiction(id->getInner()), TypeError,
       "get called on jurisdictional subnamespace with an ID from a different jurisdiction");
   ActorRoutingMode routingMode = ActorRoutingMode::DEFAULT;
   KJ_IF_SOME(o, options) {
@@ -274,16 +320,17 @@ jsg::Ref<DurableObject> DurableObjectNamespace::getImpl(jsg::Lock& js,
   bool enableReplicaRouting = FeatureFlags::get(js).getReplicaRouting();
 
   kj::Own<Fetcher::OutgoingFactory> outgoingFactory;
-  KJ_SWITCH_ONEOF(channel) {
+  KJ_SWITCH_ONEOF(native.channel) {
     KJ_CASE_ONEOF(channelId, uint) {
       outgoingFactory = kj::heap<GlobalActorOutgoingFactory>(channelId, id.addRef(),
           kj::mv(locationHint), mode, enableReplicaRouting, routingMode, kj::mv(version),
-          actorCallRetriesAllowed, persistent, userDefinedRetryPolicy);
+          native.actorCallRetriesAllowed, native.persistent, native.userDefinedRetryPolicy);
     }
     KJ_CASE_ONEOF(channelFactory, IoOwn<ActorChannelFactory>) {
-      outgoingFactory = kj::heap<GlobalActorOutgoingFactory>(kj::addRef(*channelFactory),
-          id.addRef(), kj::mv(locationHint), mode, enableReplicaRouting, routingMode,
-          kj::mv(version), actorCallRetriesAllowed, persistent, userDefinedRetryPolicy);
+      outgoingFactory =
+          kj::heap<GlobalActorOutgoingFactory>(kj::addRef(*channelFactory), id.addRef(),
+              kj::mv(locationHint), mode, enableReplicaRouting, routingMode, kj::mv(version),
+              native.actorCallRetriesAllowed, native.persistent, native.userDefinedRetryPolicy);
     }
   }
 
@@ -294,21 +341,31 @@ jsg::Ref<DurableObject> DurableObjectNamespace::getImpl(jsg::Lock& js,
       kj::mv(id), context.addObject(kj::mv(outgoingFactory)), requiresHost);
 }
 
-jsg::Ref<DurableObjectNamespace> DurableObjectNamespace::jurisdiction(
-    jsg::Lock& js, jsg::Optional<kj::Maybe<kj::String>> maybeJurisdiction) {
-  auto newIdFactory = idFactory->cloneWithJurisdiction(maybeJurisdiction.orDefault(kj::none));
+jsg::Ref<DurableObjectNamespace> DurableObjectNamespace::jurisdiction(jsg::Lock& js,
+    jsg::Optional<kj::Maybe<kj::String>> maybeJurisdiction,
+    const jsg::TypeHandler<JurisdictionPolicy>& handler) {
+  KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+    auto fn =
+        JSG_REQUIRE_NONNULL(handler.tryUnwrap(js, policy.getHandle(js).get(js, "jurisdiction"_kj)),
+            Error, "DO_NAMESPACE_NOT_FOUND");
+    return fn(js, kj::mv(maybeJurisdiction));
+  }
+
+  auto& native = authority.get<NativeAuthority>();
+  auto newIdFactory =
+      native.idFactory->cloneWithJurisdiction(maybeJurisdiction.orDefault(kj::none));
 
   // A jurisdictional sub-namespace of a ctx.exports self-binding is still a self-binding, so it
   // inherits the `persistent` bit.
-  KJ_SWITCH_ONEOF(channel) {
+  KJ_SWITCH_ONEOF(native.channel) {
     KJ_CASE_ONEOF(channelId, uint) {
       return js.alloc<api::DurableObjectNamespace>(channelId, kj::mv(newIdFactory),
-          actorCallRetriesAllowed, persistent, userDefinedRetryPolicy);
+          native.actorCallRetriesAllowed, native.persistent, native.userDefinedRetryPolicy);
     }
     KJ_CASE_ONEOF(channelFactory, IoOwn<ActorChannelFactory>) {
       return js.alloc<api::DurableObjectNamespace>(
           IoContext::current().addObject(kj::addRef(*channelFactory)), kj::mv(newIdFactory),
-          actorCallRetriesAllowed, persistent, userDefinedRetryPolicy);
+          native.actorCallRetriesAllowed, native.persistent, native.userDefinedRetryPolicy);
     }
   }
 

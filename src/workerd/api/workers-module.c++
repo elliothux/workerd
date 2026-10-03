@@ -52,10 +52,18 @@ jsg::Ref<WorkflowEntrypoint> WorkflowEntrypoint::constructor(
   return js.alloc<WorkflowEntrypoint>();
 }
 
-void EntrypointsModule::waitUntil(kj::Promise<void> promise) {
+void EntrypointsModule::waitUntil(jsg::Lock& js, jsg::Promise<void> promise) {
   // No need to check if IoContext::hasCurrent since current() will throw
   // if there is no active request.
-  IoContext::current().addWaitUntil(kj::mv(promise));
+  IoContext::current().addWaitUntil(js, kj::mv(promise));
+}
+
+jsg::JsRef<jsg::JsValue> EntrypointsModule::withWaitUntilObserver(
+    jsg::Lock& js, jsg::Value observer, jsg::Function<jsg::JsRef<jsg::JsValue>()> fn) {
+  JSG_REQUIRE(observer.getHandle(js)->IsFunction(), TypeError, "Invalid waitUntil observer");
+  jsg::AsyncContextFrame::StorageScope storage(
+      js, IoContext::current().getWaitUntilObserverKey(), kj::mv(observer));
+  return fn(js);
 }
 
 jsg::Optional<jsg::Ref<CacheContext>> EntrypointsModule::getCtxCache(jsg::Lock& js) {

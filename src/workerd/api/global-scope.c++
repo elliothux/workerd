@@ -65,8 +65,8 @@ kj::Exception makeNeuterException(NeuterReason reason) {
 
 }  // namespace
 
-void ExecutionContext::waitUntil(kj::Promise<void> promise) {
-  IoContext::current().addWaitUntil(kj::mv(promise));
+void ExecutionContext::waitUntil(jsg::Lock& js, jsg::Promise<void> promise) {
+  IoContext::current().addWaitUntil(js, kj::mv(promise));
 }
 
 void ExecutionContext::passThroughOnException() {

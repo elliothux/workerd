@@ -325,7 +325,7 @@ class ExecutionContext: public jsg::Object {
     }
   }
 
-  void waitUntil(kj::Promise<void> promise);
+  void waitUntil(jsg::Lock& js, jsg::Promise<void> promise);
   void passThroughOnException();
 
   // Cancels the current execution context with the given exception, causing all execution to stop

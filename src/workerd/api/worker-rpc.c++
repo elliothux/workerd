@@ -620,6 +620,46 @@ class JsRpcCallRetryState final: public kj::Refcounted {
   bool committed = false;
 };
 
+namespace {
+
+jsg::JsRef<jsg::JsPromise> policyPromise(
+    jsg::Lock& js, jsg::JsValue value, kj::Maybe<JsRpcClientProvider&> owner = kj::none) {
+  return js.tryCatch([&]() {
+    KJ_IF_SOME(context, owner) {
+      context.checkRpcPolicyContext();
+    }
+    auto resolver = jsg::check(v8::Promise::Resolver::New(js.v8Context()));
+    jsg::check(resolver->Resolve(js.v8Context(), value));
+    return jsg::JsRef<jsg::JsPromise>(js, jsg::JsPromise(resolver->GetPromise()));
+  }, [&](jsg::Value error) {
+    return jsg::JsRef<jsg::JsPromise>(js, js.rejectedJsPromise(jsg::JsValue(error.getHandle(js))));
+  });
+}
+
+}  // namespace
+
+JsRpcPromise::JsRpcPromise(jsg::Lock& js, jsg::JsValue policy)
+    : inner(policyPromise(js, policy)),
+      weakRef(kj::atomicRefcounted<WeakRef>()),
+      state(
+          PrivatePolicy{jsg::Value(js.v8Isolate, policy), IoContext::current().addObject(*this)}) {
+  weakRef->ref = *this;
+}
+
+jsg::Ref<JsRpcPromise> JsRpcPromise::fromPolicy(jsg::Lock& js, jsg::JsValue policy) {
+  const auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<JsRpcPromise>>());
+  KJ_IF_SOME(promise, handler.tryUnwrap(js, policy)) {
+    return kj::mv(promise);
+  }
+  return js.alloc<JsRpcPromise>(js, policy);
+}
+
+void JsRpcPromise::checkRpcPolicyContext() {
+  KJ_IF_SOME(policy, state.tryGet<PrivatePolicy>()) {
+    *policy.ctxCheck;
+  }
+}
+
 JsRpcPromise::JsRpcPromise(jsg::JsRef<jsg::JsPromise> inner,
     kj::Own<WeakRef> weakRefParam,
     PendingPipeline pipeline,
@@ -667,15 +707,19 @@ void JsRpcPromise::setOriginatingCall(kj::Maybe<TraceContextParent> value) {
 }
 
 void JsRpcPromise::dispose(jsg::Lock& js) {
+  KJ_DEFER({
+    state = Disposed();
+    weakRef->disposed = true;
+    originatingCall = kj::none;
+    actorTargetRetryability = kj::none;
+  });
+  KJ_IF_SOME(policy, state.tryGet<PrivatePolicy>()) {
+    tryCallDisposeMethod(js, jsg::JsValue(policy.value.getHandle(js)));
+  }
   KJ_IF_SOME(resolved, state.tryGet<Resolved>()) {
     // Disposing the promise implies disposing the final result.
     tryCallDisposeMethod(js, jsg::JsValue(resolved.result.getHandle(js)));
   }
-
-  state = Disposed();
-  weakRef->disposed = true;
-  originatingCall = kj::none;
-  actorTargetRetryability = kj::none;
 }
 
 // See comment at call site for explanation.
@@ -753,6 +797,9 @@ JsRpcClientProvider::ClientForOneCall JsRpcPromise::getClientForOneCall(
     KJ_CASE_ONEOF(disposed, Disposed) {
       return {.client = JSG_KJ_EXCEPTION(FAILED, Error, "RPC promise used after being disposed.")};
     }
+    KJ_CASE_ONEOF(policy, PrivatePolicy) {
+      JSG_FAIL_REQUIRE(Error, "RPC private policy cannot expose a raw capability.");
+    }
   }
   KJ_UNREACHABLE;
 }
@@ -768,7 +815,15 @@ void JsRpcProperty::appendPath(kj::Vector<kj::StringPtr>& path) {
 
 JsRpcClientProvider::ClientForOneCall JsRpcProperty::getClientForOneCall(
     jsg::Lock& js, kj::Maybe<ActorCallRetryState::Attempt> actorCallAttempt) {
+  JSG_REQUIRE(policy == kj::none, Error, "RPC private policy cannot expose a raw capability.");
   return parent->getClientForOneCall(js, kj::mv(actorCallAttempt));
+}
+
+jsg::JsValue newRpcPolicyProperty(
+    jsg::Lock& js, jsg::Ref<JsRpcClientProvider> parent, kj::String name, jsg::JsValue policy) {
+  const auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<JsRpcProperty>>());
+  return jsg::JsValue(
+      handler.wrap(js, js.alloc<JsRpcProperty>(js, kj::mv(parent), kj::mv(name), policy)));
 }
 
 namespace {
@@ -805,6 +860,30 @@ struct JsRpcPromiseAndPipeline {
     KJ_UNREACHABLE;
   }
 };
+
+JsRpcPromiseAndPipeline rejectedRpcCall(jsg::Lock& js, jsg::Value error) {
+  auto jsError = jsg::JsValue(error.getHandle(js));
+  auto pipeline = capnp::newBrokenPipeline(js.exceptionToKj(jsError));
+  return {.promise = js.rejectedJsPromise(jsError),
+    .weakRef = kj::atomicRefcounted<JsRpcPromise::WeakRef>(),
+    .pipeline =
+        rpc::JsRpcTarget::CallResults::Pipeline(capnp::AnyPointer::Pipeline(kj::mv(pipeline)))};
+}
+
+jsg::Ref<JsRpcPromise> callRpcPolicy(jsg::Lock& js,
+    JsRpcClientProvider& owner,
+    jsg::JsValue value,
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  return js.tryCatch([&]() {
+    owner.checkRpcPolicyContext();
+    auto fn = JSG_REQUIRE_NONNULL(
+        value.tryCast<jsg::JsFunction>(), TypeError, "RPC target is not callable.");
+    v8::LocalVector<v8::Value> values(js.v8Isolate);
+    values.reserve(args.Length());
+    for (int i = 0; i < args.Length(); ++i) values.push_back(args[i]);
+    return JsRpcPromise::fromPolicy(js, fn.call(js, js.undefined(), values));
+  }, [&](jsg::Value error) { return rejectedRpcCall(js, kj::mv(error)).asJsRpcPromise(js); });
+}
 
 static void setJsRpcCallSpanTags(TraceContext& span,
     JsRpcClientProvider& parent,
@@ -1408,12 +1487,7 @@ JsRpcPromiseAndPipeline callImpl(jsg::Lock& js,
     }, [&](jsg::Value error) -> JsRpcPromiseAndPipeline {
       // Probably a serialization error. Need to convert to an async error since we never throw
       // synchronously from async functions.
-      auto jsError = jsg::JsValue(error.getHandle(js));
-      auto pipeline = capnp::newBrokenPipeline(js.exceptionToKj(jsError));
-      return {.promise = js.rejectedJsPromise(jsError),
-        .weakRef = kj::atomicRefcounted<JsRpcPromise::WeakRef>(),
-        .pipeline =
-            rpc::JsRpcTarget::CallResults::Pipeline(capnp::AnyPointer::Pipeline(kj::mv(pipeline)))};
+      return rejectedRpcCall(js, kj::mv(error));
     });
   } catch (jsg::JsExceptionThrown&) {
     // This must be a termination exception, or we would have caught it above.
@@ -1435,18 +1509,28 @@ JsRpcPromiseAndPipeline callImpl(jsg::Lock& js,
 
 jsg::Ref<JsRpcPromise> JsRpcProperty::call(const v8::FunctionCallbackInfo<v8::Value>& args) {
   jsg::Lock& js = jsg::Lock::from(args.GetIsolate());
+  KJ_IF_SOME(value, policy) {
+    return callRpcPolicy(js, *this, jsg::JsValue(value.getHandle(js)), args);
+  }
 
   return callImpl(js, parent.addRef(), name, args).asJsRpcPromise(js);
 }
 
-jsg::Ref<JsRpcPromise> JsRpcStub::call(const v8::FunctionCallbackInfo<v8::Value>& args) {
+jsg::JsValue JsRpcStub::call(const v8::FunctionCallbackInfo<v8::Value>& args,
+    const jsg::TypeHandler<jsg::Ref<JsRpcPromise>>& handler) {
   jsg::Lock& js = jsg::Lock::from(args.GetIsolate());
-
-  return callImpl(js, JSG_THIS, kj::none, args).asJsRpcPromise(js);
+  KJ_IF_SOME(policy, servicePolicy) {
+    return jsg::JsValue(
+        handler.wrap(js, callRpcPolicy(js, *this, jsg::JsValue(policy.getHandle(js)), args)));
+  }
+  return jsg::JsValue(handler.wrap(js, callImpl(js, JSG_THIS, kj::none, args).asJsRpcPromise(js)));
 }
 
 jsg::Ref<JsRpcPromise> JsRpcPromise::call(const v8::FunctionCallbackInfo<v8::Value>& args) {
   jsg::Lock& js = jsg::Lock::from(args.GetIsolate());
+  KJ_IF_SOME(policy, state.tryGet<PrivatePolicy>()) {
+    return callRpcPolicy(js, *this, jsg::JsValue(policy.value.getHandle(js)), args);
+  }
 
   return callImpl(js, JSG_THIS, kj::none, args).asJsRpcPromise(js);
 }
@@ -1488,18 +1572,30 @@ jsg::JsValue finallyImpl(
 jsg::JsValue JsRpcProperty::then(jsg::Lock& js,
     v8::Local<v8::Function> handler,
     jsg::Optional<v8::Local<v8::Function>> errorHandler) {
+  KJ_IF_SOME(value, policy) {
+    return thenImpl(js, policyPromise(js, jsg::JsValue(value.getHandle(js)), *this).getHandle(js),
+        handler, errorHandler);
+  }
   auto promise = callImpl(js, parent.addRef(), name, kj::none).promise;
 
   return thenImpl(js, promise, handler, errorHandler);
 }
 
 jsg::JsValue JsRpcProperty::catch_(jsg::Lock& js, v8::Local<v8::Function> errorHandler) {
+  KJ_IF_SOME(value, policy) {
+    return catchImpl(js, policyPromise(js, jsg::JsValue(value.getHandle(js)), *this).getHandle(js),
+        errorHandler);
+  }
   auto promise = callImpl(js, parent.addRef(), name, kj::none).promise;
 
   return catchImpl(js, promise, errorHandler);
 }
 
 jsg::JsValue JsRpcProperty::finally(jsg::Lock& js, v8::Local<v8::Function> onFinally) {
+  KJ_IF_SOME(value, policy) {
+    return finallyImpl(
+        js, policyPromise(js, jsg::JsValue(value.getHandle(js)), *this).getHandle(js), onFinally);
+  }
   auto promise = callImpl(js, parent.addRef(), name, kj::none).promise;
 
   return finallyImpl(js, promise, onFinally);
@@ -1522,10 +1618,23 @@ jsg::JsValue JsRpcPromise::finally(jsg::Lock& js, v8::Local<v8::Function> onFina
 kj::Maybe<jsg::Ref<JsRpcProperty>> JsRpcProperty::getProperty(jsg::Lock& js, kj::String name) {
   JSG_REQUIRE(depth < MAX_PROPERTY_DEPTH, TypeError,
       "RPC pipelined property path is too deep (max ", MAX_PROPERTY_DEPTH, ").");
+  KJ_IF_SOME(value, policy) {
+    auto object = JSG_REQUIRE_NONNULL(jsg::JsValue(value.getHandle(js)).tryCast<jsg::JsObject>(),
+        TypeError, "Can't pipeline on RPC that did not return an object.");
+    auto child = object.get(js, name);
+    return js.alloc<JsRpcProperty>(js, JSG_THIS, kj::mv(name), child, depth + 1);
+  }
   return js.alloc<JsRpcProperty>(JSG_THIS, kj::mv(name), depth + 1);
 }
 
 kj::Maybe<jsg::Ref<JsRpcProperty>> JsRpcPromise::getProperty(jsg::Lock& js, kj::String name) {
+  KJ_IF_SOME(policy, state.tryGet<PrivatePolicy>()) {
+    auto object =
+        JSG_REQUIRE_NONNULL(jsg::JsValue(policy.value.getHandle(js)).tryCast<jsg::JsObject>(),
+            TypeError, "Can't pipeline on RPC that did not return an object.");
+    auto child = object.get(js, name);
+    return js.alloc<JsRpcProperty>(js, JSG_THIS, kj::mv(name), child);
+  }
   return js.alloc<JsRpcProperty>(JSG_THIS, kj::mv(name));
 }
 
@@ -1674,6 +1783,17 @@ JsRpcClientProvider::ClientForOneCall JsRpcStub::getClientForOneCall(
 }
 
 jsg::Ref<JsRpcStub> JsRpcStub::dup(jsg::Lock& js) {
+  KJ_IF_SOME(policy, servicePolicy) {
+    checkRpcPolicyContext();
+    auto receiver = policy.getHandle(js);
+    auto fn = JSG_REQUIRE_NONNULL(
+        receiver.get(js, "dup"_kj).tryCast<jsg::JsFunction>(), Error, "SERVICE_BINDING_DENIED");
+    auto duplicate = JSG_REQUIRE_NONNULL(
+        fn.call(js, receiver).tryCast<jsg::JsObject>(), Error, "SERVICE_BINDING_DENIED");
+    auto result = JsRpcStub::constructor(js, duplicate);
+    result->setServicePolicy(js, duplicate);
+    return result;
+  }
   // Reading and re-owning the parent both need the originating IoContext, which the
   // channel-number-only branch below may lack. Such stubs never carry an originating call.
   auto callParent = ownOriginatingCall(
@@ -1701,7 +1821,15 @@ jsg::Ref<JsRpcStub> JsRpcStub::dup(jsg::Lock& js) {
   }
 }
 
+void JsRpcStub::checkRpcPolicyContext() {
+  JSG_REQUIRE(!servicePolicyDisposed, Error, "SERVICE_BINDING_DENIED");
+  // INTERNAL policies are attached to constructor-created stubs with an IoOwn client. Reading
+  // it enforces the same request owner as native dispatch, without a loopback RPC event.
+  getClient();
+}
+
 void JsRpcStub::dispose() {
+  servicePolicyDisposed = true;
   capnpClient = kj::none;
   rpcChannel = kj::none;
   externalMemoryAdjustment = kj::none;
@@ -1710,6 +1838,23 @@ void JsRpcStub::dispose() {
     d.list.remove(*this);
     disposalGroup = kj::none;
   }
+}
+
+void JsRpcStub::disposeForJs(jsg::Lock& js) {
+  KJ_DEFER(dispose());
+  if (servicePolicyDisposed) return;
+  KJ_IF_SOME(policy, servicePolicy) {
+    auto receiver = policy.getHandle(js);
+    auto fn = JSG_REQUIRE_NONNULL(receiver.get(js, js.symbolDispose()).tryCast<jsg::JsFunction>(),
+        Error, "SERVICE_BINDING_DENIED");
+    fn.call(js, receiver);
+  }
+}
+
+void JsRpcStub::setServicePolicy(jsg::Lock& js, jsg::JsObject policy) {
+  KJ_REQUIRE(servicePolicy == kj::none && !servicePolicyDisposed,
+      "Service stub policy was already installed or disposed");
+  servicePolicy = jsg::JsRef<jsg::JsObject>(js, policy);
 }
 
 void RpcStubDisposalGroup::disownAll() {
@@ -1729,13 +1874,20 @@ void RpcStubDisposalGroup::disposeAll() {
   KJ_ASSERT(list.empty());
 }
 
-kj::Maybe<jsg::Ref<JsRpcProperty>> JsRpcStub::getRpcMethod(jsg::Lock& js, kj::String name) {
+kj::Maybe<jsg::JsValue> JsRpcStub::getRpcMethod(jsg::Lock& js, kj::String name) {
   // Do not return a method for `then`, otherwise JavaScript decides this is a thenable, i.e. a
   // custom Promise, which will mean a Promise that resolves to this object will attempt to chain
   // with it, which is not what you want!
   if (name == "then"_kj) return kj::none;
 
-  return js.alloc<JsRpcProperty>(JSG_THIS, kj::mv(name));
+  KJ_IF_SOME(policy, servicePolicy) {
+    if (!servicePolicyDisposed) {
+      auto member = policy.getHandle(js).get(js, name);
+      return newRpcPolicyProperty(js, JSG_THIS, kj::mv(name), member);
+    }
+  }
+  const auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<JsRpcProperty>>());
+  return jsg::JsValue(handler.wrap(js, js.alloc<JsRpcProperty>(JSG_THIS, kj::mv(name))));
 }
 
 void JsRpcStub::serialize(jsg::Lock& js, jsg::Serializer& serializer) {

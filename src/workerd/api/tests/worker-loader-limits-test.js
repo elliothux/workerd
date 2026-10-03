@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 import assert from 'node:assert';
+import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 
 // These must match the limits hard-coded in worker-loader.c++.
 const MAX_CODE_SIZE = 64 * 1024 * 1024; // 64 MiB
@@ -284,6 +285,169 @@ export let subrequestBudgetEnforced = {
     );
     const result = await worker.getEntrypoint().probe(6);
     assert.deepStrictEqual(result, { outbound: 3, budget: 3, first: 3 });
+  },
+};
+
+export class CallbackReceiver extends WorkerEntrypoint {
+  call(callback) {
+    return callback();
+  }
+}
+
+export const rpcCallbackPreservesStatelessInvocationBudget = {
+  async test(_ctrl, env, ctx) {
+    const worker = env.loader.load(
+      makeCode({
+        compatibilityDate: '2026-09-08',
+        limits: { subRequests: 1 },
+        env: { CALLBACK: ctx.exports.CallbackReceiver({ props: {} }) },
+        modules: {
+          'main.js': `import {WorkerEntrypoint} from 'cloudflare:workers';
+          export default class extends WorkerEntrypoint {
+            async check() {
+              await this.env.CALLBACK.call(() => 42);
+              try { await fetch('https://example.invalid/'); }
+              catch (error) { return error.message; }
+              throw Error('disabled outbound unexpectedly succeeded');
+            }
+          }`,
+        },
+      })
+    );
+    const entrypoint = worker.getEntrypoint();
+    for (let event = 0; event < 2; event++) {
+      assert.match(await entrypoint.check(), /^Too many subrequests\./);
+    }
+  },
+};
+
+export class LimitsHost extends DurableObject {
+  async probeEvents() {
+    const actor = this.env.factory.get('actor-request-budget').load(
+      makeCode({
+        compatibilityDate: '2026-09-08',
+        mainModule: 'actor.js',
+        modules: {
+          'actor.js': `
+          import { DurableObject } from 'cloudflare:workers';
+          export class Limited extends DurableObject {
+            async probe() {
+              const failures = [];
+              for (let index = 0; index < 3; index++) {
+                try {
+                  await fetch('https://example.invalid/');
+                  throw new Error('disabled outbound unexpectedly succeeded');
+                } catch (error) {
+                  if (/not permitted/i.test(error.message)) failures.push('outbound');
+                  else if (/Too many subrequests/i.test(error.message)) failures.push('budget');
+                  else throw error;
+                }
+              }
+              return failures;
+            }
+          }
+        `,
+        },
+        limits: { subRequests: 2 },
+      })
+    );
+    const stub = this.ctx.facets.get('limited', () => ({
+      class: actor.getDurableObjectClass('Limited'),
+    }));
+    return [await stub.probe(), await stub.probe()];
+  }
+}
+
+export let actorSubrequestBudgetReplenished = {
+  async test(_ctrl, _env, ctx) {
+    const results =
+      await ctx.exports.LimitsHost.getByName('event-budget').probeEvents();
+    assert.deepStrictEqual(results, [
+      ['outbound', 'outbound', 'budget'],
+      ['outbound', 'outbound', 'budget'],
+    ]);
+  },
+};
+
+export class PrivateControl extends WorkerEntrypoint {
+  ping() {
+    return 'pong';
+  }
+  accept() {
+    throw new Error('private capability reached receiver');
+  }
+}
+
+export let privateControlPreservesPublicBudgetAndCannotTransfer = {
+  async test(_ctrl, env, ctx) {
+    const worker = env.loader.load(
+      makeCode({
+        compatibilityFlags: ['nodejs_compat'],
+        limits: { subRequests: 1 },
+        env: { control: ctx.exports.PrivateControl({ props: {} }) },
+        modules: {
+          'main.js': `
+          import assert from 'node:assert/strict';
+          import { WorkerEntrypoint } from 'cloudflare:workers';
+          import { createPrivateTransport } from 'test:private-control';
+          export default class extends WorkerEntrypoint {
+            async probe() {
+              let control;
+              {
+                const original = this.env.control;
+                delete this.env.control;
+                control = createPrivateTransport(original);
+                await assert.rejects(control.accept(control), /cannot be transferred/);
+                assert.equal(await control.ping(), 'pong');
+                assert.equal(await control.ping(), 'pong');
+                assert.equal(await original.ping(), 'pong');
+                await assert.rejects(original.ping(), /Too many subrequests/);
+              }
+              // Only the private copy keeps the source wrapper alive across GC-stressed I/O.
+              assert.equal(await control.ping(), 'pong');
+            }
+          }
+        `,
+        },
+      })
+    );
+    await worker.getEntrypoint().probe();
+  },
+};
+
+export let privateControlRetainsNativeRequestOwner = {
+  async test(_ctrl, env) {
+    const worker = env.loader.load(
+      makeCode({
+        env: { loader: env.factory.get('private-control-owner') },
+        modules: {
+          'main.js': `
+            import { WorkerEntrypoint } from 'cloudflare:workers';
+            import { createPrivateTransport } from 'test:private-control';
+            let control;
+            export default class extends WorkerEntrypoint {
+              async create() {
+                const target = this.env.loader.load({
+                  compatibilityDate: '2025-01-01',
+                  mainModule: 'target.js',
+                  modules: { 'target.js': ${JSON.stringify(MAIN_MODULE)} },
+                  globalOutbound: null,
+                });
+                control = createPrivateTransport(target.getEntrypoint());
+                return await control.ping();
+              }
+              reuse() { return control.ping(); }
+            }
+          `,
+        },
+      })
+    );
+    const stub = worker.getEntrypoint();
+    assert.strictEqual(await stub.create(), 'pong');
+    await assert.rejects(
+      stub.reuse(),
+      /Cannot perform I\/O on behalf of a different request/
+    );
   },
 };
 

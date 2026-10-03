@@ -1403,6 +1403,12 @@ void ExtendableEvent::waitUntil(kj::Promise<void> promise) {
   IoContext::current().addWaitUntil(kj::mv(promise));
 }
 
+void ExtendableEvent::waitUntilJs(jsg::Lock& js, jsg::Promise<void> promise) {
+  JSG_REQUIRE(
+      getIsTrusted(), DOMInvalidStateError, "waitUntil() can only be called on trusted event.");
+  IoContext::current().addWaitUntil(js, kj::mv(promise));
+}
+
 jsg::Optional<jsg::Ref<ActorState>> ExtendableEvent::getActorState(jsg::Lock& js) {
   IoContext& context = IoContext::current();
   return context.getActor().map([&](Worker::Actor& actor) {

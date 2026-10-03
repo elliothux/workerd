@@ -71,7 +71,10 @@ function patchWaitUntil(ctx: {
   try {
     tag = Object.prototype.toString.call(ctx);
   } catch (_e) {}
-  if (tag !== '[object ExecutionContext]') {
+  if (
+    tag !== '[object ExecutionContext]' &&
+    tag !== '[object DurableObjectState]'
+  ) {
     return;
   }
   if (waitUntilPatched.has(ctx)) {

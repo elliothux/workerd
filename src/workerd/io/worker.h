@@ -151,7 +151,7 @@ class Worker: public kj::AtomicRefcounted {
 
   explicit Worker(kj::Own<const Script> script,
       kj::Own<WorkerObserver> metrics,
-      kj::FunctionParam<void(jsg::Lock& lock,
+      kj::FunctionParam<kj::Maybe<jsg::V8Ref<v8::Function>>(jsg::Lock& lock,
           const Api& api,
           v8::Local<v8::Object> target,
           v8::Local<v8::Object> ctxExports)> compileBindings,
@@ -164,6 +164,8 @@ class Worker: public kj::AtomicRefcounted {
   // properties to `target`. It also compiles the `ctx.exports` object and writes it to
   // `ctxExports`. Note that it is permissible for this callback to save a handle to `ctxExports`
   // and fill it in later if needed, as long as it is filled in before any requests are started.
+  // An optional config-owned synchronous export policy receives the main module namespace
+  // before entrypoint discovery; its closure keeps private capabilities outside tenant env.
 
   ~Worker() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(Worker);

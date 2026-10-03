@@ -1,6 +1,10 @@
 using Workerd = import "/workerd/workerd.capnp";
 
 const unitTests :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+      esModule = embed "worker-loader-private-policy-test.js")
+  ])],
   services = [
     ( name = "worker-loader-test",
       worker = (

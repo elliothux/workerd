@@ -2,6 +2,11 @@ using Workerd = import "/workerd/workerd.capnp";
 
 const unitTests :Workerd.Config = (
   v8Flags = ["--expose-gc"],
+  extensions = [(modules = [
+    (name = "workerd-test:public-extension", esModule = "export const label = 'configured';"),
+    (name = "cloudflare-internal:workerd-test-helper", internal = true, esModule = "export const label = 'configured';"),
+    (name = "cloudflare-internal:workerd-test-wrapped", internal = true, esModule = "import binding from 'cloudflare-internal:wrapped-binding'; import {label} from 'cloudflare-internal:workerd-test-helper'; class Product extends binding.WrappedBinding { #fetcher; constructor(env){super(env.fetcher);this.#fetcher=env.fetcher;} async ping(){return label+':'+await (await this.#fetcher.fetch('http://test/key')).text();} } export default env => new Product(env);"),
+  ])],
   services = [
     (name = "factory-peer", worker = (
       modules = [

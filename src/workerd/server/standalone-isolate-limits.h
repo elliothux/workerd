@@ -41,8 +41,9 @@ constexpr kj::Duration STANDARD_STARTUP_CPU_LIMIT = 1 * kj::SECONDS;
 // startup failure with the stable CPU-limit exception.
 class StandaloneIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
-  StandaloneIsolateLimitEnforcer(
-      kj::Rc<StandaloneIsolateLimitState> isolateState, StandaloneLimitWatchdog& watchdog);
+  StandaloneIsolateLimitEnforcer(kj::Rc<StandaloneIsolateLimitState> isolateState,
+      StandaloneLimitWatchdog& watchdog,
+      kj::Duration startupCpuLimit = STANDARD_STARTUP_CPU_LIMIT);
 
   // ---------------------------------------------------------------------------
   // IsolateLimitEnforcer
@@ -79,6 +80,7 @@ class StandaloneIsolateLimitEnforcer final: public IsolateLimitEnforcer {
 
   mutable kj::Rc<StandaloneIsolateLimitState> isolateState;
   StandaloneLimitWatchdog& watchdog;
+  const kj::Duration startupCpuLimit;
 
   // Workerd-thread-only. Set when the heap limit was hit, so memory-limit failures can be
   // reported accurately even when V8 surfaces them as ordinary RangeErrors.

@@ -1161,8 +1161,8 @@ DurableObjectState::DurableObjectState(jsg::Lock& js,
           [](Worker::Actor::FacetManager& ref) { return IoContext::current().addObject(ref); })),
       version(kj::mv(version)) {}
 
-void DurableObjectState::waitUntil(kj::Promise<void> promise) {
-  IoContext::current().addWaitUntil(kj::mv(promise));
+void DurableObjectState::waitUntil(jsg::Lock& js, jsg::Promise<void> promise) {
+  IoContext::current().addWaitUntil(js, kj::mv(promise));
 }
 
 kj::OneOf<jsg::Ref<DurableObjectId>, kj::StringPtr> DurableObjectState::getId(jsg::Lock& js) {

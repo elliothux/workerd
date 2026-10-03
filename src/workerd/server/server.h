@@ -202,6 +202,9 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // General context needed to construct workers. Initialized early in run().
   kj::Own<GlobalContext> globalContext;
 
+  // Config-owned modules share the config lifetime, as do configured WorkerServices' readers.
+  capnp::List<config::Extension>::Reader extensions;
+
   class Service;
   kj::Own<Service> invalidConfigServiceSingleton;
 

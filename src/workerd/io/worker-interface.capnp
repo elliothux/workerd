@@ -562,6 +562,15 @@ enum SerializationTag {
   hostExtensionPort @20;
   # Process-local native extension session. Only supported in a dynamic env Frankenvalue; it
   # cannot be sent over RPC or persisted as a channel token.
+
+  workerQueue @21;
+  # A native Queue producer backed by a subrequest channel. Only deserialized from a
+  # Frankenvalue capability; it cannot be serialized out of an isolate.
+
+  openComputeServiceFetcher @22;
+  openComputeDurableObjectStub @23;
+  # A native Fetcher retaining the fixed INTERNAL Service host policy. Serializes its private
+  # inner service stub, then rebuilds the same policy in the receiving isolate.
 }
 
 enum StreamEncoding {

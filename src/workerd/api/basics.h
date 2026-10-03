@@ -256,12 +256,13 @@ class ExtendableEvent: public Event {
   static jsg::Ref<ExtendableEvent> constructor(kj::String type) = delete;
 
   void waitUntil(kj::Promise<void> promise);
+  void waitUntilJs(jsg::Lock& js, jsg::Promise<void> promise);
 
   jsg::Optional<jsg::Ref<ActorState>> getActorState(jsg::Lock& js);
 
   JSG_RESOURCE_TYPE(ExtendableEvent) {
     JSG_INHERIT(Event);
-    JSG_METHOD(waitUntil);
+    JSG_METHOD_NAMED(waitUntil, waitUntilJs);
 
 #if !WORKERD_API_BASICS_TEST
     JSG_LAZY_READONLY_INSTANCE_PROPERTY(actorState, getActorState);

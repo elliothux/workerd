@@ -255,6 +255,7 @@ class WorkerdApi final: public Worker::Api {
       }
     };
     struct UnsafeEval {};
+    struct QueueWireCodec {};
 
     struct ActorClass {
       uint channel;
@@ -313,6 +314,7 @@ class WorkerdApi final: public Worker::Api {
         AnalyticsEngine,
         Hyperdrive,
         UnsafeEval,
+        QueueWireCodec,
         MemoryCache,
         ActorClass,
         LoopbackActorClass,

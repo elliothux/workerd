@@ -18,6 +18,16 @@ namespace workerd::api {
 
 class ExecutionContext;
 
+// Static host bridge for Queue's pinned V8 wire. This is not a tenant API or transferable grant.
+class QueueWireCodec final: public jsg::Object {
+ public:
+  jsg::JsValue decodeV8(jsg::Lock& js, jsg::JsBufferSource input);
+
+  JSG_RESOURCE_TYPE(QueueWireCodec) {
+    JSG_METHOD(decodeV8);
+  }
+};
+
 // Binding types
 
 // A capability to a Worker Queue.
@@ -26,6 +36,9 @@ class WorkerQueue: public jsg::Object {
   // `subrequestChannel` is what to pass to IoContext::getHttpClient() to get an HttpClient
   // representing this queue.
   WorkerQueue(uint subrequestChannel): subrequestChannel(subrequestChannel) {}
+
+  explicit WorkerQueue(IoOwn<IoChannelFactory::SubrequestChannel> subrequestChannel)
+      : subrequestChannel(kj::mv(subrequestChannel)) {}
 
   // The metrics structs below (Metrics, SendMetrics, SendBatchMetrics) are deserialized from
   // JSON responses where the upstream service uses 0 as a sentinel for "no data" on timestamp
@@ -119,17 +132,34 @@ class WorkerQueue: public jsg::Object {
     // NOTE: Any new fields added to SendOptions must also be added here.
   };
 
+  // Host-only publication policy. Arguments have already passed the native Queue serializer.
+  using Publish = jsg::Function<jsg::Promise<SendResponse>(
+      jsg::JsValue, jsg::Optional<kj::String>, jsg::Optional<int>)>;
+  using PublishBatch =
+      jsg::Function<jsg::Promise<SendBatchResponse>(kj::String, jsg::Optional<int>)>;
+  using ReadMetrics = jsg::Function<jsg::Promise<Metrics>()>;
+
+  void setPublicationPolicy(jsg::Lock& js, jsg::JsObject policy);
+
   jsg::Promise<SendResponse> send(jsg::Lock& js,
       jsg::JsValue body,
       jsg::Optional<SendOptions> options,
-      const jsg::TypeHandler<SendResponse>& responseHandler);
+      const jsg::TypeHandler<SendResponse>& responseHandler,
+      const jsg::TypeHandler<Publish>& policyHandler);
 
   jsg::Promise<SendBatchResponse> sendBatch(jsg::Lock& js,
       jsg::Sequence<MessageSendRequest> batch,
       jsg::Optional<SendBatchOptions> options,
-      const jsg::TypeHandler<SendBatchResponse>& responseHandler);
+      const jsg::TypeHandler<SendBatchResponse>& responseHandler,
+      const jsg::TypeHandler<PublishBatch>& policyHandler);
 
-  jsg::Promise<Metrics> metrics(jsg::Lock& js, const jsg::TypeHandler<Metrics>& metricsHandler);
+  jsg::Promise<Metrics> metrics(jsg::Lock& js,
+      const jsg::TypeHandler<Metrics>& metricsHandler,
+      const jsg::TypeHandler<ReadMetrics>& policyHandler);
+
+  void serialize(jsg::Lock& js, jsg::Serializer& serializer);
+  static jsg::Ref<WorkerQueue> deserialize(
+      jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
 
   JSG_RESOURCE_TYPE(WorkerQueue, CompatibilityFlags::Reader flags) {
     JSG_METHOD(metrics);
@@ -147,8 +177,16 @@ class WorkerQueue: public jsg::Object {
     JSG_TS_DEFINE(type QueueContentType = "text" | "bytes" | "json" | "v8");
   }
 
+  JSG_SERIALIZABLE(rpc::SerializationTag::WORKER_QUEUE);
+
  private:
-  uint subrequestChannel;
+  kj::Own<kj::HttpClient> getHttpClient(IoContext& context, kj::ConstString operationName);
+  kj::OneOf<uint, IoOwn<IoChannelFactory::SubrequestChannel>> subrequestChannel;
+  kj::Maybe<jsg::JsRef<jsg::JsObject>> publicationPolicy;
+
+  void visitForGc(jsg::GcVisitor& visitor) {
+    visitor.visit(publicationPolicy);
+  }
 };
 
 // Event handler types
@@ -474,13 +512,14 @@ class QueueCustomEvent final: public WorkerInterface::CustomEvent, public kj::Re
 };
 
 #define EW_QUEUE_ISOLATE_TYPES                                                                     \
-  api::WorkerQueue, api::WorkerQueue::SendMetrics, api::WorkerQueue::SendMetadata,                 \
-      api::WorkerQueue::SendResponse, api::WorkerQueue::SendBatchMetrics,                          \
-      api::WorkerQueue::SendBatchMetadata, api::WorkerQueue::SendBatchResponse,                    \
-      api::WorkerQueue::SendOptions, api::WorkerQueue::SendBatchOptions,                           \
-      api::WorkerQueue::MessageSendRequest, api::WorkerQueue::Metrics, api::MessageBatchMetrics,   \
-      api::MessageBatchMetadata, api::IncomingQueueMessage, api::QueueRetryBatch,                  \
-      api::QueueRetryMessage, api::QueueResponse, api::QueueRetryOptions, api::QueueMessage,       \
-      api::QueueEvent, api::QueueController, api::QueueExportedHandler
+  api::QueueWireCodec, api::WorkerQueue, api::WorkerQueue::SendMetrics,                            \
+      api::WorkerQueue::SendMetadata, api::WorkerQueue::SendResponse,                              \
+      api::WorkerQueue::SendBatchMetrics, api::WorkerQueue::SendBatchMetadata,                     \
+      api::WorkerQueue::SendBatchResponse, api::WorkerQueue::SendOptions,                          \
+      api::WorkerQueue::SendBatchOptions, api::WorkerQueue::MessageSendRequest,                    \
+      api::WorkerQueue::Metrics, api::MessageBatchMetrics, api::MessageBatchMetadata,              \
+      api::IncomingQueueMessage, api::QueueRetryBatch, api::QueueRetryMessage, api::QueueResponse, \
+      api::QueueRetryOptions, api::QueueMessage, api::QueueEvent, api::QueueController,            \
+      api::QueueExportedHandler
 
 }  // namespace workerd::api

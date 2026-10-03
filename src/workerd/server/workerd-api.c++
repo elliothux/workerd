@@ -733,6 +733,9 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     KJ_CASE_ONEOF(unsafe, Global::UnsafeEval) {
       value = lock.wrap(context, lock.alloc<api::UnsafeEval>());
     }
+    KJ_CASE_ONEOF(_, Global::QueueWireCodec) {
+      value = lock.wrap(context, lock.alloc<api::QueueWireCodec>());
+    }
 
     KJ_CASE_ONEOF(actorClass, Global::ActorClass) {
       value = lock.wrap(context, lock.alloc<api::DurableObjectClass>(actorClass.channel));
@@ -850,6 +853,9 @@ WorkerdApi::Global WorkerdApi::Global::clone() const {
     }
     KJ_CASE_ONEOF(unsafe, Global::UnsafeEval) {
       result.value = Global::UnsafeEval{};
+    }
+    KJ_CASE_ONEOF(_, Global::QueueWireCodec) {
+      result.value = Global::QueueWireCodec{};
     }
 
     KJ_CASE_ONEOF(actorClass, Global::ActorClass) {

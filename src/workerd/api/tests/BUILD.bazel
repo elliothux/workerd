@@ -1240,7 +1240,10 @@ wd_test(
     size = "enormous",
     src = "worker-loader-test.wd-test",
     args = ["--experimental"],
-    data = ["worker-loader-test.js"],
+    data = [
+        "worker-loader-private-policy-test.js",
+        "worker-loader-test.js",
+    ],
     # Needs to fetch pyodide which is not supported under RBE
     tags = [
         "no-remote-exec",
@@ -1266,6 +1269,7 @@ wd_test(
     data = [
         "worker-loader-limits-outbound.js",
         "worker-loader-limits-test.js",
+        "worker-loader-private-control-extension.js",
     ],
 )
 
@@ -1285,6 +1289,107 @@ wd_test(
     src = "worker-loader-delegation-test.wd-test",
     args = ["--experimental"],
     data = ["worker-loader-delegation-test.js"],
+)
+
+wd_test(
+    src = "worker-loader-cache-test.wd-test",
+    args = ["--experimental"],
+    compat_date = "2026-09-08",
+    data = [
+        "worker-loader-cache-test.js",
+        "worker-loader-cache-test-backend.js",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "durable-object-native-policy-test.wd-test",
+    args = ["--experimental"],
+    compat_date = "2026-09-08",
+    data = [
+        "durable-object-native-policy-test.js",
+        "durable-object-native-policy-test-internal.js",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "durable-object-native-id-test.wd-test",
+    args = ["--experimental"],
+    compat_date = "2026-09-08",
+    data = [
+        "durable-object-native-id-test.js",
+        "durable-object-native-id-test-internal.js",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "queue-wire-codec-test.wd-test",
+    args = [
+        "--experimental",
+        "check",
+    ],
+    compat_date = "2026-09-08",
+    data = [
+        "queue-wire-codec-test.js",
+        "queue-wire-codec-test-internal.js",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "worker-loader-host-policy-missing-test.wd-test",
+    args = ["--experimental"],
+    compat_date = "2026-09-08",
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "worker-loader-service-test.wd-test",
+    args = ["--experimental"],
+    compat_date = "2026-09-08",
+    data = [
+        "worker-loader-service-test.js",
+        "worker-loader-service-test-internal.js",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "worker-loader-host-policy-test.wd-test",
+    args = ["--experimental"],
+    compat_date = "2026-09-08",
+    data = [
+        "worker-loader-host-policy-test.js",
+        "worker-loader-host-policy-test-internal.js",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
+)
+
+wd_test(
+    src = "worker-loader-python-prepare-test.wd-test",
+    args = [
+        "--experimental",
+        "--pyodide-bundle-disk-cache-dir",
+        "$(location //src/workerd/server/tests/python:pyodide_314.0.6_2026-08-17_6.capnp.bin@rule)/..",
+    ],
+    compat_date = "2026-09-08",
+    data = [
+        "worker-loader-cache-test-backend.js",
+        "worker-loader-host-policy-test-internal.js",
+        "worker-loader-python-prepare-test.js",
+        "//src/workerd/server/tests/python:pyodide_314.0.6_2026-08-17_6.capnp.bin@rule",
+    ],
+    generate_all_autogates_variant = False,
+    generate_all_compat_flags_variant = False,
 )
 
 wd_test(

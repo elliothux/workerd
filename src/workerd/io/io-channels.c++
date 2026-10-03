@@ -353,6 +353,9 @@ kj::Promise<void> DynamicWorkerSource::ensureAllResolved() {
   KJ_IF_SOME(slot, globalOutbound) {
     resolveChannelSlot(slot);
   }
+  KJ_IF_SOME(slot, cacheApiOutbound) {
+    resolveChannelSlot(slot);
+  }
 
   for (auto& slot: tails) {
     resolveChannelSlot(slot);

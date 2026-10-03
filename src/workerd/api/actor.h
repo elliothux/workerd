@@ -54,7 +54,9 @@ class DurableObjectId: public jsg::Object {
   kj::String toString();
 
   inline bool equals(DurableObjectId& other) {
-    return id->equals(*other.id);
+    // A Worker may have both platform-owned and native actor namespaces. ActorIdFactory::equals
+    // permits a concrete-type assumption, which is invalid across these two authorities.
+    return id->toString() == other.id->toString();
   }
 
   // Get the name, if known.
@@ -84,12 +86,16 @@ class DurableObjectId: public jsg::Object {
 };
 
 // Stub object used to send messages to a remote durable object.
-class DurableObject final: public Fetcher {
+class DurableObject: public Fetcher {
  public:
   DurableObject(jsg::Ref<DurableObjectId> id,
       IoOwn<OutgoingFactory> outgoingFactory,
       RequiresHostAndProtocol requiresHost)
       : Fetcher(kj::mv(outgoingFactory), requiresHost, true /* isInHouse */),
+        id(kj::mv(id)) {}
+
+  DurableObject(jsg::Ref<DurableObjectId> id, kj::Own<CrossContextOutgoingFactory> outgoingFactory)
+      : Fetcher(kj::mv(outgoingFactory), RequiresHostAndProtocol::YES, true),
         id(kj::mv(id)) {}
 
   jsg::Ref<DurableObjectId> getId() {
@@ -190,21 +196,20 @@ class DurableObjectNamespace: public jsg::Object {
       ActorCallRetriesAllowed actorCallRetriesAllowed,
       Persistent persistent,
       kj::Maybe<UserDefinedRetryPolicy> userDefinedRetryPolicy)
-      : channel(channel),
-        idFactory(kj::mv(idFactory)),
-        actorCallRetriesAllowed(actorCallRetriesAllowed),
-        persistent(persistent),
-        userDefinedRetryPolicy(userDefinedRetryPolicy) {}
+      : authority(NativeAuthority{channel, kj::mv(idFactory), actorCallRetriesAllowed, persistent,
+          userDefinedRetryPolicy}) {}
   DurableObjectNamespace(IoOwn<ActorChannelFactory> factory,
       kj::Own<ActorIdFactory> idFactory,
       ActorCallRetriesAllowed actorCallRetriesAllowed,
       Persistent persistent,
       kj::Maybe<UserDefinedRetryPolicy> userDefinedRetryPolicy)
-      : channel(kj::mv(factory)),
-        idFactory(kj::mv(idFactory)),
-        actorCallRetriesAllowed(actorCallRetriesAllowed),
-        persistent(persistent),
-        userDefinedRetryPolicy(userDefinedRetryPolicy) {}
+      : authority(NativeAuthority{kj::mv(factory), kj::mv(idFactory), actorCallRetriesAllowed,
+          persistent, userDefinedRetryPolicy}) {}
+
+  // Platform namespaces share the native API but resolve the current persisted identity in one
+  // private host policy. No native channel or actor factory is synthesized for that authority.
+  DurableObjectNamespace(jsg::Lock& js, jsg::JsObject policy)
+      : authority(jsg::JsRef<jsg::JsObject>(js, policy)) {}
 
   struct NewUniqueIdOptions {
     // Restricts the new unique ID to a set of colos within a jurisdiction.
@@ -220,18 +225,25 @@ class DurableObjectNamespace: public jsg::Object {
   };
 
   // Create a new unique ID for a durable object that will be allocated nearby the calling colo.
-  jsg::Ref<DurableObjectId> newUniqueId(jsg::Lock& js, jsg::Optional<NewUniqueIdOptions> options);
+  using NewUniqueIdPolicy =
+      jsg::Function<jsg::Ref<DurableObjectId>(jsg::Optional<NewUniqueIdOptions>)>;
+  using IdPolicy = jsg::Function<jsg::Ref<DurableObjectId>(kj::String)>;
+  jsg::Ref<DurableObjectId> newUniqueId(jsg::Lock& js,
+      jsg::Optional<NewUniqueIdOptions> options,
+      const jsg::TypeHandler<NewUniqueIdPolicy>& handler);
 
   // Create a name-derived ID. Passing in the same `name` (to the same class) will always
   // produce the same ID.
-  jsg::Ref<DurableObjectId> idFromName(jsg::Lock& js, kj::String name);
+  jsg::Ref<DurableObjectId> idFromName(
+      jsg::Lock& js, kj::String name, const jsg::TypeHandler<IdPolicy>& handler);
 
   // Create a DurableObjectId from the stringified form of the ID (as produced by calling
   // `toString()` on a durable object ID). Throws if the ID is not a 64-digit hex number, or if the
   // ID was not originally created for this class.
   //
   // The ID may be one that was originally created using either `newUniqueId()` or `idFromName()`.
-  jsg::Ref<DurableObjectId> idFromString(jsg::Lock& js, kj::String id);
+  jsg::Ref<DurableObjectId> idFromString(
+      jsg::Lock& js, kj::String id, const jsg::TypeHandler<IdPolicy>& handler);
 
   struct GetDurableObjectOptions {
     jsg::Optional<kj::String> locationHint;
@@ -276,15 +288,26 @@ class DurableObjectNamespace: public jsg::Object {
     }
   };
 
+  using GetPolicy = jsg::Function<jsg::Ref<DurableObject>(
+      jsg::Ref<DurableObjectId>, jsg::Optional<GetDurableObjectOptions>)>;
+  using GetByNamePolicy =
+      jsg::Function<jsg::Ref<DurableObject>(kj::String, jsg::Optional<GetDurableObjectOptions>)>;
+  using JurisdictionPolicy =
+      jsg::Function<jsg::Ref<DurableObjectNamespace>(jsg::Optional<kj::Maybe<kj::String>>)>;
+
   // Gets a durable object by ID or creates it if it doesn't already exist.
-  jsg::Ref<DurableObject> get(
-      jsg::Lock& js, jsg::Ref<DurableObjectId> id, jsg::Optional<GetDurableObjectOptions> options);
+  jsg::Ref<DurableObject> get(jsg::Lock& js,
+      jsg::Ref<DurableObjectId> id,
+      jsg::Optional<GetDurableObjectOptions> options,
+      const jsg::TypeHandler<GetPolicy>& handler);
 
   // Gets a durable object by name or creates it if it doesn't already exist.
   //
   // Short for `idFromName()` followed by `get()`.
-  jsg::Ref<DurableObject> getByName(
-      jsg::Lock& js, kj::String name, jsg::Optional<GetDurableObjectOptions> options);
+  jsg::Ref<DurableObject> getByName(jsg::Lock& js,
+      kj::String name,
+      jsg::Optional<GetDurableObjectOptions> options,
+      const jsg::TypeHandler<GetByNamePolicy>& handler);
 
   // Experimental. Gets a durable object by ID if it already exists. Currently, gated for use
   // by cloudflare only.
@@ -292,8 +315,9 @@ class DurableObjectNamespace: public jsg::Object {
       jsg::Lock& js, jsg::Ref<DurableObjectId> id, jsg::Optional<GetDurableObjectOptions> options);
 
   // Creates a subnamespace with the jurisdiction hardcoded.
-  jsg::Ref<DurableObjectNamespace> jurisdiction(
-      jsg::Lock& js, jsg::Optional<kj::Maybe<kj::String>> maybeJurisdiction);
+  jsg::Ref<DurableObjectNamespace> jurisdiction(jsg::Lock& js,
+      jsg::Optional<kj::Maybe<kj::String>> maybeJurisdiction,
+      const jsg::TypeHandler<JurisdictionPolicy>& handler);
 
   JSG_RESOURCE_TYPE(DurableObjectNamespace, CompatibilityFlags::Reader flags) {
     JSG_METHOD(newUniqueId);
@@ -324,14 +348,19 @@ class DurableObjectNamespace: public jsg::Object {
   }
 
  private:
-  kj::OneOf<uint, IoOwn<ActorChannelFactory>> channel;
-  kj::Own<ActorIdFactory> idFactory;
-  ActorCallRetriesAllowed actorCallRetriesAllowed;
-
-  // See doc comment on the constructor.
-  Persistent persistent;
-
-  kj::Maybe<UserDefinedRetryPolicy> userDefinedRetryPolicy;
+  struct NativeAuthority {
+    kj::OneOf<uint, IoOwn<ActorChannelFactory>> channel;
+    kj::Own<ActorIdFactory> idFactory;
+    ActorCallRetriesAllowed actorCallRetriesAllowed;
+    Persistent persistent;
+    kj::Maybe<UserDefinedRetryPolicy> userDefinedRetryPolicy;
+  };
+  kj::OneOf<NativeAuthority, jsg::JsRef<jsg::JsObject>> authority;
+  void visitForGc(jsg::GcVisitor& visitor) {
+    KJ_IF_SOME(policy, authority.tryGet<jsg::JsRef<jsg::JsObject>>()) {
+      visitor.visit(policy);
+    }
+  }
 
   jsg::Ref<DurableObject> getImpl(jsg::Lock& js,
       ActorGetMode mode,
