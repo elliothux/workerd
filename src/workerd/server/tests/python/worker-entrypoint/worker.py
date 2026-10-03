@@ -5,14 +5,9 @@
 import os
 
 from js import Date, Object
-from workers import RpcTarget, WorkerEntrypoint
+from workers import WorkerEntrypoint
 
 from pyodide.ffi import to_js
-
-
-class QueueNamedRpcTarget(RpcTarget):
-    async def queue(self, left, right):
-        return f"{left}:{right}"
 
 
 class WorkerEntrypointExample(WorkerEntrypoint):
@@ -28,9 +23,6 @@ class WorkerEntrypointExample(WorkerEntrypoint):
 
     async def rpc_arguments(self, left, middle, right):
         return f"{left}:{middle}:{right}"
-
-    async def rpc_queue_target(self):
-        return QueueNamedRpcTarget()
 
     async def queue(self, batch):
         assert batch.queue == "entrypoint-events"
@@ -51,9 +43,6 @@ async def test(ctrl, env, ctx):
     assert second_resp == "hello from python 1"
 
     assert await env.entrypoint.rpc_arguments("a", "b", "c") == "a:b:c"
-    target = await env.entrypoint.rpc_queue_target()
-    assert await target.queue("a", "b") == "a:b"
-
     messages = to_js(
         [
             {"id": "one", "timestamp": Date.new(1_000), "attempts": 1, "body": "first"},
