@@ -509,7 +509,10 @@ function makeEntrypointProxyHandler(
 
         const introspectionMod = await getIntrospectionMod();
 
-        const isRelaxed = isFetch || prop === 'test';
+        const isRelaxed =
+          isFetch ||
+          prop === 'test' ||
+          (className === 'WorkerEntrypoint' && prop === 'scheduled');
         return await doPyCall(introspectionMod.wrapper_func, [
           isRelaxed,
           pyInstance,

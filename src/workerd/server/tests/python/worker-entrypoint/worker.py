@@ -33,6 +33,11 @@ class WorkerEntrypointExample(WorkerEntrypoint):
         batch.messages[1].retry({"delaySeconds": 7})
         batch.ackAll()
 
+    async def scheduled(self, controller):
+        assert controller.cron == "* * * * *"
+        assert controller.scheduledTime == 60_000
+        controller.noRetry()
+
 
 async def test(ctrl, env, ctx):
     first_resp = await env.entrypoint.rpc_trigger_func()
@@ -62,3 +67,12 @@ async def test(ctrl, env, ctx):
     assert len(queued.retryMessages) == 1
     assert queued.retryMessages[0].msgId == "two"
     assert queued.retryMessages[0].delaySeconds == 7
+
+    scheduled = await env.entrypoint.scheduled(
+        to_js(
+            {"cron": "* * * * *", "scheduledTime": Date.new(60_000)},
+            dict_converter=Object.fromEntries,
+        )
+    )
+    assert scheduled.outcome == "ok"
+    assert scheduled.noRetry
