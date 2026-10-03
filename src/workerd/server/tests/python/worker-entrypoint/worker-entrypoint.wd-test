@@ -9,7 +9,7 @@ const config :Workerd.Config = (
 
 const mainWorker :Workerd.Worker = (
 
-  compatibilityFlags = [%PYTHON_FEATURE_FLAGS, "rpc", "disable_python_no_global_handlers"],
+  compatibilityFlags = [%PYTHON_FEATURE_FLAGS, "rpc", "disable_python_no_global_handlers", "service_binding_extra_handlers"],
 
   modules = [
     (name = "worker.py", pythonModule = embed "worker.py"),

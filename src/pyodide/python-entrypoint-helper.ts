@@ -483,6 +483,13 @@ function makeEntrypointProxyHandler(
           throw new TypeError(`Method ${prop} does not exist`);
         }
 
+        // WorkerEntrypoint.queue receives the batch; env and ctx belong to the instance.
+        // The SDK's variadic queue decorator forwards extra arguments to the user's
+        // single-argument method, so relaxed calling cannot trim them for us.
+        if (className === 'WorkerEntrypoint' && prop === 'queue') {
+          args = args.slice(0, 1);
+        }
+
         if ((isKnownHandler || isKnownDoHandler) && !isFetch) {
           return await doPyCallHelper(
             true,
