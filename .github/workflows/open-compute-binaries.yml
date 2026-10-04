@@ -104,7 +104,7 @@ jobs:
           mkdir release
           cp "${catalogs[0]}" release/compatibility-catalog.json
           for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
-            binary="artifacts/workerd-$target/workerd"
+            binary="artifacts/workerd-$target/bazel-bin/src/workerd/server/workerd"
             test -f "$binary"
             case "$target" in
               darwin-x64) archive=workerd-darwin-64.gz ;;
