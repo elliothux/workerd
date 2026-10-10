@@ -25,8 +25,12 @@ class HostContainerRpc final: public capnp::Capability::Server {
    private:
     kj::ForkedPromise<void> queue = kj::Promise<void>(kj::READY_NOW).fork();
   };
+  struct Resolved {
+    rpc::Container::Client client;
+    kj::String leaseKey;
+  };
   using Resolve =
-      kj::Function<kj::Promise<kj::Maybe<rpc::Container::Client>>(bool, bool, bool, kj::String)>;
+      kj::Function<kj::Promise<kj::Maybe<Resolved>>(bool, bool, bool, kj::String, kj::String)>;
   HostContainerRpc(Resolve resolve, kj::Own<MutationQueue> mutations)
       : resolve(kj::mv(resolve)),
         mutations(kj::mv(mutations)) {}
@@ -65,7 +69,8 @@ class HostContainerRpc final: public capnp::Capability::Server {
       codec.setHasMode(capnp::HasMode::NON_DEFAULT);
       startup = codec.encode(context.getParams().getAs<rpc::Container::StartParams>());
     }
-    auto client = co_await resolve(methodId == 1, methodId == 3, false, kj::mv(startup));
+    auto client =
+        co_await resolve(methodId == 1, methodId == 3, false, kj::mv(startup), kj::str(""));
     if (client == kj::none && (methodId == 0 || methodId == 3)) {
       if (methodId == 0)
         context.getResults().initAs<rpc::Container::StatusResults>().setRunning(false);
@@ -74,7 +79,9 @@ class HostContainerRpc final: public capnp::Capability::Server {
       co_return;
     }
     auto& target = JSG_REQUIRE_NONNULL(client, Error, "The Container is not running.");
-    auto request = target.typelessRequest(capnp::typeId<rpc::Container>(), methodId, kj::none, {});
+    auto leaseKey = kj::str(target.leaseKey);
+    auto request =
+        target.client.typelessRequest(capnp::typeId<rpc::Container>(), methodId, kj::none, {});
     request.setAs<capnp::AnyPointer>(context.getParams());
     if (methodId == 1 || methodId == 2 || methodId == 3) {
       auto response = co_await request.send();
@@ -82,9 +89,9 @@ class HostContainerRpc final: public capnp::Capability::Server {
         // The native monitor RPC succeeds with an exact exit code, including signal/nonzero exits.
         // Transport failures reject above and must retain unknown leases. Persist a stop intent
         // before the provider proves process fencing and cleanup.
-        co_await resolve(false, true, false, kj::str(""));
+        co_await resolve(false, true, false, kj::str(""), kj::str(leaseKey));
       }
-      co_await resolve(false, methodId != 1, true, kj::str(""));
+      co_await resolve(false, methodId != 1, true, kj::str(""), kj::mv(leaseKey));
       context.getResults().setAs<capnp::AnyPointer>(response);
     } else {
       co_await context.tailCall(kj::mv(request));

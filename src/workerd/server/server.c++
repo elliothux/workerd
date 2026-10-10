@@ -793,8 +793,8 @@ class Server::ActorNamespace final {
     }
 
     kj::Promise<void> ensureHostContainerAttached() override {
-      auto& tenant = JSG_REQUIRE_NONNULL(facets.findEntry("tenant"_kj), Error,
-          "The host has no declared tenant facet.");
+      auto& tenant = JSG_REQUIRE_NONNULL(
+          facets.findEntry("tenant"_kj), Error, "The host has no declared tenant facet.");
       co_await tenant.value->getActor().ignoreResult().attach(tenant.value->addRef());
     }
 
@@ -811,11 +811,12 @@ class Server::ActorNamespace final {
               key == "tenant",
           Error, "Container attachments require the host's declared tenant facet.");
       auto weak = root.weakSelf->addRef();
-      auto getClient =
-          [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound)](bool start,
-              bool stop, bool completed,
-              kj::String startup) mutable -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
-        auto lease = co_await resolve(start, stop, completed, kj::mv(startup));
+      auto getClient = [weak = kj::mv(weak), resolve = kj::mv(resolve),
+                           outbound = kj::mv(outbound)](bool start, bool stop, bool completed,
+                           kj::String startup, kj::String expectedLeaseKey) mutable
+          -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+        auto lease =
+            co_await resolve(start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey));
         auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
         if (stop && completed) {
           owner.revokeHostContainerCallbacks();
@@ -832,8 +833,9 @@ class Server::ActorNamespace final {
             KJ_ASSERT_NONNULL(owner.hostContainerClient)
                 ->setHostCredentials(
                     kj::str(identity.controlToken), kj::str(identity.callbackToken));
-            co_return rpc::Container::Client(
-                KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef());
+            co_return HostContainerRpc::Resolved{
+              rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
+              kj::str(identity.leaseKey)};
           }
         }
         owner.hostContainerClient = owner.ns.getContainerClient(identity.leaseKey,
@@ -841,7 +843,9 @@ class Server::ActorNamespace final {
         KJ_ASSERT_NONNULL(owner.hostContainerClient)
             ->setHostCredentials(kj::str(identity.controlToken), kj::str(identity.callbackToken));
         owner.hostContainerLease = kj::mv(identity);
-        co_return rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef());
+        co_return HostContainerRpc::Resolved{
+          rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
+          kj::str(KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey)};
       };
       capnp::Capability::Client grant(
           kj::heap<HostContainerRpc>(kj::mv(getClient), kj::addRef(*root.hostContainerMutations)));
@@ -6490,11 +6494,13 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         KJ_IF_SOME(grant, isolate->hostContainer) {
           if (entrypointName != kj::none &&
               KJ_ASSERT_NONNULL(entrypointName) == grant->getClassName()) {
-            JSG_REQUIRE(container == kj::none, Error, "Container attachment is already configured.");
-            container = grant->attach(JSG_REQUIRE_NONNULL(facetManager, Error,
-                                          "Container attachment requires a host-owned tenant facet."),
-                kj::addRef(*JSG_REQUIRE_NONNULL(isolate->containerOutbound, Error,
-                    "Container attachment requires the tenant outbound capability.")));
+            JSG_REQUIRE(
+                container == kj::none, Error, "Container attachment is already configured.");
+            container =
+                grant->attach(JSG_REQUIRE_NONNULL(facetManager, Error,
+                                  "Container attachment requires a host-owned tenant facet."),
+                    kj::addRef(*JSG_REQUIRE_NONNULL(isolate->containerOutbound, Error,
+                        "Container attachment requires the tenant outbound capability.")));
           }
         }
         return getInner().newActor(tracker, kj::mv(actorId), kj::mv(makeActorCache),

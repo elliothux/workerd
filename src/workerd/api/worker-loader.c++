@@ -1,7 +1,5 @@
 #include "worker-loader.h"
 
-#include <capnp/compat/json.h>
-
 #include <workerd/api/actor-state.h>
 #include <workerd/api/actor.h>
 #include <workerd/api/http.h>
@@ -12,6 +10,7 @@
 #include <workerd/util/completion-membrane.h>
 #include <workerd/util/weak-refs.h>
 
+#include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <kj/vector.h>
 
@@ -153,13 +152,14 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
     JSG_REQUIRE(!revoked && origin->tryGet() != kj::none, Error,
         "The Container attachment grant has been revoked.");
     auto client = child.attachHostContainer(owner,
-        [weak = weakSelf->addRef()](
-            bool start, bool stop, bool completed, kj::String startup) mutable {
-      auto& self = JSG_REQUIRE_NONNULL(weak->tryGet(), Error,
-          "The Container attachment grant has ended.");
+        [weak = weakSelf->addRef()](bool start, bool stop, bool completed, kj::String startup,
+            kj::String expectedLeaseKey) mutable {
+      auto& self =
+          JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container attachment grant has ended.");
       JSG_REQUIRE(!self.revoked && self.origin->tryGet() != kj::none, Error,
           "The Container attachment grant has been revoked.");
-      return self.resolve(start, stop, completed, kj::mv(startup)).attach(kj::addRef(self));
+      return self.resolve(start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey))
+          .attach(kj::addRef(self));
     },
         kj::mv(outbound));
     attached = capnp::membrane(kj::mv(client), kj::addRef(*membrane));
@@ -171,11 +171,11 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
     co_await owner.ensureHostContainerAttached();
     auto& capability = JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.");
     if ((co_await capability.statusRequest().send()).getRunning()) co_return;
-    auto lease = co_await resolve(true, false, false, kj::str(""));
+    auto lease = co_await resolve(true, false, false, kj::str(""), kj::str(""));
     auto& execution = JSG_REQUIRE_NONNULL(lease, Error, "Container execution is unavailable.");
     JSG_REQUIRE(!revoked, Error, "The Container attachment grant has been revoked.");
-    auto request = JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.")
-                       .startRequest();
+    auto request =
+        JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.").startRequest();
     capnp::JsonCodec codec;
     codec.decode(execution.nativeStartupJson, request);
     co_await request.send();
@@ -194,7 +194,8 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
 
  private:
   kj::Own<WeakRef<HostContainerChannelImpl>> weakSelf =
-      kj::refcounted<WeakRef<HostContainerChannelImpl>>(kj::Badge<HostContainerChannelImpl>(), *this);
+      kj::refcounted<WeakRef<HostContainerChannelImpl>>(
+          kj::Badge<HostContainerChannelImpl>(), *this);
   kj::Own<IoContext::WeakRef> origin;
   Worker::Actor::FacetManager& owner;
   kj::String className;
@@ -208,8 +209,8 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
 }  // namespace
 
 jsg::Promise<void> HostContainer::start(jsg::Lock& js) {
-  return IoContext::current().awaitIo(js,
-      channel->start().attach(kj::addRef(*channel)).catch_([](kj::Exception&&) {
+  return IoContext::current().awaitIo(
+      js, channel->start().attach(kj::addRef(*channel)).catch_([](kj::Exception&&) {
     JSG_FAIL_REQUIRE(Error, "Container operation failed.");
   }));
 }
@@ -224,15 +225,15 @@ jsg::Ref<HostFacets> WorkerLoaderFactory::getFacets(
 jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
     jsg::Ref<DurableObjectFacets> facets,
     kj::String className,
-    jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(bool, bool, bool, kj::String)>
-        resolve) {
+    jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(
+        bool, bool, bool, kj::String, kj::String)> resolve) {
   JSG_REQUIRE(
       className.size() > 0 && className.size() <= 256, TypeError, "Invalid Container class name.");
   auto& ioctx = IoContext::current();
   auto callback = ioctx.makeReentryCallbackWeak(
       [resolve = kj::mv(resolve)](jsg::Lock& js, IoContext& ioctx, bool start, bool stop,
-          bool completed, kj::String startup) mutable {
-    return resolve(js, start, stop, completed, kj::mv(startup))
+          bool completed, kj::String startup, kj::String expectedLeaseKey) mutable {
+    return resolve(js, start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey))
         .then(js,
             ioctx.addFunctor(
                 [](jsg::Lock& js, IoContext& ioctx,

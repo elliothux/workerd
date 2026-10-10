@@ -36,11 +36,12 @@ struct HostContainerLease {
   kj::String callbackToken;
   kj::String nativeStartupJson;
 
-  JSG_STRUCT(leaseKey, imageRef, providerContractSha256, controlToken, callbackToken, nativeStartupJson);
+  JSG_STRUCT(
+      leaseKey, imageRef, providerContractSha256, controlToken, callbackToken, nativeStartupJson);
 };
 
 using ResolveHostContainerLease = kj::Function<kj::Promise<kj::Maybe<HostContainerLease>>(
-    bool start, bool stop, bool completed, kj::String startup)>;
+    bool start, bool stop, bool completed, kj::String startup, kj::String expectedLeaseKey)>;
 
 class HostContainerOwner;
 

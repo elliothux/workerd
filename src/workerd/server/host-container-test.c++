@@ -31,12 +31,12 @@ KJ_TEST("Host Container status and destroy do not reserve an absent lease") {
   kj::WaitScope wait(loop);
   uint calls = 0;
   capnp::Capability::Client capability(kj::heap<HostContainerRpc>(
-      [&calls](bool start, bool stop, bool completed,
-          kj::String startup) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      [&calls](bool start, bool stop, bool completed, kj::String startup,
+          kj::String expectedLeaseKey) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     KJ_EXPECT(!start && !completed && startup.size() == 0);
     KJ_EXPECT(stop == (calls == 1));
     ++calls;
-    return kj::Maybe<rpc::Container::Client>(kj::none);
+    return kj::Maybe<HostContainerRpc::Resolved>(kj::none);
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = capability.castAs<rpc::Container>();
@@ -70,8 +70,8 @@ KJ_TEST("Host Container mutation callbacks bracket the original native engine op
   rpc::Container::Client native(kj::mv(engine));
   uint calls = 0;
   capnp::Capability::Client capability(kj::heap<HostContainerRpc>(
-      [&calls, &inspect, &native](bool start, bool stop, bool completed,
-          kj::String startup) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      [&calls, &inspect, &native](bool start, bool stop, bool completed, kj::String startup,
+          kj::String expectedLeaseKey) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     switch (calls++) {
       case 0:
         KJ_EXPECT(start && !stop && !completed && inspect.started == 0);
@@ -88,7 +88,8 @@ KJ_TEST("Host Container mutation callbacks bracket the original native engine op
       default:
         KJ_FAIL_ASSERT("Unexpected Container callback");
     }
-    return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+    return kj::Maybe<HostContainerRpc::Resolved>(
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = capability.castAs<rpc::Container>();
@@ -150,11 +151,12 @@ KJ_TEST(
   auto reserved = kj::newPromiseAndFulfiller<void>();
   uint lookups = 0;
   capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
-      [&native, &reserved, &lookups](
-          bool start, bool, bool, kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      [&native, &reserved, &lookups](bool start, bool, bool, kj::String,
+          kj::String) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     ++lookups;
     if (start) co_await kj::mv(reserved.promise);
-    co_return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+    co_return kj::Maybe<HostContainerRpc::Resolved>(
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = grant.castAs<rpc::Container>();
@@ -181,8 +183,8 @@ KJ_TEST(
   kj::WaitScope wait(loop);
   auto reserved = kj::newPromiseAndFulfiller<void>();
   capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
-      [&reserved](
-          bool start, bool, bool, kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      [&reserved](bool start, bool, bool, kj::String,
+          kj::String) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     if (start) co_await kj::mv(reserved.promise);
     co_return kj::none;
   },
@@ -204,8 +206,8 @@ KJ_TEST("Container epoch revocation interrupts pending reservation and queued mo
   auto reserved = kj::newPromiseAndFulfiller<void>();
   auto revocation = kj::newPromiseAndFulfiller<void>();
   capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
-      [&reserved](
-          bool start, bool, bool, kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      [&reserved](bool start, bool, bool, kj::String,
+          kj::String) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     if (start) co_await kj::mv(reserved.promise);
     co_return kj::none;
   },
@@ -220,6 +222,38 @@ KJ_TEST("Container epoch revocation interrupts pending reservation and queued mo
   KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", start.wait(wait));
   KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", monitor.wait(wait));
   KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", port.wait(wait));
+}
+
+KJ_TEST("Delayed monitor cleanup retains its original lease key after replacement startup") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  auto oldEngine = kj::heap<StartingEngine>();
+  auto& old = *oldEngine;
+  old.started = true;
+  rpc::Container::Client oldClient(kj::mv(oldEngine));
+  auto replacementEngine = kj::heap<Engine>();
+  auto& replacement = *replacementEngine;
+  rpc::Container::Client replacementClient(kj::mv(replacementEngine));
+  kj::StringPtr current = "old";
+  uint stops = 0;
+  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+      [&oldClient, &replacementClient, &current, &stops](bool start, bool stop, bool, kj::String,
+          kj::String expected) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+    if (start) current = "replacement";
+    KJ_REQUIRE(expected.size() == 0 || expected == current, "Lease generation changed.");
+    if (stop) ++stops;
+    return kj::Maybe<HostContainerRpc::Resolved>(HostContainerRpc::Resolved{
+      rpc::Container::Client(current == "old" ? oldClient : replacementClient), kj::str(current)});
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>()));
+  auto container = grant.castAs<rpc::Container>();
+  auto monitor = container.monitorRequest().send().dropPipeline();
+  KJ_EXPECT(!monitor.poll(wait) && old.monitoring);
+  container.startRequest().send().wait(wait);
+  KJ_EXPECT(replacement.started == 1);
+  old.exit.fulfiller->fulfill(0);
+  KJ_EXPECT_THROW_MESSAGE("Container operation failed", monitor.wait(wait));
+  KJ_EXPECT(stops == 0 && replacement.destroyed == 0);
 }
 
 class ExitedEngine final: public rpc::Container::Server {
@@ -244,13 +278,15 @@ KJ_TEST(
     rpc::Container::Client native(kj::heap<ExitedEngine>(code, false));
     uint stage = 0;
     capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
-        [&native, &stage](bool start, bool stop, bool completed,
-            kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+        [&native, &stage](bool start, bool stop, bool completed, kj::String,
+            kj::String expectedLeaseKey) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
       KJ_EXPECT(!start);
+      KJ_EXPECT(expectedLeaseKey == (stage == 0 ? "" : "lease"));
       KJ_EXPECT(stop == (stage != 0));
       KJ_EXPECT(completed == (stage == 2));
       ++stage;
-      return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+      return kj::Maybe<HostContainerRpc::Resolved>(
+          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
     },
         kj::refcounted<HostContainerRpc::MutationQueue>()));
     auto result = grant.castAs<rpc::Container>().monitorRequest().send().wait(wait);
@@ -264,11 +300,12 @@ KJ_TEST("Unknown native monitor transport failure never requests stop or release
   rpc::Container::Client native(kj::heap<ExitedEngine>(0, true));
   uint lookups = 0;
   capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
-      [&native, &lookups](bool start, bool stop, bool completed,
-          kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      [&native, &lookups](bool start, bool stop, bool completed, kj::String,
+          kj::String) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     KJ_EXPECT(!start && !stop && !completed);
     ++lookups;
-    return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+    return kj::Maybe<HostContainerRpc::Resolved>(
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   KJ_EXPECT_THROW_MESSAGE("Container operation failed",
