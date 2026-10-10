@@ -2636,7 +2636,7 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `    this.bind(ctx, env);
           `  }
           `  bind(ctx, env) {
-          `    this.leaseActive = this.birth === 1 && this.replaced;
+          `    this.leaseActive = (this.birth === 1 && this.replaced) || this.birth > 2;
           `    this.grant = env.factory.getContainer(ctx.facets, 'Tenant', async (_start, stop, completed) => {
           `      if (stop && completed) { this.leaseActive = false; return undefined; }
           `      if (_start) this.leaseActive = true;
@@ -2656,6 +2656,7 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `      class:loaded.getDurableObjectClass('Tenant'), id:'tenant'}));
           `  }
           `  async fetch(request) {
+          `    if (new URL(request.url).pathname === '/retire') this.ctx.abort('Server shutting down.');
           `    if (new URL(request.url).pathname === '/replace') {
           `      this.grant.revoke();
           `      if (await this.child.registerAfterRevoke()) throw new Error('Revoked facet registered an outbound callback');
@@ -2663,6 +2664,7 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `      this.replaced = true; this.bind(this.ctx, this.env);
           `      await this.child.fetch('http://tenant/prepare');
           `    }
+          `    if (new URL(request.url).pathname === '/recover') await this.child.fetch('http://tenant/prepare');
           `    if (new URL(request.url).pathname === '/first' || new URL(request.url).pathname === '/start') {
           `      const before = await this.env.engine.fetch('http://unit/stats').then(r => r.text());
           `      await this.child.fetch('http://tenant/prepare');
@@ -2689,8 +2691,9 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `    return new Response(this.birth + ':' + await response.text());
           `  }
           `}
-          `export default {fetch(request, env) {
-          `  return env.objects.get(env.objects.idFromName('owner')).fetch(request);
+          `export default {async fetch(request, env) {
+          `  try { return await env.objects.get(env.objects.idFromName('owner')).fetch(request); }
+          `  catch (error) { if (new URL(request.url).pathname === '/retire') return new Response('retired'); throw error; }
           `}};
         )],
         bindings = [
@@ -2711,19 +2714,21 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
       (name = "docker", worker = (
         compatibilityDate = "2026-09-08",
         modules = [(name = "docker.js", esModule =
-          `const states = new Map(); let requests = 0;
+          `const states = new Map(); let requests = 0; let starts = 0; let deletes = 0;
           `export default {async fetch(request) {
           `  await request.arrayBuffer();
           `  const path = new URL(request.url).pathname; const name = path.split('/')[2];
           `  if (path === '/stats') return new Response(String(requests));
+          `  if (path === '/shutdown-proof') return new Response(String(states.get('9'.repeat(64))) + ':' + String(states.get('9'.repeat(64) + '-proxy')));
+          `  if (path === '/process-proof') return new Response(String(starts) + ':' + String(deletes));
           `  ++requests;
           `  if (path.endsWith('/archive')) return new Response(null,{status:200});
           `  if (path === '/containers/create') return Response.json({Id:new URL(request.url).searchParams.get('name')},{status:201});
-          `  if (path.endsWith('/start')) { states.set(name,true); return new Response(null,{status:204}); }
+          `  if (path.endsWith('/start')) { ++starts; states.set(name,true); return new Response(null,{status:204}); }
           `  if (path === '/volumes') return Response.json({Volumes:[]});
           `  if (path === '/networks/bridge') return Response.json({IPAM:{Config:[{Gateway:'127.0.0.1',Subnet:'127.0.0.0/8'}]}});
           `  if (path.endsWith('/wait')) { while (states.get(name)) await scheduler.wait(1000); return Response.json({StatusCode:0}); }
-          `  if (request.method === 'DELETE') { states.set(name,false); return new Response(null,{status:204}); }
+          `  if (request.method === 'DELETE') { ++deletes; states.set(name,false); return new Response(null,{status:204}); }
           `  if (path.endsWith('/json')) return Response.json({
           `    State:{Status:states.get(name) ? 'running' : 'exited'}, NetworkSettings:{Ports:{'39001/tcp':[{HostIp:'127.0.0.1',HostPort:'39002'}]}}
           `  });
@@ -2831,6 +2836,21 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
   test.wait(12);
   auto resumed = test.connect("test-addr");
   resumed.httpGet200("/", "2:true:8");
+
+  // Explicit abort retires the native owner just like Server teardown. The persisted provider,
+  // not the native owner or its retired callbacks, owns removal of an admitted lease.
+  resumed.httpGet200("/retire", "retired");
+  test.wait(1);
+  auto provider = test.connect("docker-addr");
+  provider.httpGet200("/shutdown-proof", "true:true");
+  provider.httpGet200("/process-proof", "4:3");
+  auto recovered = test.connect("test-addr");
+  recovered.httpGet200("/recover", "3:true:9");
+  auto preserved = test.connect("docker-addr");
+  preserved.httpGet200("/process-proof", "4:3");
+  test.wait(12);
+  auto recoveredIdle = test.connect("test-addr");
+  recoveredIdle.httpGet200("/", "3:true:10");
 }
 
 KJ_TEST("Server: named images and directory snapshots are not startup sources") {

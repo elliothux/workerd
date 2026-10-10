@@ -130,8 +130,8 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
 
   ~ContainerClient() noexcept(false);
 
-  // Starts best-effort Docker cleanup before this client is destroyed. This is used during
-  // graceful server shutdown, when cleanup can still use the server's network resources.
+  // Releases callbacks before owner teardown. Standalone Docker clients also remove their
+  // containers; private host leases remain owned by the persisted host authority.
   void shutdown();
 
   // Cancel in-flight tenant callbacks and release old mappings while retaining the effective lease.

@@ -1187,6 +1187,12 @@ void ContainerClient::shutdown() {
   revokeHostCallbacks();
   stopEgressListener();
 
+  // The host authority owns private lease termination across native owner retirement and restart.
+  if (outbound != kj::none) {
+    cleanupCallback(kj::READY_NOW);
+    return;
+  }
+
   // Remove the application before deleting its cloned volumes and network-namespace sidecar.
   // Waiting for each removal ensures shutdown does not report completion while Docker is still
   // tearing down the sidecar.
