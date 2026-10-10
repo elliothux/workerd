@@ -52,6 +52,12 @@ class HostContainerRpc final: public capnp::Capability::Server {
       auto turn = mutations->take();
       mutation = kj::mv(turn.fulfiller);
       co_await turn.promise;
+    } else {
+      // start() queues its RPC before the automatic monitor. Do not resolve the lease until that
+      // mutation has finished, but release this barrier before a long-lived monitor or stream.
+      auto turn = mutations->take();
+      co_await turn.promise;
+      turn.fulfiller->fulfill();
     }
     kj::String startup = kj::str("");
     if (methodId == 1) {
@@ -70,9 +76,15 @@ class HostContainerRpc final: public capnp::Capability::Server {
     auto& target = JSG_REQUIRE_NONNULL(client, Error, "The Container is not running.");
     auto request = target.typelessRequest(capnp::typeId<rpc::Container>(), methodId, kj::none, {});
     request.setAs<capnp::AnyPointer>(context.getParams());
-    if (methodId == 1 || methodId == 3) {
+    if (methodId == 1 || methodId == 2 || methodId == 3) {
       auto response = co_await request.send();
-      co_await resolve(false, methodId == 3, true, kj::str(""));
+      if (methodId == 2) {
+        // The native monitor RPC succeeds with an exact exit code, including signal/nonzero exits.
+        // Transport failures reject above and must retain unknown leases. Persist a stop intent
+        // before the provider proves process fencing and cleanup.
+        co_await resolve(false, true, false, kj::str(""));
+      }
+      co_await resolve(false, methodId != 1, true, kj::str(""));
       context.getResults().setAs<capnp::AnyPointer>(response);
     } else {
       co_await context.tailCall(kj::mv(request));

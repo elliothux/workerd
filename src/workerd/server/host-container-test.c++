@@ -111,6 +111,171 @@ KJ_TEST("Host Container mutation queue preserves ordering after a waiting operat
   last.fulfiller->fulfill();
 }
 
+class StartingEngine final: public rpc::Container::Server {
+ public:
+  kj::PromiseFulfillerPair<void> startup = kj::newPromiseAndFulfiller<void>();
+  kj::PromiseFulfillerPair<int32_t> exit = kj::newPromiseAndFulfiller<int32_t>();
+  bool started = false;
+  bool monitoring = false;
+  bool portRequested = false;
+
+  kj::Promise<void> start(StartContext) override {
+    co_await kj::mv(startup.promise);
+    started = true;
+  }
+  kj::Promise<void> monitor(MonitorContext context) override {
+    KJ_REQUIRE(started);
+    monitoring = true;
+    context.getResults().setExitCode(co_await kj::mv(exit.promise));
+  }
+  kj::Promise<void> getTcpPort(GetTcpPortContext context) override {
+    KJ_REQUIRE(started);
+    portRequested = true;
+    context.getResults().setPort(rpc::Container::Port::Client(nullptr));
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> destroy(DestroyContext) override {
+    exit.fulfiller->fulfill(0);
+    return kj::READY_NOW;
+  }
+};
+
+KJ_TEST(
+    "Container monitor and port await reservation and startup without locking their lifetimes") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  auto engine = kj::heap<StartingEngine>();
+  auto& state = *engine;
+  rpc::Container::Client native(kj::mv(engine));
+  auto reserved = kj::newPromiseAndFulfiller<void>();
+  uint lookups = 0;
+  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+      [&native, &reserved, &lookups](
+          bool start, bool, bool, kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+    ++lookups;
+    if (start) co_await kj::mv(reserved.promise);
+    co_return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>()));
+  auto container = grant.castAs<rpc::Container>();
+  auto start = container.startRequest().send().dropPipeline();
+  auto monitor = container.monitorRequest().send().dropPipeline();
+  auto port = container.getTcpPortRequest().send().dropPipeline();
+  KJ_EXPECT(!start.poll(wait) && !monitor.poll(wait) && !port.poll(wait));
+  KJ_EXPECT(lookups == 1 && !state.started && !state.monitoring && !state.portRequested);
+  reserved.fulfiller->fulfill();
+  KJ_EXPECT(!start.poll(wait) && !monitor.poll(wait) && !port.poll(wait));
+  KJ_EXPECT(lookups == 1);
+  state.startup.fulfiller->fulfill();
+  start.wait(wait);
+  port.wait(wait);
+  KJ_EXPECT(!monitor.poll(wait) && state.monitoring && state.portRequested);
+  // A running monitor must not block the destroy mutation that will finish it.
+  container.destroyRequest().send().wait(wait);
+  KJ_EXPECT(monitor.wait(wait).getExitCode() == 0);
+}
+
+KJ_TEST(
+    "Failed Container reservation releases waiting monitor and port without reaching the engine") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  auto reserved = kj::newPromiseAndFulfiller<void>();
+  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+      [&reserved](
+          bool start, bool, bool, kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+    if (start) co_await kj::mv(reserved.promise);
+    co_return kj::none;
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>()));
+  auto container = grant.castAs<rpc::Container>();
+  auto start = container.startRequest().send().dropPipeline();
+  auto monitor = container.monitorRequest().send().dropPipeline();
+  auto port = container.getTcpPortRequest().send().dropPipeline();
+  KJ_EXPECT(!monitor.poll(wait) && !port.poll(wait));
+  reserved.fulfiller->reject(KJ_EXCEPTION(FAILED, "Reservation failed."));
+  KJ_EXPECT_THROW_MESSAGE("Container operation failed", start.wait(wait));
+  KJ_EXPECT_THROW_MESSAGE("Container operation failed", monitor.wait(wait));
+  KJ_EXPECT_THROW_MESSAGE("Container operation failed", port.wait(wait));
+}
+
+KJ_TEST("Container epoch revocation interrupts pending reservation and queued monitor and port") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  auto reserved = kj::newPromiseAndFulfiller<void>();
+  auto revocation = kj::newPromiseAndFulfiller<void>();
+  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+      [&reserved](
+          bool start, bool, bool, kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+    if (start) co_await kj::mv(reserved.promise);
+    co_return kj::none;
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>()));
+  auto membrane = kj::refcounted<RevokerMembrane>(kj::mv(revocation.promise));
+  auto container = capnp::membrane(grant.castAs<rpc::Container>(), kj::mv(membrane));
+  auto start = container.startRequest().send().dropPipeline();
+  auto monitor = container.monitorRequest().send().dropPipeline();
+  auto port = container.getTcpPortRequest().send().dropPipeline();
+  KJ_EXPECT(!start.poll(wait) && !monitor.poll(wait) && !port.poll(wait));
+  revocation.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "Container attachment revoked."));
+  KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", start.wait(wait));
+  KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", monitor.wait(wait));
+  KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", port.wait(wait));
+}
+
+class ExitedEngine final: public rpc::Container::Server {
+ public:
+  explicit ExitedEngine(int32_t code, bool disconnected): code(code), disconnected(disconnected) {}
+  kj::Promise<void> monitor(MonitorContext context) override {
+    KJ_REQUIRE(!disconnected, "Docker wait transport disconnected.");
+    context.getResults().setExitCode(code);
+    return kj::READY_NOW;
+  }
+
+ private:
+  int32_t code;
+  bool disconnected;
+};
+
+KJ_TEST(
+    "Positive native exit codes persist stop intent and cleanup before returning monitor result") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  for (int32_t code: {0, 7, 137}) {
+    rpc::Container::Client native(kj::heap<ExitedEngine>(code, false));
+    uint stage = 0;
+    capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+        [&native, &stage](bool start, bool stop, bool completed,
+            kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+      KJ_EXPECT(!start);
+      KJ_EXPECT(stop == (stage != 0));
+      KJ_EXPECT(completed == (stage == 2));
+      ++stage;
+      return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+    },
+        kj::refcounted<HostContainerRpc::MutationQueue>()));
+    auto result = grant.castAs<rpc::Container>().monitorRequest().send().wait(wait);
+    KJ_EXPECT(result.getExitCode() == code && stage == 3);
+  }
+}
+
+KJ_TEST("Unknown native monitor transport failure never requests stop or releases its lease") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  rpc::Container::Client native(kj::heap<ExitedEngine>(0, true));
+  uint lookups = 0;
+  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+      [&native, &lookups](bool start, bool stop, bool completed,
+          kj::String) -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+    KJ_EXPECT(!start && !stop && !completed);
+    ++lookups;
+    return kj::Maybe<rpc::Container::Client>(rpc::Container::Client(native));
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>()));
+  KJ_EXPECT_THROW_MESSAGE("Container operation failed",
+      grant.castAs<rpc::Container>().monitorRequest().send().wait(wait));
+  KJ_EXPECT(lookups == 1);
+}
+
 class PendingCapability final: public capnp::Capability::Server {
  public:
   explicit PendingCapability(bool& active): active(active) {}
