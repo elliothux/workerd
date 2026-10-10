@@ -49,6 +49,17 @@ jobs:
           --strip=always
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
+      - name: Qualify native Container callbacks and attachment
+        run: >-
+          bazel test
+          //src/workerd/server:host-container-test@
+          //src/workerd/server:container-client-test@
+          //src/workerd/api:container-test@
+          //src/workerd/api/tests:worker-loader-host-container-test@
+          --strip=always
+          --config=${{ matrix.config }}
+          --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
+          --test_output=errors
       - name: Record inputs
         run: |
           bazel --version > build-inputs.txt
@@ -57,6 +68,13 @@ jobs:
           xcrun --show-sdk-version >> build-inputs.txt 2>&1 || true
           bazel-bin/src/workerd/server/workerd --version >> build-inputs.txt
           shasum -a 256 bazel-bin/src/workerd/server/workerd >> build-inputs.txt
+      - name: Verify private Container protocol
+        run: |
+          bazel-bin/src/workerd/server/workerd container-protocol-version > container-protocol.stdout 2> container-protocol.stderr
+          test ! -s container-protocol.stderr
+          printf 'open-compute-container-protocol-v1\n' > container-protocol.expected
+          cmp container-protocol.expected container-protocol.stdout
+          cat container-protocol.stdout >> build-inputs.txt
       - name: Record compatibility catalog
         run: |
           bazel-bin/src/workerd/server/workerd compatibility-catalog > compatibility-catalog.json 2> compatibility-catalog.stderr
