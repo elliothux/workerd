@@ -1052,6 +1052,12 @@ kj::Promise<void> ensureSystemImageAvailable(
 
 }  // namespace
 
+void configureHostContainerSecurity(
+    docker_api::Docker::ContainerCreateRequest::HostConfig::Builder hostConfig) {
+  hostConfig.initRestartPolicy().setName("no");
+  hostConfig.initCapDrop(1).set(0, "NET_RAW");
+}
+
 void configureContainerPrivileges(
     docker_api::Docker::ContainerCreateRequest::HostConfig::Builder hostConfig,
     const ContainerPrivileges& privileges) {
@@ -1777,9 +1783,9 @@ kj::Promise<void> ContainerClient::readCACert() {
   auto ingressPort = KJ_REQUIRE_NONNULL(
       sidecarIngressHostPort, "Cannot read CA cert: sidecar ingress port not known");
 
-  auto response = co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressPort),
-      kj::HttpMethod::GET, kj::str("/ca"), kj::none,
-      controlToken.map([](auto& token) { return kj::str(token); }));
+  auto response =
+      co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressPort), kj::HttpMethod::GET,
+          kj::str("/ca"), kj::none, controlToken.map([](auto& token) { return kj::str(token); }));
 
   JSG_REQUIRE(response.statusCode == 200, Error,
       "Failed to read CA cert from sidecar: ", response.statusCode, " ", response.body);
@@ -1975,7 +1981,11 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
   auto hostConfig = jsonRoot.initHostConfig();
   // We need to set a restart policy to avoid having ambiguous states
   // where the container we're managing is stuck at "exited" state.
-  hostConfig.initRestartPolicy().setName(outbound == kj::none ? "on-failure" : "no");
+  if (outbound != kj::none) {
+    configureHostContainerSecurity(hostConfig);
+  } else {
+    hostConfig.initRestartPolicy().setName("on-failure");
+  }
 
   hostConfig.setNetworkMode(kj::str("container:", sidecarContainerName));
 
@@ -3150,7 +3160,8 @@ kj::Promise<void> ContainerClient::ensureSidecarStarted() {
 
 kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::connectReverseCallback() {
   auto port = JSG_REQUIRE_NONNULL(sidecarIngressHostPort, Error, "Container sidecar unavailable.");
-  auto token = kj::str(JSG_REQUIRE_NONNULL(controlToken, Error, "Container credentials unavailable."));
+  auto token =
+      kj::str(JSG_REQUIRE_NONNULL(controlToken, Error, "Container credentials unavailable."));
   auto address = co_await network.parseAddress(kj::str("127.0.0.1:", port));
   auto connection = co_await address->connect();
   auto client = kj::newHttpClient(headerTable, *connection).attach(kj::mv(connection));
@@ -3165,14 +3176,14 @@ kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::connectReverseCallback(
 kj::Promise<void> ContainerClient::serveReverseCallbacks(kj::Own<kj::AsyncIoStream> connection) {
   for (;;) {
     if (connection.get() != nullptr) {
-      waitUntilTasks.add(egressState->callbacks.wrap(
-          KJ_ASSERT_NONNULL(egressHttpServer)->listenHttp(kj::mv(connection)))
-                            .catch_([](kj::Exception&&) {})
-                            .attach(addRef()));
+      waitUntilTasks.add(egressState->callbacks
+              .wrap(KJ_ASSERT_NONNULL(egressHttpServer)->listenHttp(kj::mv(connection)))
+              .catch_([](kj::Exception&&) {
+      }).attach(addRef()));
     }
     try {
-      auto sidecar = JSG_REQUIRE_NONNULL(co_await inspectSidecar(), Error,
-          "Container networking sidecar unavailable.");
+      auto sidecar = JSG_REQUIRE_NONNULL(
+          co_await inspectSidecar(), Error, "Container networking sidecar unavailable.");
       sidecarIngressHostPort = sidecar.ingressHostPort;
       // Admission is bounded by the sidecar's idle pool; active streams retain existing I/O budgets.
       connection = co_await connectReverseCallback();

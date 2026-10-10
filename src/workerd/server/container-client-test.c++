@@ -18,6 +18,23 @@
 namespace workerd::server {
 namespace {
 
+KJ_TEST("Managed application cannot capture sidecar credentials or silently restart its process") {
+  capnp::MallocMessageBuilder message;
+  auto create = message.initRoot<docker_api::Docker::ContainerCreateRequest>();
+  configureHostContainerSecurity(create.initHostConfig());
+  capnp::JsonCodec codec;
+  codec.handleByAnnotation<docker_api::Docker::ContainerCreateRequest>();
+  codec.setHasMode(capnp::HasMode::NON_DEFAULT);
+  auto decoded =
+      decodeJsonResponse<docker_api::Docker::ContainerCreateRequest>(codec.encode(create));
+  auto host = decoded->getRoot<docker_api::Docker::ContainerCreateRequest>().getHostConfig();
+  KJ_EXPECT(host.getRestartPolicy().getName() == "no");
+  KJ_EXPECT(host.getCapDrop().size() == 1);
+  KJ_EXPECT(host.getCapDrop()[0] == "NET_RAW");
+  KJ_EXPECT(host.getCapAdd().size() == 0);
+  KJ_EXPECT(!host.getPrivileged());
+}
+
 // Regression test for VULN-127728: ContainerInspectResponse decode must not
 // use-after-free.  With the old buggy code every field access after decode
 // dereferences freed heap memory (detectable by ASAN).

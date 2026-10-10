@@ -71,6 +71,11 @@ void configureContainerPrivileges(
     docker_api::Docker::ContainerCreateRequest::HostConfig::Builder hostConfig,
     const ContainerPrivileges& privileges);
 
+// The managed application shares the sidecar network namespace. Its process identity and control
+// credentials require explicit restart and packet-capture restrictions.
+void configureHostContainerSecurity(
+    docker_api::Docker::ContainerCreateRequest::HostConfig::Builder hostConfig);
+
 // Docker-based implementation that implements the rpc::Container::Server interface
 // so it can be used as a rpc::Container::Client via kj::refcounted<ContainerClient>().
 // This allows the Container JSG class to use Docker directly without knowing
