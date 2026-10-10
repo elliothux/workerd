@@ -4516,6 +4516,19 @@ void Worker::Actor::setIoContext(kj::Own<IoContext> context) {
           .eagerlyEvaluate([](kj::Exception&& e) { LOG_EXCEPTION("actorMetricsFlushLoop", e); });
 }
 
+kj::Promise<void> Worker::Actor::hostContainerStarted() {
+  auto& context = KJ_REQUIRE_NONNULL(getIoContext());
+  auto inputLock = co_await impl->inputGate.wait(context.getCurrentTraceSpan());
+  JSG_REQUIRE(impl->ctxObject != kj::none, Error, "Native Container state is unavailable.");
+  co_await context.run([this](Worker::Lock& lock, IoContext&) {
+    jsg::Lock& js = lock;
+    auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<api::DurableObjectState>>());
+    auto state = KJ_REQUIRE_NONNULL(handler.tryUnwrap(js, getCtx(js)));
+    auto container = KJ_REQUIRE_NONNULL(state->getContainer());
+    container->hostStarted();
+  }, kj::mv(inputLock));
+}
+
 jsg::JsObject Worker::Actor::getCtx(jsg::Lock& js) {
   return KJ_REQUIRE_NONNULL(impl->ctxObject).getHandle(js);
 }

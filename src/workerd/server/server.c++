@@ -804,17 +804,76 @@ class Server::ActorNamespace final {
       }
     }
 
+    class HostContainerStartedEvent final: public WorkerInterface::CustomEvent {
+     public:
+      kj::Promise<Result> run(kj::Own<IoContext_IncomingRequest> incoming,
+          kj::Maybe<kj::StringPtr>,
+          kj::Maybe<Worker_VersionInfo>,
+          Frankenvalue,
+          kj::TaskSet& tasks,
+          bool) override {
+        incoming->delivered();
+        KJ_DEFER(incoming->drain(tasks, kj::mv(incoming)));
+        auto& context = incoming->getContext();
+        auto& actor = JSG_REQUIRE_NONNULL(
+            context.getActor(), Error, "Native Container attachment is unavailable.");
+        actor.ensureConstructed(context);
+        co_await actor.hostContainerStarted();
+        co_return Result{.outcome = EventOutcome::OK};
+      }
+      kj::Promise<Result> sendRpc(capnp::HttpOverCapnpFactory&,
+          capnp::ByteStreamFactory&,
+          FrankenvalueHandler&,
+          rpc::EventDispatcher::Client) override {
+        JSG_FAIL_REQUIRE(Error, "Native Container attachment is local only.");
+      }
+      kj::Promise<Result> notSupported() override {
+        JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
+      }
+      uint16_t getType() override {
+        return 0;
+      }
+      tracing::EventInfo getEventInfo() const override {
+        return tracing::CustomEventInfo();
+      }
+    };
+
+    kj::Promise<void> hostContainerStarted() override {
+      auto& tenant = JSG_REQUIRE_NONNULL(
+          facets.findEntry("tenant"_kj), Error, "The host has no declared tenant facet.");
+      auto request = co_await tenant.value->startRequest({}).attach(tenant.value->addRef());
+      co_await request->customEvent(kj::heap<HostContainerStartedEvent>());
+    }
+
+    void retireHostContainerOwner() {
+      revokeHostContainerCallbacks();
+      hostContainerClient = kj::none;
+      hostContainerLease = kj::none;
+      if (hasHostContainerAttachment) {
+        // Its loaded class contains an owner-scoped grant. Retire that class with the Root so
+        // the next owner attaches a fresh grant, while retaining the facet's durable storage.
+        abortFacet("tenant", KJ_EXCEPTION(DISCONNECTED, "Container owner became inactive."));
+        hasHostContainerAttachment = false;
+      }
+    }
+
     rpc::Container::Client attachHostContainer(HostContainerOwner& owner,
         ResolveHostContainerLease resolve,
         kj::Own<IoChannelFactory::SubrequestChannel> outbound) override {
       JSG_REQUIRE(parent != kj::none && &KJ_ASSERT_NONNULL(parent) == &owner && &root == &owner &&
               key == "tenant",
           Error, "Container attachments require the host's declared tenant facet.");
+      root.hasHostContainerAttachment = true;
       auto weak = root.weakSelf->addRef();
       auto getClient =
           [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound)](bool start,
               bool stop, bool completed, kj::String startup, kj::String expectedLeaseKey,
               bool monitor) mutable -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+        // A tenant RPC belongs to the stable Root. Keep that owner's existing request tracker
+        // active across admission and the actual native operation, including a pending monitor.
+        auto activity = kj::heap<RequestTracker::ActiveRequest>(
+            JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.")
+                .tracker->startRequest());
         auto lease = co_await resolve(
             start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor);
         auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
@@ -835,7 +894,7 @@ class Server::ActorNamespace final {
                     kj::str(identity.controlToken), kj::str(identity.callbackToken));
             co_return HostContainerRpc::Resolved{
               rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
-              kj::str(identity.leaseKey)};
+              kj::str(identity.leaseKey), kj::mv(activity)};
           }
         }
         owner.hostContainerClient = owner.ns.getContainerClient(identity.leaseKey,
@@ -845,7 +904,7 @@ class Server::ActorNamespace final {
         owner.hostContainerLease = kj::mv(identity);
         co_return HostContainerRpc::Resolved{
           rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
-          kj::str(KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey)};
+          kj::str(KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey), kj::mv(activity)};
       };
       capnp::Capability::Client grant(
           kj::heap<HostContainerRpc>(kj::mv(getClient), kj::addRef(*root.hostContainerMutations)));
@@ -958,6 +1017,7 @@ class Server::ActorNamespace final {
     kj::Maybe<kj::Own<ContainerClient>> containerClient;
 
     // The root owns execution across replacement tenant facets; grants only borrow it.
+    bool hasHostContainerAttachment = false;
     kj::Maybe<HostContainerLease> hostContainerLease;
     kj::Maybe<kj::Own<ContainerClient>> hostContainerClient;
     kj::Own<HostContainerRpc::MutationQueue> hostContainerMutations =
@@ -1207,11 +1267,7 @@ class Server::ActorNamespace final {
       // If setInactivityTimeout() was called, the timer still holds a reference
       // so the container stays alive until the timeout expires
       containerClient = kj::none;
-      if (parent == kj::none) {
-        revokeHostContainerCallbacks();
-        hostContainerClient = kj::none;
-        hostContainerLease = kj::none;
-      }
+      if (parent == kj::none) retireHostContainerOwner();
     }
 
     // Test-only eviction body, used by the evict hooks (evictWhenIdle). Destroys the Worker::Actor
@@ -1283,11 +1339,7 @@ class Server::ActorNamespace final {
       // Drop our reference to the ContainerClient. If setInactivityTimeout() was called, the timer
       // still holds a reference so the container stays alive until the timeout expires.
       containerClient = kj::none;
-      if (parent == kj::none) {
-        revokeHostContainerCallbacks();
-        hostContainerClient = kj::none;
-        hostContainerLease = kj::none;
-      }
+      if (parent == kj::none) retireHostContainerOwner();
       co_return true;
     }
 

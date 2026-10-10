@@ -89,7 +89,7 @@ KJ_TEST("Host Container mutation callbacks bracket the original native engine op
         KJ_FAIL_ASSERT("Unexpected Container callback");
     }
     return kj::Maybe<HostContainerRpc::Resolved>(
-        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = capability.castAs<rpc::Container>();
@@ -156,7 +156,7 @@ KJ_TEST(
     ++lookups;
     if (start) co_await kj::mv(reserved.promise);
     co_return kj::Maybe<HostContainerRpc::Resolved>(
-        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = grant.castAs<rpc::Container>();
@@ -224,6 +224,56 @@ KJ_TEST("Container epoch revocation interrupts pending reservation and queued mo
   KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", port.wait(wait));
 }
 
+class OwnerActivity final: public RequestTracker::Hooks {
+ public:
+  uint entered = 0;
+  uint left = 0;
+  void active() override {
+    ++entered;
+  }
+  void inactive() override {
+    ++left;
+  }
+};
+
+KJ_TEST("Host Container owner activity follows monitor completion failure and revocation") {
+  for (uint outcome = 0; outcome < 3; ++outcome) {
+    kj::EventLoop loop;
+    kj::WaitScope wait(loop);
+    OwnerActivity hooks;
+    auto tracker = kj::refcounted<RequestTracker>(hooks);
+    auto engine = kj::heap<StartingEngine>();
+    auto& native = *engine;
+    native.started = true;
+    rpc::Container::Client client(kj::mv(engine));
+    capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+        [&tracker, &client](bool, bool, bool, kj::String, kj::String,
+            bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+      return kj::Maybe<HostContainerRpc::Resolved>(
+          HostContainerRpc::Resolved{rpc::Container::Client(client), kj::str("lease"),
+            kj::heap<RequestTracker::ActiveRequest>(tracker->startRequest())});
+    },
+        kj::refcounted<HostContainerRpc::MutationQueue>()));
+    auto revocation = kj::newPromiseAndFulfiller<void>();
+    auto fenced =
+        capnp::membrane(kj::mv(grant), kj::refcounted<RevokerMembrane>(kj::mv(revocation.promise)));
+    auto monitor = fenced.castAs<rpc::Container>().monitorRequest().send().dropPipeline();
+    KJ_EXPECT(!monitor.poll(wait) && native.monitoring && tracker->isActive());
+    if (outcome == 0) {
+      native.exit.fulfiller->fulfill(0);
+      KJ_EXPECT(monitor.wait(wait).getExitCode() == 0);
+    } else if (outcome == 1) {
+      native.exit.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "Unknown process state."));
+      KJ_EXPECT_THROW_MESSAGE("Container operation failed", monitor.wait(wait));
+    } else {
+      revocation.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "Container attachment revoked."));
+      KJ_EXPECT_THROW_MESSAGE("Container attachment revoked", monitor.wait(wait));
+    }
+    kj::evalLater([] {}).wait(wait);
+    KJ_EXPECT(!tracker->isActive() && hooks.entered == hooks.left);
+  }
+}
+
 KJ_TEST("Delayed monitor cleanup retains its original lease key after replacement startup") {
   kj::EventLoop loop;
   kj::WaitScope wait(loop);
@@ -243,7 +293,8 @@ KJ_TEST("Delayed monitor cleanup retains its original lease key after replacemen
     KJ_REQUIRE(expected.size() == 0 || expected == current, "Lease generation changed.");
     if (stop) ++stops;
     return kj::Maybe<HostContainerRpc::Resolved>(HostContainerRpc::Resolved{
-      rpc::Container::Client(current == "old" ? oldClient : replacementClient), kj::str(current)});
+      rpc::Container::Client(current == "old" ? oldClient : replacementClient), kj::str(current),
+      {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = grant.castAs<rpc::Container>();
@@ -290,7 +341,7 @@ KJ_TEST(
       KJ_EXPECT(completed == (stage == 2));
       ++stage;
       return kj::Maybe<HostContainerRpc::Resolved>(
-          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
+          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
     },
         kj::refcounted<HostContainerRpc::MutationQueue>()));
     auto result = grant.castAs<rpc::Container>().monitorRequest().send().wait(wait);
@@ -309,7 +360,7 @@ KJ_TEST("Unknown native monitor transport failure never requests stop or release
     KJ_EXPECT(!start && !stop && !completed);
     ++lookups;
     return kj::Maybe<HostContainerRpc::Resolved>(
-        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   KJ_EXPECT_THROW_MESSAGE("Container operation failed",
@@ -333,7 +384,7 @@ KJ_TEST("Monitor lookup after a proved start can wait an exited lease without Ru
       KJ_EXPECT(expected == (stage == 0 ? "" : "lease"));
       ++stage;
       return kj::Maybe<HostContainerRpc::Resolved>(
-          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease")});
+          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
     },
         kj::refcounted<HostContainerRpc::MutationQueue>()));
     auto container = grant.castAs<rpc::Container>();
@@ -355,7 +406,7 @@ KJ_TEST("Monitor lookup cannot bind a replacement after its original start was p
     if (stop) ++stops;
     if (monitor) KJ_EXPECT(expected == "lease");
     return kj::Maybe<HostContainerRpc::Resolved>(HostContainerRpc::Resolved{
-      rpc::Container::Client(native), kj::str(monitor ? "replacement" : "lease")});
+      rpc::Container::Client(native), kj::str(monitor ? "replacement" : "lease"), {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>()));
   auto container = grant.castAs<rpc::Container>();

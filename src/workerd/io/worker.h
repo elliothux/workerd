@@ -1101,6 +1101,9 @@ class Worker::Actor final: public kj::Refcounted {
   //   some more information to the place where `Actor` is created, which might be uglier than it's
   //   worth.
 
+  // Refresh the native Container monitor after a trusted host startup has been proved.
+  kj::Promise<void> hostContainerStarted();
+
   // Get the `ctx` object for this actor.
   jsg::JsObject getCtx(jsg::Lock& js);
 

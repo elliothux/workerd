@@ -315,6 +315,12 @@ Container::Monitor::Monitor(kj::ForkedPromise<int32_t> promise, uint64_t generat
       stopped(observe(this->promise, running).fork()),
       background(stopped.addBranch().eagerlyEvaluate(nullptr)) {}
 
+void Container::hostStarted() {
+  if (!getRunning()) resetMonitor();
+  // The host initiated this lifecycle without a tenant request to register its monitor.
+  IoContext::current().addWaitUntil(KJ_ASSERT_NONNULL(currentMonitor)->stopped.addBranch());
+}
+
 bool Container::getRunning() {
   KJ_IF_SOME(monitor, currentMonitor) {
     return monitor->running;
@@ -466,7 +472,10 @@ void Container::start(jsg::Lock& js, jsg::Optional<StartupOptions> maybeOptions)
 
   IoContext::current().addTask(req.sendIgnoringResult());
 
-  // We reset the monitor state as we are re-creating the container here.
+  resetMonitor();
+}
+
+void Container::resetMonitor() {
   destroyReason = kj::none;
   currentMonitor = kj::none;
   startMonitor();

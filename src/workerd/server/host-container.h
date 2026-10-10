@@ -2,6 +2,7 @@
 
 #include <workerd/io/container.capnp.h>
 #include <workerd/io/io-channels.h>
+#include <workerd/io/request-tracker.h>
 
 #include <capnp/compat/json.h>
 
@@ -28,6 +29,7 @@ class HostContainerRpc final: public capnp::Capability::Server {
   struct Resolved {
     rpc::Container::Client client;
     kj::String leaseKey;
+    kj::Own<RequestTracker::ActiveRequest> ownerActivity;
   };
   using Resolve = kj::Function<kj::Promise<kj::Maybe<Resolved>>(
       bool, bool, bool, kj::String, kj::String, bool)>;

@@ -60,6 +60,14 @@ jobs:
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
           --test_output=errors
+      - name: Qualify Root ownership across native Container idle
+        run: >-
+          bazel test //src/workerd/server:server-test@
+          --strip=always
+          --config=${{ matrix.config }}
+          --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
+          --test_arg=-f --test_arg=server-test.c++:2618
+          --test_output=all
       - name: Record inputs
         run: |
           bazel --version > build-inputs.txt

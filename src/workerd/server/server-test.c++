@@ -2615,6 +2615,165 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
     Internal Server Error)"_blockquote);
 }
 
+KJ_TEST("Server: Host Container monitor retains its owner across the idle window") {
+  TestServer test(R"((
+    extensions = [(modules = [
+      (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+       esModule = "export default () => namespace => namespace;")
+    ])],
+    services = [
+      (name = "host", worker = (
+        compatibilityDate = "2026-09-08",
+        compatibilityFlags = ["experimental"],
+        modules = [(name = "host.js", esModule =
+          `import { DurableObject } from 'cloudflare:workers';
+          `let births = 0; const grants = [];
+          `const source = "import { DurableObject } from 'cloudflare:workers'; export class Tenant extends DurableObject { constructor(ctx, env) { super(ctx, env); this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); } async fetch(request) { if (new URL(request.url).pathname === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `export class Host extends DurableObject {
+          `  constructor(ctx, env) {
+          `    super(ctx, env);
+          `    this.birth = ++births;
+          `    this.bind(ctx, env);
+          `  }
+          `  bind(ctx, env) {
+          `    this.grant = env.factory.getContainer(ctx.facets, 'Tenant', async (_start, stop, completed) => stop && completed ? undefined : ({
+          `      leaseKey: (this.birth === 1 ? 'a' : '9').repeat(64), imageRef: 'sha256:' + 'b'.repeat(64),
+          `      providerContractSha256: 'e'.repeat(64), controlToken: 'c'.repeat(64),
+          `      callbackToken: 'd'.repeat(64), nativeStartupJson: '{}'
+          `    }));
+          `    grants.push(this.grant);
+          `    const loaded = env.loader.load({compatibilityDate:'2026-09-08',
+          `      compatibilityFlags:[], mainModule:'tenant.js',
+          `      modules:{'tenant.js':source}, env:{}, openComputePrivateEnv:{},
+          `      openComputeHostPolicy:true, openComputeContainer:this.grant,
+          `      globalOutbound:env.outbound});
+          `    this.child = ctx.facets.get('tenant', () => ({
+          `      class:loaded.getDurableObjectClass('Tenant'), id:'tenant'}));
+          `  }
+          `  async fetch(request) {
+          `    if (new URL(request.url).pathname === '/replace') {
+          `      this.grant.revoke(); this.ctx.facets.abort('tenant', new Error('Code switched'));
+          `      this.bind(this.ctx, this.env);
+          `    }
+          `    if (new URL(request.url).pathname === '/start') {
+          `      let rejected = false; try { await grants[0].start(); } catch { rejected = true; }
+          `      if (!rejected) throw new Error('Retired owner grant was accepted');
+          `      await this.grant.start();
+          `    }
+          `    const response = await this.child.fetch(request);
+          `    return new Response(this.birth + ':' + await response.text());
+          `  }
+          `}
+          `export default {fetch(request, env) {
+          `  return env.objects.get(env.objects.idFromName('owner')).fetch(request);
+          `}};
+        )],
+        bindings = [
+          (name = "objects", durableObjectNamespace = "Host"),
+          (name = "factory", workerLoader = (factory = true)),
+          (name = "loader", workerLoader = ()),
+          (name = "outbound", service = "network")
+        ],
+        durableObjectNamespaces = [(className = "Host", uniqueKey = "owner", enableSql = true)],
+        durableObjectStorage = (localDisk = "storage"),
+        containerEngine = (localDocker = (socketPath = "docker-addr",
+          containerEgressInterceptorImage = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")),
+        globalOutbound = "network"
+      )),
+      (name = "storage", disk = (path = "storage", writable = true)),
+      (name = "network", network = (allow = ["network", "local"], deny = ["unix", "unix-abstract"])),
+      (name = "docker", worker = (
+        compatibilityDate = "2026-09-08",
+        modules = [(name = "docker.js", esModule =
+          `const states = new Map([['a'.repeat(64),true],['a'.repeat(64)+'-proxy',true]]);
+          `export default {async fetch(request) {
+          `  await request.arrayBuffer();
+          `  const path = new URL(request.url).pathname; const name = path.split('/')[2];
+          `  if (path === '/containers/create') return Response.json({Id:new URL(request.url).searchParams.get('name')},{status:201});
+          `  if (path.endsWith('/start')) { states.set(name,true); return new Response(null,{status:204}); }
+          `  if (path === '/volumes') return Response.json({Volumes:[]});
+          `  if (path === '/networks/bridge') return Response.json({IPAM:{Config:[{Gateway:'127.0.0.1',Subnet:'127.0.0.0/8'}]}});
+          `  if (path.endsWith('/wait')) { while (states.get(name)) await scheduler.wait(1000); return Response.json({StatusCode:0}); }
+          `  if (request.method === 'DELETE') { states.set(name,false); return new Response(null,{status:204}); }
+          `  if (path.endsWith('/json')) return Response.json({
+          `    State:{Status:states.get(name) ? 'running' : 'exited'}, NetworkSettings:{Ports:{'39001/tcp':[{HostIp:'127.0.0.1',HostPort:'39002'}]}}
+          `  });
+          `  throw new Error('Unexpected unit Engine request');
+          `}};
+        )]
+      )),
+      (name = "sidecar", worker = (
+        compatibilityDate = "2026-09-08",
+        modules = [(name = "sidecar.js", esModule =
+          `let idle = 0;
+          `export default {async connect(socket) {
+          `  const reader = socket.readable.getReader();
+          `  const writer = socket.writable.getWriter();
+          `  let request = '';
+          `  while (!request.includes('\r\n\r\n')) {
+          `    const part = await reader.read();
+          `    if (part.done) return;
+          `    request += new TextDecoder().decode(part.value);
+          `  }
+          `  const headerEnd = request.indexOf('\r\n\r\n') + 4;
+          `  const length = Number(request.slice(0, headerEnd).match(/content-length: (\d+)/i)?.[1] ?? 0);
+          `  while (request.length < headerEnd + length) {
+          `    const part = await reader.read();
+          `    if (part.done) return;
+          `    request += new TextDecoder().decode(part.value);
+          `  }
+
+          `  if (request.startsWith('CONNECT ')) {
+          `    ++idle;
+          `    try {
+          `    if (idle > 16) await scheduler.wait(3600000);
+          `    await writer.write(new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'));
+          `    await reader.read();
+          `    } finally { --idle; }
+          `  } else {
+          `    const body = request.startsWith('GET /ca ') ? 'unit protocol certificate' : '';
+          `    await writer.write(new TextEncoder().encode('HTTP/1.1 200 OK\r\nContent-Length: ' + body.length + '\r\n\r\n' + body));
+          `    await writer.close();
+          `  }
+          `}};
+        )]
+      ))
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "host"),
+      (name = "docker", address = "docker-addr", service = "docker"),
+      (name = "sidecar", address = "127.0.0.1:39002", service = "sidecar", tcp = ())
+    ]
+  ))"_kj);
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "1:true:1");
+  test.wait(12);
+  auto next = test.connect("test-addr");
+  next.httpGet200("/", "1:true:2");
+  next.httpGet200("/replace", "1:true:3");
+  test.wait(12);
+  auto replaced = test.connect("test-addr");
+  replaced.httpGet200("/", "1:true:4");
+  replaced.send("GET /stop HTTP/1.1\r\nHost: test\r\n\r\n");
+  test.wait(1);
+  replaced.recv(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 9
+    Content-Type: text/plain;charset=UTF-8
+
+    1:false:5)"_blockquote);
+  test.wait(12);
+  auto stopped = test.connect("test-addr");
+  stopped.httpGet200("/", "2:false:6");
+  stopped.httpGet200("/start", "2:true:7");
+  test.wait(12);
+  auto resumed = test.connect("test-addr");
+  resumed.httpGet200("/", "2:true:8");
+}
+
 KJ_TEST("Server: named images and directory snapshots are not startup sources") {
   TestServer test(R"((
     services = [

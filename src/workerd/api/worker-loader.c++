@@ -171,7 +171,10 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
         "The Container attachment grant has been revoked.");
     co_await owner.ensureHostContainerAttached();
     auto& capability = JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.");
-    if ((co_await capability.statusRequest().send()).getRunning()) co_return;
+    if ((co_await capability.statusRequest().send()).getRunning()) {
+      co_await owner.hostContainerStarted();
+      co_return;
+    }
     auto lease = co_await resolve(true, false, false, kj::str(""), kj::str(""), false);
     auto& execution = JSG_REQUIRE_NONNULL(lease, Error, "Container execution is unavailable.");
     JSG_REQUIRE(!revoked, Error, "The Container attachment grant has been revoked.");
@@ -180,6 +183,7 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
     capnp::JsonCodec codec;
     codec.decode(execution.nativeStartupJson, request);
     co_await request.send();
+    co_await owner.hostContainerStarted();
   }
   kj::StringPtr getClassName() const override {
     return className;

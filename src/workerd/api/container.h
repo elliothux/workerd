@@ -331,6 +331,8 @@ class Container: public jsg::Object {
   };
 
   bool getRunning();
+  // Internal host notification; this method is not part of the tenant JSG API.
+  void hostStarted();
   jsg::Dict<kj::String> getImages() const;
 
   // Methods correspond closely to the RPC interface in `container.capnp`.
@@ -436,6 +438,7 @@ class Container: public jsg::Object {
   kj::Maybe<IoOwn<kj::HashMap<int, kj::Rc<TcpPortState>>>> tcpPortStates;
 
   void invalidateTcpPortStates();
+  void resetMonitor();
   void startMonitor();
   bool isCurrentMonitor(uint64_t generation);
 

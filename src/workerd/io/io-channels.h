@@ -716,6 +716,10 @@ class HostContainerOwner {
     JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
   }
 
+  virtual kj::Promise<void> hostContainerStarted() {
+    JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
+  }
+
   virtual rpc::Container::Client attachHostContainer(HostContainerOwner& owner,
       ResolveHostContainerLease resolve,
       kj::Own<IoChannelFactory::SubrequestChannel> outbound) {
