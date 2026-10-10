@@ -1,5 +1,7 @@
 #include "worker-loader.h"
 
+#include <capnp/compat/json.h>
+
 #include <workerd/api/actor-state.h>
 #include <workerd/api/actor.h>
 #include <workerd/api/http.h>
@@ -7,6 +9,8 @@
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/features.h>
 #include <workerd/io/io-context.h>
+#include <workerd/util/completion-membrane.h>
+#include <workerd/util/weak-refs.h>
 
 #include <capnp/message.h>
 #include <kj/vector.h>
@@ -128,13 +132,132 @@ class HostFacetChannelImpl final: public IoChannelFactory::HostFacetChannel {
   bool revoked = false;
 };
 
+class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChannel {
+ public:
+  HostContainerChannelImpl(
+      Worker::Actor::FacetManager& owner, kj::String className, ResolveHostContainerLease resolve)
+      : origin(IoContext::current().getWeakRef()),
+        owner(owner),
+        className(kj::mv(className)),
+        resolve(kj::mv(resolve)),
+        revocation(kj::newPromiseAndFulfiller<void>()),
+        membrane(kj::refcounted<RevokerMembrane>(
+            kj::mv(revocation.promise).exclusiveJoin(IoContext::current().onAbort()))) {}
+
+  ~HostContainerChannelImpl() noexcept(false) {
+    weakSelf->invalidate();
+  }
+
+  rpc::Container::Client attach(
+      HostContainerOwner& child, kj::Own<IoChannelFactory::SubrequestChannel> outbound) override {
+    JSG_REQUIRE(!revoked && origin->tryGet() != kj::none, Error,
+        "The Container attachment grant has been revoked.");
+    auto client = child.attachHostContainer(owner,
+        [weak = weakSelf->addRef()](
+            bool start, bool stop, bool completed, kj::String startup) mutable {
+      auto& self = JSG_REQUIRE_NONNULL(weak->tryGet(), Error,
+          "The Container attachment grant has ended.");
+      JSG_REQUIRE(!self.revoked && self.origin->tryGet() != kj::none, Error,
+          "The Container attachment grant has been revoked.");
+      return self.resolve(start, stop, completed, kj::mv(startup)).attach(kj::addRef(self));
+    },
+        kj::mv(outbound));
+    attached = capnp::membrane(kj::mv(client), kj::addRef(*membrane));
+    return KJ_ASSERT_NONNULL(attached);
+  }
+  kj::Promise<void> start() override {
+    JSG_REQUIRE(!revoked && origin->tryGet() != kj::none, Error,
+        "The Container attachment grant has been revoked.");
+    co_await owner.ensureHostContainerAttached();
+    auto& capability = JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.");
+    if ((co_await capability.statusRequest().send()).getRunning()) co_return;
+    auto lease = co_await resolve(true, false, false, kj::str(""));
+    auto& execution = JSG_REQUIRE_NONNULL(lease, Error, "Container execution is unavailable.");
+    JSG_REQUIRE(!revoked, Error, "The Container attachment grant has been revoked.");
+    auto request = JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.")
+                       .startRequest();
+    capnp::JsonCodec codec;
+    codec.decode(execution.nativeStartupJson, request);
+    co_await request.send();
+  }
+  kj::StringPtr getClassName() const override {
+    return className;
+  }
+  void revoke() override {
+    if (!revoked) {
+      revoked = true;
+      attached = kj::none;
+      if (origin->tryGet() != kj::none) owner.revokeHostContainerCallbacks();
+      revocation.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "Container attachment revoked."));
+    }
+  }
+
+ private:
+  kj::Own<WeakRef<HostContainerChannelImpl>> weakSelf =
+      kj::refcounted<WeakRef<HostContainerChannelImpl>>(kj::Badge<HostContainerChannelImpl>(), *this);
+  kj::Own<IoContext::WeakRef> origin;
+  Worker::Actor::FacetManager& owner;
+  kj::String className;
+  ResolveHostContainerLease resolve;
+  kj::PromiseFulfillerPair<void> revocation;
+  kj::Own<RevokerMembrane> membrane;
+  bool revoked = false;
+  kj::Maybe<rpc::Container::Client> attached;
+};
+
 }  // namespace
+
+jsg::Promise<void> HostContainer::start(jsg::Lock& js) {
+  return IoContext::current().awaitIo(js,
+      channel->start().attach(kj::addRef(*channel)).catch_([](kj::Exception&&) {
+    JSG_FAIL_REQUIRE(Error, "Container operation failed.");
+  }));
+}
 
 jsg::Ref<HostFacets> WorkerLoaderFactory::getFacets(
     jsg::Lock& js, jsg::Ref<DurableObjectFacets> facets) {
   kj::Own<IoChannelFactory::HostFacetChannel> channel =
       kj::refcounted<HostFacetChannelImpl>(facets->getFacetManager());
   return js.alloc<HostFacets>(IoContext::current().addObject(kj::mv(channel)));
+}
+
+jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
+    jsg::Ref<DurableObjectFacets> facets,
+    kj::String className,
+    jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(bool, bool, bool, kj::String)>
+        resolve) {
+  JSG_REQUIRE(
+      className.size() > 0 && className.size() <= 256, TypeError, "Invalid Container class name.");
+  auto& ioctx = IoContext::current();
+  auto callback = ioctx.makeReentryCallbackWeak(
+      [resolve = kj::mv(resolve)](jsg::Lock& js, IoContext& ioctx, bool start, bool stop,
+          bool completed, kj::String startup) mutable {
+    return resolve(js, start, stop, completed, kj::mv(startup))
+        .then(js,
+            ioctx.addFunctor(
+                [](jsg::Lock& js, IoContext& ioctx,
+                    jsg::Optional<HostContainerLease> lease) -> kj::Maybe<HostContainerLease> {
+      KJ_IF_SOME(value, lease) {
+        auto validDigest = [](kj::StringPtr text) {
+          if (text.size() != 64) return false;
+          for (auto c: text)
+            if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+          return true;
+        };
+        JSG_REQUIRE(validDigest(value.leaseKey) && validDigest(value.providerContractSha256) &&
+                validDigest(value.controlToken) && validDigest(value.callbackToken) &&
+                value.controlToken != value.callbackToken && value.imageRef.startsWith("sha256:") &&
+                validDigest(value.imageRef.slice(7)),
+            Error, "Invalid Container execution authority.");
+        return kj::mv(value);
+      }
+      return kj::none;
+    }));
+  });
+  kj::Own<IoChannelFactory::HostContainerChannel> channel =
+      kj::refcounted<HostContainerChannelImpl>(
+          facets->getFacetManager(), kj::mv(className), kj::mv(callback));
+  return js.alloc<HostContainer>(ioctx.addObject(kj::mv(channel)));
 }
 
 void HostFacets::create(jsg::Lock& js,
@@ -686,12 +809,20 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     };
   }
 
+  kj::Maybe<kj::Own<IoChannelFactory::HostContainerChannel>> hostContainer;
+  KJ_IF_SOME(container, code.openComputeContainer) {
+    JSG_REQUIRE(allowOpenComputePrivateEnv && code.openComputeHostPolicy.orDefault(false),
+        TypeError, "Container attachment requires the configured host policy.");
+    hostContainer = container->getChannel();
+  }
+
   return {.source = kj::mv(extractedSource),
     .compatibilityFlags = compatFlags,
     .limits = code.limits,
     .env = kj::mv(env),
     .privateEnv = kj::mv(privateEnv),
     .hostPolicy = code.openComputeHostPolicy.orDefault(false),
+    .hostContainer = kj::mv(hostContainer),
     .pythonSnapshot = kj::mv(code.openComputePythonSnapshot),
     .globalOutbound = kj::mv(globalOutbound),
     .cacheApiOutbound = kj::mv(cacheApiOutbound),

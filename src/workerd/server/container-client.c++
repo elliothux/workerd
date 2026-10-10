@@ -5,6 +5,7 @@
 #include "container-client.h"
 
 #include "ada.h"
+#include "container-auth.h"
 
 #include <workerd/io/container.capnp.h>
 #include <workerd/io/worker-interface.h>
@@ -291,7 +292,14 @@ class SharedExecConnection final: public kj::Refcounted {
   explicit SharedExecConnection(kj::Own<kj::AsyncIoStream> connection)
       : connection(kj::mv(connection)) {}
 
+  void disconnect() {
+    inputWrites.cancel("Container exec connection closed.");
+    stdinClosed = true;
+    connection = nullptr;
+  }
+
   kj::Own<kj::AsyncIoStream> connection;
+  kj::Canceler inputWrites;
   bool stdinOpened = false;
   bool stdinClosed = false;
 };
@@ -302,15 +310,19 @@ class DockerExecStdinStream final: public capnp::ExplicitEndOutputStream {
       : sharedConnection(kj::mv(sharedConnection)) {}
 
   kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override {
-    return sharedConnection->connection->write(buffer);
+    KJ_REQUIRE(sharedConnection->connection.get() != nullptr, "Container exec connection closed.");
+    return sharedConnection->inputWrites.wrap(sharedConnection->connection->write(buffer));
   }
 
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
-    return sharedConnection->connection->write(pieces);
+    KJ_REQUIRE(sharedConnection->connection.get() != nullptr, "Container exec connection closed.");
+    return sharedConnection->inputWrites.wrap(sharedConnection->connection->write(pieces));
   }
 
   kj::Promise<void> whenWriteDisconnected() override {
-    return sharedConnection->connection->whenWriteDisconnected();
+    if (sharedConnection->connection.get() == nullptr) return kj::READY_NOW;
+    return sharedConnection->inputWrites.wrap(
+        sharedConnection->connection->whenWriteDisconnected());
   }
 
   kj::Promise<void> end() override {
@@ -591,12 +603,16 @@ kj::Promise<DockerBinaryResponse> dockerApiRequestRaw(kj::Network& network,
     kj::String endpoint,
     kj::Maybe<kj::ArrayPtr<const kj::byte>> body,
     kj::StringPtr contentType,
-    uint64_t maxResponseSize) {
+    uint64_t maxResponseSize,
+    kj::Maybe<kj::String> controlToken = kj::none) {
   kj::HttpHeaderTable headerTable;
   auto address = co_await network.parseAddress(dockerPath);
   auto connection = co_await address->connect();
   auto httpClient = kj::newHttpClient(headerTable, *connection).attach(kj::mv(connection));
   kj::HttpHeaders headers(headerTable);
+  KJ_IF_SOME(token, controlToken) {
+    headers.add(CONTAINER_CONTROL_HEADER, token);
+  }
   headers.setPtr(kj::HttpHeaderId::HOST, "localhost");
 
   KJ_IF_SOME(requestBody, body) {
@@ -624,13 +640,14 @@ kj::Promise<DockerResponse> dockerApiRequest(kj::Network& network,
     kj::String dockerPath,
     kj::HttpMethod method,
     kj::String endpoint,
-    kj::Maybe<kj::String> body = kj::none) {
+    kj::Maybe<kj::String> body = kj::none,
+    kj::Maybe<kj::String> controlToken = kj::none) {
   kj::Maybe<kj::ArrayPtr<const kj::byte>> bodyBytes;
   KJ_IF_SOME(b, body) {
     bodyBytes = b.asBytes();
   }
   auto raw = co_await dockerApiRequestRaw(network, kj::mv(dockerPath), method, kj::mv(endpoint),
-      bodyBytes, "application/json"_kj, MAX_JSON_RESPONSE_SIZE);
+      bodyBytes, "application/json"_kj, MAX_JSON_RESPONSE_SIZE, kj::mv(controlToken));
   co_return DockerResponse{.statusCode = raw.statusCode, .body = kj::str(raw.body.asChars())};
 }
 
@@ -652,7 +669,7 @@ kj::Promise<void> deleteVolume(kj::Network& network, kj::String dockerPath, kj::
   auto response = co_await dockerApiRequest(
       network, kj::mv(dockerPath), kj::HttpMethod::DELETE, kj::str("/volumes/", volumeName));
   if (response.statusCode != 204 && response.statusCode != 404) {
-    KJ_LOG(WARNING, "failed to delete volume", volumeName, response.statusCode, response.body);
+    KJ_LOG(WARNING, "failed to delete volume", response.statusCode);
   }
 }
 
@@ -661,10 +678,9 @@ kj::Promise<void> deleteVolumes(
   kj::Vector<kj::Promise<void>> volumeDeletes;
   volumeDeletes.reserve(snapshotCloneVolumes.size());
   for (auto& volumeName: snapshotCloneVolumes) {
-    auto logName = kj::str(volumeName);
-    volumeDeletes.add(deleteVolume(network, kj::str(dockerPath), kj::mv(volumeName))
-                          .catch_([logName = kj::mv(logName)](kj::Exception&& e) {
-      KJ_LOG(WARNING, "failed to delete volume", logName, e);
+    volumeDeletes.add(
+        deleteVolume(network, kj::str(dockerPath), kj::mv(volumeName)).catch_([](kj::Exception&&) {
+      KJ_LOG(WARNING, "failed to delete volume");
     }));
   }
   co_await kj::joinPromises(volumeDeletes.releaseAsArray());
@@ -1085,11 +1101,13 @@ struct ContainerClient::EgressMapping {
 // so that the EgressMapping type is not visible in container-client.h.
 struct ContainerClient::EgressState {
   kj::Vector<EgressMapping> mappings;
+  kj::Canceler callbacks;
 };
 
 ContainerClient::ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
     kj::Timer& timer,
     kj::Network& network,
+    kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> outbound,
     kj::String dockerPath,
     kj::String containerName,
     kj::Maybe<kj::String> imageName,
@@ -1102,6 +1120,7 @@ ContainerClient::ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
     : byteStreamFactory(byteStreamFactory),
       timer(timer),
       network(network),
+      outbound(kj::mv(outbound)),
       dockerPath(kj::mv(dockerPath)),
       containerName(kj::encodeUriComponent(kj::str(containerName))),
       sidecarContainerName(kj::encodeUriComponent(kj::str(containerName, "-proxy"))),
@@ -1113,12 +1132,28 @@ ContainerClient::ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
       cleanupCallback(kj::mv(cleanupCallback)),
       channelTokenHandler(channelTokenHandler),
       egressState(kj::heap<EgressState>()) {
-  if (!staleSnapshotVolumeCheckScheduled.exchange(true)) {
+  if (this->outbound == kj::none && !staleSnapshotVolumeCheckScheduled.exchange(true)) {
     waitUntilTasks.add(warnAboutStaleSnapshotVolumes(network, kj::str(this->dockerPath))
-                           .catch_([](kj::Exception&& e) {
+            .catch_([](kj::Exception&& e) {
       KJ_LOG(WARNING, "failed to inspect snapshot volumes for staleness", e);
     }));
   }
+}
+
+void ContainerClient::revokeHostCallbacks() {
+  egressState->callbacks.cancel("Container attachment revoked.");
+  egressState->mappings.clear();
+  reverseCallbackTask = kj::none;
+}
+
+void ContainerClient::setHostCredentials(kj::String control, kj::String callback) {
+  JSG_REQUIRE(
+      outbound != kj::none && control.size() == 64 && callback.size() == 64 && control != callback,
+      Error, "Invalid Container provider credentials.");
+  if (controlToken != kj::none && !containerTokenMatches(KJ_ASSERT_NONNULL(controlToken), control))
+    revokeHostCallbacks();
+  controlToken = kj::mv(control);
+  callbackToken = kj::mv(callback);
 }
 
 ContainerClient::~ContainerClient() noexcept(false) {
@@ -1129,6 +1164,7 @@ void ContainerClient::shutdown() {
   if (shutdownStarted) return;
   shutdownStarted = true;
 
+  revokeHostCallbacks();
   stopEgressListener();
 
   // Remove the application before deleting its cloned volumes and network-namespace sidecar.
@@ -1174,9 +1210,13 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
 
     kj::HttpHeaderTable::Builder headerTableBuilder;
     auto xDstAddrHeader = headerTableBuilder.add("X-Dst-Addr");
+    auto controlHeader = headerTableBuilder.add(CONTAINER_CONTROL_HEADER);
     auto headerTable = headerTableBuilder.build();
     kj::HttpHeaders headers(*headerTable);
     headers.set(xDstAddrHeader, kj::str(dstAddr));
+    KJ_IF_SOME(token, containerClient.controlToken) {
+      headers.set(controlHeader, token);
+    }
 
     auto proxyConnection = co_await address->connect();
     auto httpClient = kj::newHttpClient(*headerTable, *proxyConnection)
@@ -1216,9 +1256,9 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
     auto downPump =
         connectionRef.pumpTo(downEndRef).then([&downEndRef](uint64_t) { return downEndRef.end(); });
 
-    pumpTasks.add(
+    pumpTasks.add(containerClient.egressState->callbacks.wrap(
         kj::joinPromisesFailFast(kj::arr(kj::mv(upPump), kj::mv(downPump)))
-            .attach(kj::mv(httpClient), kj::mv(upEnd), kj::mv(connection), kj::mv(downEnd)));
+            .attach(kj::mv(httpClient), kj::mv(upEnd), kj::mv(connection), kj::mv(downEnd))));
     co_return;
   }
 
@@ -1234,7 +1274,11 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
     // the ByteStreams, so ignore them (and other uninteresting errors such as OVERLOADED). Log
     // anything unexpected so that genuine failures are not silently swallowed.
     if (isInterestingException(exception)) {
-      KJ_LOG(ERROR, "container tunnel pump task failed", exception);
+      if (containerClient.outbound != kj::none) {
+        KJ_LOG(ERROR, "container tunnel pump task failed");
+      } else {
+        KJ_LOG(ERROR, "container tunnel pump task failed", exception);
+      }
     }
   }
 };
@@ -1267,7 +1311,11 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       // always combined into stdout when a PTY is active, so there is no separate stderr stream.
       auto task = copyRawExecOutput(*sharedConnection->connection, kj::mv(stdoutStream))
                       .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
-      streamClosedTask = kj::mv(task).fork();
+      streamClosedTask = this->containerClient->egressState->callbacks
+                             .wrap(kj::mv(task).attach(
+                                 kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
+        shared->disconnect();
+      }))).fork();
       return;
     }
 
@@ -1283,7 +1331,11 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
     auto task = demuxDockerExecOutput(
         *sharedConnection->connection, kj::mv(stdoutStream), kj::mv(stderrStream), combinedOutput)
                     .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
-    streamClosedTask = kj::mv(task).fork();
+    streamClosedTask =
+        this->containerClient->egressState->callbacks
+            .wrap(kj::mv(task).attach(kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
+      shared->disconnect();
+    }))).fork();
   }
 
   kj::Promise<void> wait(WaitContext context) override {
@@ -1450,6 +1502,21 @@ class EgressHttpService final: public kj::HttpService {
       kj::AsyncIoStream& connection,
       ConnectResponse& response,
       kj::HttpConnectSettings settings) override {
+    return containerClient.egressState->callbacks.wrap(
+        connectImpl(host, headers, connection, response, settings));
+  }
+
+  kj::Promise<void> connectImpl(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) {
+    if (containerClient.outbound != kj::none &&
+        !containerCallbackAuthorized(containerClient.callbackToken, headers)) {
+      kj::HttpHeaders rejection(headerTable);
+      auto body = response.reject(401, "Unauthorized", rejection, uint64_t(0));
+      co_return;
+    }
     auto destAddr = kj::str(host);
     if (co_await handleConnectMode(destAddr, headers, connection, response, "X-Tls-Sni",
             /*defaultPort=*/443, EgressProtocol::HTTPS)) {
@@ -1570,6 +1637,14 @@ class EgressHttpService final: public kj::HttpService {
       co_return;
     }
 
+    KJ_IF_SOME(outbound, containerClient.outbound) {
+      IoChannelFactory::SubrequestMetadata metadata;
+      auto worker = outbound->startRequest(kj::mv(metadata));
+      TcpEgressConnectResponse response;
+      kj::HttpHeaders headers(headerTable);
+      co_await worker->connect(destAddr, headers, connection, response, {});
+      co_return;
+    }
     auto addr = co_await containerClient.network.parseAddress(destAddr);
     auto destConn = co_await addr->connect();
     co_await pumpBidirectional(connection, *destConn);
@@ -1631,7 +1706,8 @@ kj::Promise<uint16_t> ContainerClient::startEgressListener(
   auto& httpServerRef = *httpServer;
 
   egressHttpServer = httpServer.attach(kj::mv(service));
-
+  // Private callbacks use reverse streams; the standalone sidecar port flag remains valid.
+  if (outbound != kj::none) co_return 39001;
   auto addr = co_await network.parseAddress(kj::str(listenAddress, ":", port));
   // The gateway IP from Docker's bridge network is not always bindable on the host.
   // On WSL with Docker Desktop, 172.17.0.1 lives inside the Docker VM, not on the WSL host's
@@ -1658,6 +1734,7 @@ kj::Promise<uint16_t> ContainerClient::startEgressListener(
 }
 
 void ContainerClient::stopEgressListener() {
+  reverseCallbackTask = kj::none;
   egressListenerTask = kj::none;
   egressHttpServer = kj::none;
   egressListenerStarted.store(false, std::memory_order_release);
@@ -1700,8 +1777,9 @@ kj::Promise<void> ContainerClient::readCACert() {
   auto ingressPort = KJ_REQUIRE_NONNULL(
       sidecarIngressHostPort, "Cannot read CA cert: sidecar ingress port not known");
 
-  auto response = co_await dockerApiRequest(
-      network, kj::str("127.0.0.1:", ingressPort), kj::HttpMethod::GET, kj::str("/ca"));
+  auto response = co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressPort),
+      kj::HttpMethod::GET, kj::str("/ca"), kj::none,
+      controlToken.map([](auto& token) { return kj::str(token); }));
 
   JSG_REQUIRE(response.statusCode == 200, Error,
       "Failed to read CA cert from sidecar: ", response.statusCode, " ", response.body);
@@ -1817,6 +1895,7 @@ kj::Promise<kj::Maybe<ContainerClient::SidecarInspectResponse>> ContainerClient:
 kj::Promise<void> ContainerClient::updateSidecarEgressPort(
     uint16_t ingressHostPort, uint16_t egressPort) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::ProxyEverything::Port>();
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::ProxyEverything::Port>();
@@ -1824,7 +1903,8 @@ kj::Promise<void> ContainerClient::updateSidecarEgressPort(
 
   auto body = codec.encode(jsonRoot);
   auto response = co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressHostPort),
-      kj::HttpMethod::PUT, kj::str("/egress"), kj::mv(body));
+      kj::HttpMethod::PUT, kj::str("/egress"), kj::mv(body),
+      controlToken.map([](auto& token) { return kj::str(token); }));
 
   JSG_REQUIRE(response.statusCode >= 200 && response.statusCode < 300, Error,
       "Updating sidecar egress port failed with: ", response.statusCode, " ", response.body);
@@ -1833,6 +1913,7 @@ kj::Promise<void> ContainerClient::updateSidecarEgressPort(
 kj::Promise<void> ContainerClient::updateSidecarEgressConfig(
     uint16_t ingressHostPort, uint16_t egressPort) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::ProxyEverything::Port>();
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::ProxyEverything::Port>();
@@ -1851,7 +1932,8 @@ kj::Promise<void> ContainerClient::updateSidecarEgressConfig(
 
   auto body = codec.encode(jsonRoot);
   auto response = co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressHostPort),
-      kj::HttpMethod::PUT, kj::str("/egress"), kj::mv(body));
+      kj::HttpMethod::PUT, kj::str("/egress"), kj::mv(body),
+      controlToken.map([](auto& token) { return kj::str(token); }));
 
   JSG_REQUIRE(response.statusCode >= 200 && response.statusCode < 300, Error,
       "Updating sidecar egress config failed with: ", response.statusCode, " ", response.body);
@@ -1863,6 +1945,7 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
     kj::ArrayPtr<const SnapshotRestoreMount> restoreMounts,
     rpc::Container::StartParams::Reader params) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ContainerCreateRequest>();
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::Docker::ContainerCreateRequest>();
@@ -1876,7 +1959,8 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
   }
 
   auto envSize = environment.map([](auto& env) { return env.size(); }).orDefault(0);
-  auto jsonEnv = jsonRoot.initEnv(envSize + kj::size(defaultEnv));
+  auto defaultEnvSize = outbound == kj::none ? kj::size(defaultEnv) : 0;
+  auto jsonEnv = jsonRoot.initEnv(envSize + defaultEnvSize);
 
   KJ_IF_SOME(env, environment) {
     for (uint32_t i: kj::zeroTo(env.size())) {
@@ -1884,20 +1968,20 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
     }
   }
 
-  for (uint32_t i: kj::zeroTo(kj::size(defaultEnv))) {
+  for (uint32_t i: kj::zeroTo(defaultEnvSize)) {
     jsonEnv.set(envSize + i, defaultEnv[i]);
   }
 
   auto hostConfig = jsonRoot.initHostConfig();
   // We need to set a restart policy to avoid having ambiguous states
   // where the container we're managing is stuck at "exited" state.
-  hostConfig.initRestartPolicy().setName("on-failure");
+  hostConfig.initRestartPolicy().setName(outbound == kj::none ? "on-failure" : "no");
 
   hostConfig.setNetworkMode(kj::str("container:", sidecarContainerName));
 
   // When containersPidNamespace is NOT enabled, use host PID namespace for backwards compatibility.
   // This allows the container to see processes on the host.
-  if (!params.getCompatibilityFlags().getContainersPidNamespace()) {
+  if (outbound == kj::none && !params.getCompatibilityFlags().getContainersPidNamespace()) {
     hostConfig.setPidMode("host");
   }
 
@@ -1927,7 +2011,9 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
   }
   configureContainerPrivileges(hostConfig, privileges);
 
-  co_await ensureSystemImageAvailable(network, dockerPath, effectiveImage);
+  if (outbound == kj::none) {
+    co_await ensureSystemImageAvailable(network, dockerPath, effectiveImage);
+  }
   auto response = co_await dockerApiRequest(network, kj::str(dockerPath), kj::HttpMethod::POST,
       kj::str("/containers/create?name=", containerName), codec.encode(jsonRoot));
 
@@ -1936,6 +2022,9 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
   // because Docker may take a moment to fully release the container name after removal.
   constexpr int MAX_RETRIES = 3;
   constexpr auto RETRY_DELAY = 100 * kj::MILLISECONDS;
+
+  JSG_REQUIRE(outbound == kj::none || response.statusCode != 409, Error,
+      "Container execution identity already exists.");
 
   for (int attempt = 0; response.statusCode == 409 && attempt < MAX_RETRIES; ++attempt) {
     co_await removeContainer(network, kj::str(dockerPath), kj::str(containerName));
@@ -1960,6 +2049,7 @@ kj::Promise<kj::String> ContainerClient::createExec(capnp::List<capnp::Text>::Re
     bool attachStderr,
     kj::StringPtr killToken) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ExecCreateRequest>();
 
   capnp::MallocMessageBuilder message;
@@ -2016,6 +2106,7 @@ kj::Promise<kj::String> ContainerClient::createExec(capnp::List<capnp::Text>::Re
 kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::startExec(
     kj::String execId, bool tty, uint16_t cols, uint16_t rows) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ExecStartRequest>();
 
   capnp::MallocMessageBuilder message;
@@ -2084,6 +2175,7 @@ kj::Promise<ContainerClient::ExecInspectResponse> ContainerClient::inspectExec(
 
 kj::Promise<void> ContainerClient::runSimpleExec(kj::ArrayPtr<const kj::String> cmd) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ExecCreateRequest>();
 
   capnp::MallocMessageBuilder createMessage;
@@ -2109,6 +2201,7 @@ kj::Promise<void> ContainerClient::runSimpleExec(kj::ArrayPtr<const kj::String> 
   auto execId = kj::str(parsedCreate->getRoot<docker_api::Docker::ExecCreateResponse>().getId());
 
   capnp::JsonCodec startCodec;
+  if (outbound != kj::none) startCodec.setHasMode(capnp::HasMode::NON_DEFAULT);
   startCodec.handleByAnnotation<docker_api::Docker::ExecStartRequest>();
 
   capnp::MallocMessageBuilder startMessage;
@@ -2178,6 +2271,7 @@ kj::Promise<void> ContainerClient::createSidecarContainer(
     uint16_t egressPort, kj::String networkCidr) {
   // Equivalent to: docker run --cap-add=NET_ADMIN -p <random-host>:39001 ...
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ContainerCreateRequest>();
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::Docker::ContainerCreateRequest>();
@@ -2188,6 +2282,7 @@ kj::Promise<void> ContainerClient::createSidecarContainer(
   // determined by the number of flags we need to pass to proxy-everything
   uint32_t cmdSize =
       8;  // --http-egress-port <port> --http-ingress-address 0.0.0.0:<port> --docker-gateway-cidr <cidr> --dns-enabled --tls-intercept
+  if (outbound != kj::none) cmdSize += 2;
   if (!ipv6Enabled) cmdSize += 1;  // --disable-ipv6
 
   auto cmd = jsonRoot.initCmd(cmdSize);
@@ -2200,6 +2295,10 @@ kj::Promise<void> ContainerClient::createSidecarContainer(
   cmd.set(idx++, networkCidr);
   cmd.set(idx++, "--dns-enabled");
   cmd.set(idx++, "--tls-intercept");
+  if (outbound != kj::none) {
+    cmd.set(idx++, "--control-auth-file");
+    cmd.set(idx++, "/run/open-compute/control.json");
+  }
   if (!ipv6Enabled) {
     cmd.set(idx++, "--disable-ipv6");
   }
@@ -2254,6 +2353,7 @@ kj::Promise<void> ContainerClient::destroySidecarContainer() {
 
 kj::Promise<void> ContainerClient::createVolume(kj::StringPtr volumeName) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::VolumeCreateRequest>();
   capnp::MallocMessageBuilder message;
   auto req = message.initRoot<docker_api::Docker::VolumeCreateRequest>();
@@ -2309,6 +2409,7 @@ kj::Promise<void> ContainerClient::deleteImage(kj::String imageRef) {
 kj::Promise<kj::String> ContainerClient::createTempContainerWithVolume(
     kj::StringPtr volumeName, kj::StringPtr mountPath) {
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ContainerCreateRequest>();
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::Docker::ContainerCreateRequest>();
@@ -2340,6 +2441,7 @@ kj::Promise<void> ContainerClient::cloneSnapshot(SnapshotRestoreMount& snapshot)
   });
 
   capnp::JsonCodec codec;
+  if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
   codec.handleByAnnotation<docker_api::Docker::ContainerCreateRequest>();
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::Docker::ContainerCreateRequest>();
@@ -2448,6 +2550,7 @@ kj::Promise<void> ContainerClient::status(StatusContext context) {
     co_await ensureEgressListenerStarted();
     co_await updateSidecarEgressPort(sidecar.ingressHostPort, egressListenerPort);
     co_await readCACert();
+    co_await ensureReverseCallbacks();
   }
 
   context.getResults().setRunning(isRunning);
@@ -2519,26 +2622,26 @@ kj::Promise<void> ContainerClient::start(StartContext context) {
   kj::Maybe<kj::StringPtr> effectiveImage =
       imageName.map([](kj::String& image) -> kj::StringPtr { return image; });
   auto source = params.getSource();
-  switch (source.which()) {
-    case rpc::Container::StartParams::Source::IMAGE:
-      JSG_REQUIRE(
-          source.getImage().size() > 0, Error, "Container image reference cannot be empty.");
-      effectiveImage = source.getImage();
-      break;
-    case rpc::Container::StartParams::Source::CONTAINER_SNAPSHOT_ID: {
-      if (!source.hasContainerSnapshotId()) break;
+  if (outbound == kj::none) switch (source.which()) {
+      case rpc::Container::StartParams::Source::IMAGE:
+        JSG_REQUIRE(
+            source.getImage().size() > 0, Error, "Container image reference cannot be empty.");
+        effectiveImage = source.getImage();
+        break;
+      case rpc::Container::StartParams::Source::CONTAINER_SNAPSHOT_ID: {
+        if (!source.hasContainerSnapshotId()) break;
 
-      auto snapshotRef = source.getContainerSnapshotId();
-      JSG_REQUIRE(snapshotRef.size() > 0, Error, "Container snapshot ID cannot be empty.");
+        auto snapshotRef = source.getContainerSnapshotId();
+        JSG_REQUIRE(snapshotRef.size() > 0, Error, "Container snapshot ID cannot be empty.");
 
-      auto snapshotId = parseSnapshotId(snapshotRef);
-      snapshotImageRef = kj::str(CONTAINER_SNAPSHOT_IMAGE_PREFIX, snapshotId);
-      // Snapshot existence is validated before sidecar and directory-volume setup.
-      co_await inspectImageSize(snapshotImageRef);
-      effectiveImage = snapshotImageRef;
-      break;
+        auto snapshotId = parseSnapshotId(snapshotRef);
+        snapshotImageRef = kj::str(CONTAINER_SNAPSHOT_IMAGE_PREFIX, snapshotId);
+        // Snapshot existence is validated before sidecar and directory-volume setup.
+        co_await inspectImageSize(snapshotImageRef);
+        effectiveImage = snapshotImageRef;
+        break;
+      }
     }
-  }
 
   auto image = JSG_REQUIRE_NONNULL(
       effectiveImage, Error, "Container.start() requires an image or container snapshot.");
@@ -2561,7 +2664,7 @@ kj::Promise<void> ContainerClient::start(StartContext context) {
   });
 
   kj::Vector<SnapshotRestoreMount> restoreMounts;
-  if (params.hasDirectorySnapshots()) {
+  if (outbound == kj::none && params.hasDirectorySnapshots()) {
     auto snapshotList = params.getDirectorySnapshots();
     restoreMounts.reserve(snapshotList.size());
     for (auto i: kj::zeroTo(snapshotList.size())) {
@@ -2590,6 +2693,7 @@ kj::Promise<void> ContainerClient::start(StartContext context) {
 
   co_await ensureEgressListenerStarted();
   co_await ensureSidecarStarted();
+  co_await ensureReverseCallbacks();
 
   // Refresh the sidecar's egress configuration on every start(). This is required because:
   //   - `internetEnabled` may have changed since the sidecar was originally created.
@@ -2834,7 +2938,7 @@ kj::Promise<void> ContainerClient::snapshotDirectory(SnapshotDirectoryContext co
       "': ", putResponse.statusCode);
 
   volumeCommitted = true;
-  KJ_LOG(INFO, "created snapshot volume", volumeName, dir, tarSize);
+  if (outbound == kj::none) KJ_LOG(INFO, "created snapshot volume", volumeName, dir, tarSize);
 
   auto result = context.getResults().initSnapshot();
   result.setId(snapshotId);
@@ -3042,6 +3146,51 @@ kj::Promise<void> ContainerClient::ensureSidecarStarted() {
 
   co_await readCACert();
   succeeded = true;
+}
+
+kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::connectReverseCallback() {
+  auto port = JSG_REQUIRE_NONNULL(sidecarIngressHostPort, Error, "Container sidecar unavailable.");
+  auto token = kj::str(JSG_REQUIRE_NONNULL(controlToken, Error, "Container credentials unavailable."));
+  auto address = co_await network.parseAddress(kj::str("127.0.0.1:", port));
+  auto connection = co_await address->connect();
+  auto client = kj::newHttpClient(headerTable, *connection).attach(kj::mv(connection));
+  kj::HttpHeaders headers(headerTable);
+  headers.add(CONTAINER_CONTROL_HEADER, token);
+  auto request = client->connect("/open-compute/callback-channel", headers, {});
+  auto status = co_await request.status;
+  JSG_REQUIRE(status.statusCode == 200, Error, "Container callback channel rejected.");
+  co_return request.connection.attach(kj::mv(client));
+}
+
+kj::Promise<void> ContainerClient::serveReverseCallbacks(kj::Own<kj::AsyncIoStream> connection) {
+  for (;;) {
+    if (connection.get() != nullptr) {
+      waitUntilTasks.add(egressState->callbacks.wrap(
+          KJ_ASSERT_NONNULL(egressHttpServer)->listenHttp(kj::mv(connection)))
+                            .catch_([](kj::Exception&&) {})
+                            .attach(addRef()));
+    }
+    try {
+      auto sidecar = JSG_REQUIRE_NONNULL(co_await inspectSidecar(), Error,
+          "Container networking sidecar unavailable.");
+      sidecarIngressHostPort = sidecar.ingressHostPort;
+      // Admission is bounded by the sidecar's idle pool; active streams retain existing I/O budgets.
+      connection = co_await connectReverseCallback();
+      continue;
+    } catch (...) {
+      // Only the Broker can grant a current relay connection.
+    }
+    co_await timer.afterDelay(200 * kj::MILLISECONDS);
+  }
+}
+
+kj::Promise<void> ContainerClient::ensureReverseCallbacks() {
+  if (outbound == kj::none || reverseCallbackTask != kj::none) co_return;
+  auto connection = co_await timer.timeoutAfter(5 * kj::SECONDS, connectReverseCallback());
+  reverseCallbackTask = egressState->callbacks.wrap(serveReverseCallbacks(kj::mv(connection)))
+                            .eagerlyEvaluate([](kj::Exception&&) {
+    KJ_LOG(ERROR, "Container reverse callback channel ended.");
+  });
 }
 
 kj::Promise<void> ContainerClient::ensureEgressListenerStarted(uint16_t port) {

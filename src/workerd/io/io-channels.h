@@ -6,6 +6,7 @@
 
 #include <workerd/io/actor-id.h>
 #include <workerd/io/compatibility-date.capnp.h>
+#include <workerd/io/container.capnp.h>
 #include <workerd/io/frankenvalue.h>
 #include <workerd/io/io-util.h>
 #include <workerd/io/trace.h>
@@ -25,6 +26,23 @@ class Network;
 namespace workerd {
 
 class WorkerInterface;
+
+// Host-issued immutable execution identity. It has no tenant or RPC serialization.
+struct HostContainerLease {
+  kj::String leaseKey;
+  kj::String imageRef;
+  kj::String providerContractSha256;
+  kj::String controlToken;
+  kj::String callbackToken;
+  kj::String nativeStartupJson;
+
+  JSG_STRUCT(leaseKey, imageRef, providerContractSha256, controlToken, callbackToken, nativeStartupJson);
+};
+
+using ResolveHostContainerLease = kj::Function<kj::Promise<kj::Maybe<HostContainerLease>>(
+    bool start, bool stop, bool completed, kj::String startup)>;
+
+class HostContainerOwner;
 
 // Indicates whether the target worker of a stub had the `allow_irrevocable_stub_storage` compat
 // flag enabled when the stub was minted. Only stubs minted from `ctx.exports` ("loopback")
@@ -510,6 +528,16 @@ class IoChannelFactory: public virtual kj::Refcounted {
     virtual void revoke() = 0;
   };
 
+  // Process-local grant for one declared class in the trusted host's tenant facet.
+  class HostContainerChannel: public kj::Refcounted {
+   public:
+    virtual rpc::Container::Client attach(
+        HostContainerOwner& owner, kj::Own<SubrequestChannel> outbound) = 0;
+    virtual kj::Promise<void> start() = 0;
+    virtual kj::StringPtr getClassName() const = 0;
+    virtual void revoke() = 0;
+  };
+
   virtual kj::Own<HostFacetChannel> getHostFacetChannel(uint channel) {
     JSG_FAIL_REQUIRE(Error, "Host facet delegation is not supported by this runtime.");
   }
@@ -674,6 +702,21 @@ class WorkerStubChannel: public kj::Refcounted {
 };
 
 // Source code needed to dynamically load a Worker.
+class HostContainerOwner {
+ public:
+  virtual ~HostContainerOwner() noexcept(false) = default;
+  virtual void revokeHostContainerCallbacks() {}
+  virtual kj::Promise<void> ensureHostContainerAttached() {
+    JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
+  }
+
+  virtual rpc::Container::Client attachHostContainer(HostContainerOwner& owner,
+      ResolveHostContainerLease resolve,
+      kj::Own<IoChannelFactory::SubrequestChannel> outbound) {
+    JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
+  }
+};
+
 struct DynamicWorkerSource {
   WorkerSource source;
   CompatibilityFlags::Reader compatibilityFlags;
@@ -690,6 +733,8 @@ struct DynamicWorkerSource {
 
   // Fixed config-owned policy receives privateEnv without exposing it to tenant handlers.
   bool hostPolicy = false;
+
+  kj::Maybe<kj::Own<IoChannelFactory::HostContainerChannel>> hostContainer;
 
   // Host-authenticated dedicated Python snapshot; absent for ordinary Dynamic Workers.
   kj::Maybe<kj::Array<const byte>> pythonSnapshot;
@@ -728,6 +773,7 @@ struct DynamicWorkerSource {
       .env = env.clone(),
       .privateEnv = privateEnv.clone(),
       .hostPolicy = hostPolicy,
+      .hostContainer = mapAddRef(hostContainer),
       .pythonSnapshot =
           pythonSnapshot.map([](auto& snapshot) { return kj::heapArray<const byte>(snapshot); }),
       .preparePython = preparePython,

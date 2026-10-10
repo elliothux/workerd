@@ -1561,3 +1561,9 @@ sh_test(
         "//conditions:default": [],
     }),
 )
+
+wd_test(
+    src = "worker-loader-host-container-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-host-container-test.js"],
+)

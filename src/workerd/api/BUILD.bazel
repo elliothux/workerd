@@ -160,6 +160,8 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/workerd/io",
+        "@capnp-cpp//src/capnp/compat:json",
+        "//src/workerd/util:completion-membrane",
     ],
 )
 

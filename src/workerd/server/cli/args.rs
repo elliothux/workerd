@@ -125,6 +125,9 @@ pub enum Command {
     #[command(long_about = "Prints the compiled compatibility catalog as deterministic JSON.")]
     CompatibilityCatalog,
 
+    /// print the private native Container attachment protocol version
+    ContainerProtocolVersion,
+
     /// outputs the package lock file used by Pyodide
     #[command(long_about = "Outputs the package lock file used by Pyodide.")]
     PyodideLock,

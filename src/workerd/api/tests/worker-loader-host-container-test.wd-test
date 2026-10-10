@@ -1,0 +1,26 @@
+using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  extensions = [(modules = [
+    (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+     esModule = "export default () => namespace => namespace;"),
+  ])],
+  services = [
+    (name = "TEST_TMPDIR", disk = (writable = true)),
+    (name = "blocked", network = (allow = [])),
+    (name = "host", worker = (
+      modules = [(name = "test.js", esModule = embed "worker-loader-host-container-test.js")],
+      compatibilityFlags = ["experimental", "nodejs_compat", "enable_ctx_exports"],
+      durableObjectNamespaces = [(className = "Host", uniqueKey = "host", enableSql = true)],
+      durableObjectStorage = (localDisk = "TEST_TMPDIR"),
+      containerEngine = (localDocker = (
+        socketPath = "unix:/tmp/open-compute-container-test-unconnected.sock",
+        containerEgressInterceptorImage = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+      globalOutbound = "blocked",
+      bindings = [
+        (name = "factory", workerLoader = (factory = true)),
+        (name = "loader", workerLoader = ()),
+        (name = "outbound", service = "blocked"),
+      ],
+    )),
+  ],
+);

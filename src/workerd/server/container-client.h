@@ -84,6 +84,7 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
       kj::Timer& timer,
       kj::Network& network,
+      kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> outbound,
       kj::String dockerPath,
       kj::String containerName,
       kj::Maybe<kj::String> imageName,
@@ -99,6 +100,12 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // Starts best-effort Docker cleanup before this client is destroyed. This is used during
   // graceful server shutdown, when cleanup can still use the server's network resources.
   void shutdown();
+
+  // Cancel in-flight tenant callbacks and release old mappings while retaining the effective lease.
+  void revokeHostCallbacks();
+
+  // Replace provider generation credentials without changing the persisted execution identity.
+  void setHostCredentials(kj::String controlToken, kj::String callbackToken);
 
   // Implement rpc::Container::Server interface
   kj::Promise<void> status(StatusContext context) override;
@@ -125,6 +132,7 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   kj::HttpHeaderTable headerTable;
   kj::Timer& timer;
   kj::Network& network;
+  kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> outbound;
   kj::String dockerPath;
   kj::String containerName;
   kj::String sidecarContainerName;
@@ -142,6 +150,9 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // in-flight DELETE from the previous client has settled (either completed or been cancelled
   // via containerCleanupCanceler, in which case the .catch_() resolves it immediately).
   kj::ForkedPromise<void> pendingCleanup;
+
+  kj::Maybe<kj::String> controlToken;
+  kj::Maybe<kj::String> callbackToken;
 
   static constexpr kj::StringPtr defaultEnv[] = {"CLOUDFLARE_COUNTRY_A2=XX"_kj,
     "CLOUDFLARE_DEPLOYMENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"_kj,
@@ -284,6 +295,7 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
 
   kj::Maybe<kj::Own<kj::HttpServer>> egressHttpServer;
   kj::Maybe<kj::Promise<void>> egressListenerTask;
+  kj::Maybe<kj::Promise<void>> reverseCallbackTask;
 
   uint16_t egressListenerPort = 0;
   kj::Maybe<uint16_t> sidecarIngressHostPort;
@@ -317,6 +329,9 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // Ensure the egress listener and sidecar container are started exactly once.
   // Uses containerSidecarStarted as a guard. Called from both start() and setEgressHttp().
   kj::Promise<void> ensureSidecarStarted();
+  kj::Promise<kj::Own<kj::AsyncIoStream>> connectReverseCallback();
+  kj::Promise<void> serveReverseCallbacks(kj::Own<kj::AsyncIoStream> connection);
+  kj::Promise<void> ensureReverseCallbacks();
 };
 
 }  // namespace workerd::server

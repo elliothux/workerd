@@ -183,6 +183,10 @@ fn run_command(
             print!("{}", ffi::compatibility_catalog()?);
             Ok(0)
         }
+        args::Command::ContainerProtocolVersion => {
+            println!("open-compute-container-protocol-v1");
+            Ok(0)
+        }
         args::Command::PyodideLock => {
             println!("{}", ffi::pyodide_lock()?);
             Ok(0)
@@ -459,6 +463,7 @@ impl args::Main {
             args::Command::Fuzzilli { .. } => "fuzzilli",
             args::Command::Test { .. } => "test",
             args::Command::CompatibilityCatalog => "compatibility-catalog",
+            args::Command::ContainerProtocolVersion => "container-protocol-version",
             args::Command::PyodideLock => "pyodide-lock",
             args::Command::MakePyodideBaselineSnapshot { .. } => "make-pyodide-baseline-snapshot",
         }

@@ -10,6 +10,8 @@
 
 namespace workerd::api {
 
+class HostContainer;
+
 class Fetcher;
 class DurableObjectClass;
 class DurableObjectFacets;
@@ -138,6 +140,8 @@ class WorkerLoader: public jsg::Object {
     // Execute the fixed config-owned environment/export policy before tenant entrypoints.
     jsg::Optional<bool> openComputeHostPolicy;
 
+    jsg::Optional<jsg::Ref<HostContainer>> openComputeContainer;
+
     // Dedicated Python snapshot selected and authenticated by the trusted host.
     jsg::Optional<kj::Array<const byte>> openComputePythonSnapshot;
 
@@ -165,6 +169,7 @@ class WorkerLoader: public jsg::Object {
         openComputePrivateEnv,
         openComputeBindings,
         openComputeHostPolicy,
+        openComputeContainer,
         openComputePythonSnapshot,
         globalOutbound,
         openComputeCache,
@@ -266,6 +271,11 @@ class WorkerLoaderFactory: public jsg::Object {
   void revoke(jsg::Lock& js, kj::String name);
   void revokePrefix(jsg::Lock& js, kj::String prefix);
   jsg::Ref<HostFacets> getFacets(jsg::Lock& js, jsg::Ref<DurableObjectFacets> facets);
+  jsg::Ref<HostContainer> getContainer(jsg::Lock& js,
+      jsg::Ref<DurableObjectFacets> facets,
+      kj::String className,
+      jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(bool, bool, bool, kj::String)>
+          resolve);
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
       jsg::Ref<WorkerStub> stub,
       kj::Array<jsg::Ref<Fetcher>> tails,
@@ -279,11 +289,32 @@ class WorkerLoaderFactory: public jsg::Object {
     JSG_METHOD(revoke);
     JSG_METHOD(revokePrefix);
     JSG_METHOD(getFacets);
+    JSG_METHOD(getContainer);
     JSG_METHOD(getEntrypoint);
   }
 
  private:
   uint channel;
+};
+
+class HostContainer: public jsg::Object {
+ public:
+  explicit HostContainer(IoOwn<IoChannelFactory::HostContainerChannel> channel)
+      : channel(kj::mv(channel)) {}
+  kj::Own<IoChannelFactory::HostContainerChannel> getChannel() {
+    return kj::addRef(*channel);
+  }
+  jsg::Promise<void> start(jsg::Lock& js);
+  void revoke() {
+    channel->revoke();
+  }
+  JSG_RESOURCE_TYPE(HostContainer) {
+    JSG_METHOD(start);
+    JSG_METHOD(revoke);
+  }
+
+ private:
+  IoOwn<IoChannelFactory::HostContainerChannel> channel;
 };
 
 // A single native-extension session. It may be delegated once into a dynamic Worker's env and
@@ -330,6 +361,7 @@ class HostExtensionFactory: public jsg::Object {
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
       api::WorkerLoader::Module, api::WorkerLoader::WorkerCode,                                    \
       api::WorkerLoader::WorkerCode::HostBinding, api::WorkerLoaderFactory, api::HostFacets,       \
-      api::HostExtensionPort, api::HostExtensionFactory, workerd::ResourceLimits
+      api::HostContainer, workerd::HostContainerLease, api::HostExtensionPort,                     \
+      api::HostExtensionFactory, workerd::ResourceLimits
 
 }  // namespace workerd::api

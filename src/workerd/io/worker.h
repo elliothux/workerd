@@ -943,7 +943,7 @@ class Worker::Actor final: public kj::Refcounted {
     virtual kj::Maybe<uint32_t> getEventTimeout() = 0;
   };
 
-  class FacetManager {
+  class FacetManager: public HostContainerOwner {
    public:
     // Information needed to start a facet.
     struct StartInfo {

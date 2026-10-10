@@ -6,6 +6,7 @@
 
 #include "alarm-scheduler.h"
 #include "container-client.h"
+#include "host-container.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -536,7 +537,7 @@ class Server::ActorNamespace final {
           tracker(kj::refcounted<RequestTracker>(*this)),
           ns(ns),
           root(parent.map([](ActorContainer& p) -> ActorContainer& { return p.root; })
-                   .orDefault(*this)),
+                  .orDefault(*this)),
           parent(parent),
           timer(timer),
           lastAccess(makeLastAccess(parent, timer)) {
@@ -566,6 +567,8 @@ class Server::ActorNamespace final {
     }
 
     ~ActorContainer() noexcept(false) {
+      revokeHostContainerCallbacks();
+      weakSelf->invalidate();
       // Shutdown the tracker so we don't use active/inactive hooks anymore.
       tracker->shutdown();
 
@@ -789,6 +792,62 @@ class Server::ActorNamespace final {
       return 0;
     }
 
+    kj::Promise<void> ensureHostContainerAttached() override {
+      auto& tenant = JSG_REQUIRE_NONNULL(facets.findEntry("tenant"_kj), Error,
+          "The host has no declared tenant facet.");
+      co_await tenant.value->getActor().ignoreResult().attach(tenant.value->addRef());
+    }
+
+    void revokeHostContainerCallbacks() override {
+      KJ_IF_SOME(client, hostContainerClient) {
+        client->revokeHostCallbacks();
+      }
+    }
+
+    rpc::Container::Client attachHostContainer(HostContainerOwner& owner,
+        ResolveHostContainerLease resolve,
+        kj::Own<IoChannelFactory::SubrequestChannel> outbound) override {
+      JSG_REQUIRE(parent != kj::none && &KJ_ASSERT_NONNULL(parent) == &owner && &root == &owner &&
+              key == "tenant",
+          Error, "Container attachments require the host's declared tenant facet.");
+      auto weak = root.weakSelf->addRef();
+      auto getClient =
+          [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound)](bool start,
+              bool stop, bool completed,
+              kj::String startup) mutable -> kj::Promise<kj::Maybe<rpc::Container::Client>> {
+        auto lease = co_await resolve(start, stop, completed, kj::mv(startup));
+        auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        if (stop && completed) {
+          owner.revokeHostContainerCallbacks();
+          owner.hostContainerClient = kj::none;
+          owner.hostContainerLease = kj::none;
+        }
+        if (lease == kj::none) co_return kj::none;
+        auto& identity = KJ_ASSERT_NONNULL(lease);
+        KJ_IF_SOME(existing, owner.hostContainerLease) {
+          if (existing.leaseKey == identity.leaseKey) {
+            JSG_REQUIRE(existing.imageRef == identity.imageRef &&
+                    existing.providerContractSha256 == identity.providerContractSha256,
+                Error, "Container execution authority changed.");
+            KJ_ASSERT_NONNULL(owner.hostContainerClient)
+                ->setHostCredentials(
+                    kj::str(identity.controlToken), kj::str(identity.callbackToken));
+            co_return rpc::Container::Client(
+                KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef());
+          }
+        }
+        owner.hostContainerClient = owner.ns.getContainerClient(identity.leaseKey,
+            kj::StringPtr(identity.imageRef), ContainerPrivileges{}, kj::addRef(*outbound));
+        KJ_ASSERT_NONNULL(owner.hostContainerClient)
+            ->setHostCredentials(kj::str(identity.controlToken), kj::str(identity.callbackToken));
+        owner.hostContainerLease = kj::mv(identity);
+        co_return rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef());
+      };
+      capnp::Capability::Client grant(
+          kj::heap<HostContainerRpc>(kj::mv(getClient), kj::addRef(*root.hostContainerMutations)));
+      return grant.castAs<rpc::Container>();
+    }
+
     kj::Own<IoChannelFactory::ActorChannel> getFacet(
         kj::StringPtr name, kj::Function<kj::Promise<StartInfo>()> getStartInfo) override {
       auto facet = getFacetContainer(kj::str(name), kj::mv(getStartInfo));
@@ -893,6 +952,14 @@ class Server::ActorNamespace final {
 
     // Reference to the ContainerClient (if container is enabled for this actor)
     kj::Maybe<kj::Own<ContainerClient>> containerClient;
+
+    // The root owns execution across replacement tenant facets; grants only borrow it.
+    kj::Maybe<HostContainerLease> hostContainerLease;
+    kj::Maybe<kj::Own<ContainerClient>> hostContainerClient;
+    kj::Own<HostContainerRpc::MutationQueue> hostContainerMutations =
+        kj::refcounted<HostContainerRpc::MutationQueue>();
+    kj::Own<WeakRef<ActorContainer>> weakSelf =
+        kj::refcounted<WeakRef<ActorContainer>>(kj::Badge<ActorContainer>(), *this);
 
     // If this is a `ForkedPromise<void>`, await the promise. When it has resolved, then
     // `classAndId` will have been replaced with the resolved `ClassAndId` value.
@@ -1136,6 +1203,11 @@ class Server::ActorNamespace final {
       // If setInactivityTimeout() was called, the timer still holds a reference
       // so the container stays alive until the timeout expires
       containerClient = kj::none;
+      if (parent == kj::none) {
+        revokeHostContainerCallbacks();
+        hostContainerClient = kj::none;
+        hostContainerLease = kj::none;
+      }
     }
 
     // Test-only eviction body, used by the evict hooks (evictWhenIdle). Destroys the Worker::Actor
@@ -1207,6 +1279,11 @@ class Server::ActorNamespace final {
       // Drop our reference to the ContainerClient. If setInactivityTimeout() was called, the timer
       // still holds a reference so the container stays alive until the timeout expires.
       containerClient = kj::none;
+      if (parent == kj::none) {
+        revokeHostContainerCallbacks();
+        hostContainerClient = kj::none;
+        hostContainerLease = kj::none;
+      }
       co_return true;
     }
 
@@ -1424,7 +1501,7 @@ class Server::ActorNamespace final {
 
         container = ns.getContainerClient(
             kj::str("workerd-", KJ_ASSERT_NONNULL(uniqueKey), "-", containerId), imageName,
-            kj::mv(privileges));
+            kj::mv(privileges), kj::none);
       }
 
       auto actor = actorClass->newActor(getTracker(), Worker::Actor::cloneId(id),
@@ -1481,7 +1558,8 @@ class Server::ActorNamespace final {
 
   kj::Own<ContainerClient> getContainerClient(kj::StringPtr containerId,
       kj::Maybe<kj::StringPtr> imageName,
-      ContainerPrivileges privileges) {
+      ContainerPrivileges privileges,
+      kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> outbound) {
     KJ_REQUIRE(!containerShutdownStarted,
         "cannot acquire a container client after graceful shutdown has begun");
 
@@ -1537,7 +1615,7 @@ class Server::ActorNamespace final {
     };
 
     auto client = kj::refcounted<ContainerClient>(byteStreamFactory, timer, dockerNetwork,
-        kj::str(dockerPathRef), kj::str(containerId),
+        kj::mv(outbound), kj::str(dockerPathRef), kj::str(containerId),
         imageName.map([](kj::StringPtr image) { return kj::str(image); }),
         kj::str(KJ_ASSERT_NONNULL(containerEgressInterceptorImage,
             "containerEgressInterceptorImage must be configured for containers.")),
@@ -2147,7 +2225,7 @@ class PromisedNetworkAddress final: public kj::NetworkAddress {
  public:
   PromisedNetworkAddress(kj::Promise<kj::Own<kj::NetworkAddress>> promise)
       : promise(promise.then([this](kj::Own<kj::NetworkAddress> result) { addr = kj::mv(result); })
-                    .fork()) {}
+                .fork()) {}
 
   kj::Promise<kj::Own<kj::AsyncIoStream>> connect() override {
     KJ_IF_SOME(a, addr) {
@@ -5947,11 +6025,11 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         : owner(kj::mv(owner)),
           cacheKey(kj::mv(cacheKey)),
           startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource))
-                          .catch_([this](kj::Exception&& exception) {
-                            onAbortIsolate();
-                            kj::throwRecoverableException(kj::mv(exception));
-                          })
-                          .fork()),
+                  .catch_([this](kj::Exception&& exception) {
+                    onAbortIsolate();
+                    kj::throwRecoverableException(kj::mv(exception));
+                  })
+                  .fork()),
           cleanupTaskSet(server.tasks) {}
 
     bool canEvict() const {
@@ -6025,6 +6103,8 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
     kj::Maybe<EffectiveResourceLimits> requestLimits;
 
     kj::Maybe<kj::Own<WorkerService>> service;  // null if still starting up
+    kj::Maybe<kj::Own<IoChannelFactory::HostContainerChannel>> hostContainer;
+    kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> containerOutbound;
     kj::Maybe<kj::Array<byte>> preparedPythonSnapshot;
     kj::ForkedPromise<void> startupTask;  // resolves when `service` is non-null
 
@@ -6086,6 +6166,12 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
       auto source = co_await fetchSource();
       requireActiveNamespace();
+      KJ_IF_SOME(ns, owner.tryGet()) {
+        JSG_REQUIRE(ns.mode != DELEGATED || source.hostContainer == kj::none, Error,
+            "Container attachment requires a host-owned loader.");
+      }
+      hostContainer = kj::mv(source.hostContainer);
+      containerOutbound = mapAddRef(source.globalOutbound);
       // Every Dynamic Worker gets the fixed Standard isolate and simultaneous-connection
       // limits. CPU and subrequest dimensions remain absent only when neither WorkerCode nor
       // the selected entrypoint declared them.
@@ -6401,6 +6487,16 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           jsg::Dict<kj::String> containerImages,
           kj::Maybe<Worker::Actor::FacetManager&> facetManager) override {
         isolate->requireActiveNamespace();
+        KJ_IF_SOME(grant, isolate->hostContainer) {
+          if (entrypointName != kj::none &&
+              KJ_ASSERT_NONNULL(entrypointName) == grant->getClassName()) {
+            JSG_REQUIRE(container == kj::none, Error, "Container attachment is already configured.");
+            container = grant->attach(JSG_REQUIRE_NONNULL(facetManager, Error,
+                                          "Container attachment requires a host-owned tenant facet."),
+                kj::addRef(*JSG_REQUIRE_NONNULL(isolate->containerOutbound, Error,
+                    "Container attachment requires the tenant outbound capability.")));
+          }
+        }
         return getInner().newActor(tracker, kj::mv(actorId), kj::mv(makeActorCache),
             kj::mv(makeStorage), kj::mv(loopback), kj::mv(manager), kj::mv(container),
             kj::mv(containerImages), facetManager);
@@ -6827,7 +6923,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
               jsg::Lock& js, kj::StringPtr specifier, kj::Maybe<kj::String> referrer,
               jsg::CompilationObserver& observer, jsg::ModuleRegistry::ResolveMethod method,
               kj::Maybe<kj::StringPtr> rawSpecifier) mutable
-          -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
+              -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
         kj::HashMap<kj::StringPtr, kj::StringPtr> attributes;
         KJ_IF_SOME(moduleOrRedirect,
             client->tryResolve(workerd::fallback::Version::V1,
@@ -7815,9 +7911,9 @@ class Server::TcpListener final: public kj::Refcounted {
       auto response = kj::heap<ResponseWrapper>();
       kj::HttpHeaders headers(headerTable);
       owner.tasks.add(req->connect(authority, headers, *stream.stream, *response, {})
-                          .attach(kj::mv(stream.stream), kj::mv(response))
-                          .attach(kj::mv(req))
-                          .catch_([](kj::Exception&& e) {
+              .attach(kj::mv(stream.stream), kj::mv(response))
+              .attach(kj::mv(req))
+              .catch_([](kj::Exception&& e) {
         if (e.getType() != kj::Exception::Type::DISCONNECTED) {
           KJ_LOG(ERROR, "TCP connect() handler threw", e);
         }
@@ -8058,9 +8154,9 @@ class Server::UdpListener final: public kj::Refcounted {
     auto worker = service->startRequest(kj::mv(metadata));
     auto event = kj::heap<api::UdpConnectCustomEvent>(kj::str(addrStr), *flow);
     owner.tasks.add(worker->customEvent(kj::mv(event))
-                        .ignoreResult()
-                        .attach(kj::mv(worker), kj::mv(flow))
-                        .catch_([](kj::Exception&& e) {
+            .ignoreResult()
+            .attach(kj::mv(worker), kj::mv(flow))
+            .catch_([](kj::Exception&& e) {
       if (e.getType() != kj::Exception::Type::DISCONNECTED) {
         KJ_LOG(ERROR, "UDP connect() handler threw", e);
       }
