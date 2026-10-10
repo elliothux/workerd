@@ -534,10 +534,21 @@ class IoChannelFactory: public virtual kj::Refcounted {
     virtual void revoke() = 0;
   };
 
+  // Ephemeral Container callbacks stay within their host-owned tenant facet.
+  class HostContainerEgressRegistrar: public kj::Refcounted {
+   public:
+    virtual kj::Promise<void> registerEgress(
+        uint16_t methodId, kj::String hostPort, kj::Own<SubrequestChannel> channel) = 0;
+  };
+  struct HostContainerAttachment {
+    rpc::Container::Client client;
+    kj::Own<HostContainerEgressRegistrar> egress;
+  };
+
   // Process-local grant for one declared class in the trusted host's tenant facet.
   class HostContainerChannel: public kj::Refcounted {
    public:
-    virtual rpc::Container::Client attach(
+    virtual HostContainerAttachment attach(
         HostContainerOwner& owner, kj::Own<SubrequestChannel> outbound) = 0;
     virtual kj::Promise<void> start() = 0;
     virtual kj::StringPtr getClassName() const = 0;
@@ -720,7 +731,16 @@ class HostContainerOwner {
     JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
   }
 
-  virtual rpc::Container::Client attachHostContainer(HostContainerOwner& owner,
+  virtual void setHostContainerEgressRegistrar(
+      kj::Own<IoChannelFactory::HostContainerEgressRegistrar> registrar) {
+    JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
+  }
+  virtual kj::Maybe<kj::Own<IoChannelFactory::HostContainerEgressRegistrar>>
+  getHostContainerEgressRegistrar() {
+    return kj::none;
+  }
+
+  virtual IoChannelFactory::HostContainerAttachment attachHostContainer(HostContainerOwner& owner,
       ResolveHostContainerLease resolve,
       kj::Own<IoChannelFactory::SubrequestChannel> outbound) {
     JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");

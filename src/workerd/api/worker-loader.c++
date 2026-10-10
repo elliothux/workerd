@@ -131,6 +131,26 @@ class HostFacetChannelImpl final: public IoChannelFactory::HostFacetChannel {
   bool revoked = false;
 };
 
+class RevocableContainerEgress final: public IoChannelFactory::HostContainerEgressRegistrar {
+ public:
+  RevocableContainerEgress(
+      kj::Own<HostContainerEgressRegistrar> inner, kj::Own<RevokerMembrane> membrane)
+      : inner(kj::mv(inner)),
+        membrane(kj::mv(membrane)) {}
+  kj::Promise<void> registerEgress(uint16_t methodId,
+      kj::String hostPort,
+      kj::Own<IoChannelFactory::SubrequestChannel> channel) override {
+    return inner->registerEgress(methodId, kj::mv(hostPort), kj::mv(channel))
+        .exclusiveJoin(KJ_ASSERT_NONNULL(membrane->onRevoked()))
+        .catch_([](kj::Exception&&) { JSG_FAIL_REQUIRE(Error, "Container operation failed."); })
+        .attach(kj::addRef(*this));
+  }
+
+ private:
+  kj::Own<HostContainerEgressRegistrar> inner;
+  kj::Own<RevokerMembrane> membrane;
+};
+
 class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChannel {
  public:
   HostContainerChannelImpl(
@@ -147,11 +167,11 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
     weakSelf->invalidate();
   }
 
-  rpc::Container::Client attach(
+  IoChannelFactory::HostContainerAttachment attach(
       HostContainerOwner& child, kj::Own<IoChannelFactory::SubrequestChannel> outbound) override {
     JSG_REQUIRE(!revoked && origin->tryGet() != kj::none, Error,
         "The Container attachment grant has been revoked.");
-    auto client = child.attachHostContainer(owner,
+    auto attachment = child.attachHostContainer(owner,
         [weak = weakSelf->addRef()](bool start, bool stop, bool completed, kj::String startup,
             kj::String expectedLeaseKey, bool monitor) mutable {
       auto& self =
@@ -163,8 +183,9 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
           .attach(kj::addRef(self));
     },
         kj::mv(outbound));
-    attached = capnp::membrane(kj::mv(client), kj::addRef(*membrane));
-    return KJ_ASSERT_NONNULL(attached);
+    attached = capnp::membrane(kj::mv(attachment.client), kj::addRef(*membrane));
+    return {KJ_ASSERT_NONNULL(attached),
+      kj::refcounted<RevocableContainerEgress>(kj::mv(attachment.egress), kj::addRef(*membrane))};
   }
   kj::Promise<void> start() override {
     JSG_REQUIRE(!revoked && origin->tryGet() != kj::none, Error,

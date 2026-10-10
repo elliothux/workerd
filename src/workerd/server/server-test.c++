@@ -2628,7 +2628,7 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
         modules = [(name = "host.js", esModule =
           `import { DurableObject } from 'cloudflare:workers';
           `let births = 0; const grants = [];
-          `const source = "import { DurableObject } from 'cloudflare:workers'; export class Tenant extends DurableObject { constructor(ctx, env) { super(ctx, env); this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); } async fetch(request) { if (new URL(request.url).pathname === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; export class Proxy extends WorkerEntrypoint { fetch() { return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
           `export class Host extends DurableObject {
           `  constructor(ctx, env) {
           `    super(ctx, env);
@@ -2636,15 +2636,20 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `    this.bind(ctx, env);
           `  }
           `  bind(ctx, env) {
-          `    this.grant = env.factory.getContainer(ctx.facets, 'Tenant', async (_start, stop, completed) => stop && completed ? undefined : ({
+          `    this.leaseActive = this.birth === 1 && this.replaced;
+          `    this.grant = env.factory.getContainer(ctx.facets, 'Tenant', async (_start, stop, completed) => {
+          `      if (stop && completed) { this.leaseActive = false; return undefined; }
+          `      if (_start) this.leaseActive = true;
+          `      if (!this.leaseActive) return undefined;
+          `      return ({
           `      leaseKey: (this.birth === 1 ? 'a' : '9').repeat(64), imageRef: 'sha256:' + 'b'.repeat(64),
           `      providerContractSha256: 'e'.repeat(64), controlToken: 'c'.repeat(64),
           `      callbackToken: 'd'.repeat(64), nativeStartupJson: '{}'
-          `    }));
+          `    }); });
           `    grants.push(this.grant);
           `    const loaded = env.loader.load({compatibilityDate:'2026-09-08',
           `      compatibilityFlags:[], mainModule:'tenant.js',
-          `      modules:{'tenant.js':source}, env:{}, openComputePrivateEnv:{},
+          `      modules:{'tenant.js':source}, env:{OUTBOUND_HOST: this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid'}, openComputePrivateEnv:{},
           `      openComputeHostPolicy:true, openComputeContainer:this.grant,
           `      globalOutbound:env.outbound});
           `    this.child = ctx.facets.get('tenant', () => ({
@@ -2652,13 +2657,33 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `  }
           `  async fetch(request) {
           `    if (new URL(request.url).pathname === '/replace') {
-          `      this.grant.revoke(); this.ctx.facets.abort('tenant', new Error('Code switched'));
-          `      this.bind(this.ctx, this.env);
+          `      this.grant.revoke();
+          `      if (await this.child.registerAfterRevoke()) throw new Error('Revoked facet registered an outbound callback');
+          `      this.ctx.facets.abort('tenant', new Error('Code switched'));
+          `      this.replaced = true; this.bind(this.ctx, this.env);
+          `      await this.child.fetch('http://tenant/prepare');
+          `    }
+          `    if (new URL(request.url).pathname === '/first' || new URL(request.url).pathname === '/start') {
+          `      const before = await this.env.engine.fetch('http://unit/stats').then(r => r.text());
+          `      await this.child.fetch('http://tenant/prepare');
+          `      const after = await this.env.engine.fetch('http://unit/stats').then(r => r.text());
+          `      if (before !== after) throw new Error('Pre-start registration reached the Engine');
+          `      if (new URL(request.url).pathname === '/first') await this.grant.start();
           `    }
           `    if (new URL(request.url).pathname === '/start') {
           `      let rejected = false; try { await grants[0].start(); } catch { rejected = true; }
           `      if (!rejected) throw new Error('Retired owner grant was accepted');
           `      await this.grant.start();
+          `    }
+          `    const dns = await this.env.outbound.fetch('http://127.0.0.1:39002/unit-dns').then(r => r.json());
+          `    const expectedHost = this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid';
+          `    if (new URL(request.url).pathname !== '/' && new URL(request.url).pathname !== '/stop' &&
+          `        (dns.length !== 1 || dns[0] !== '*')) {
+          `      throw new Error('Native outbound state was not refreshed');
+          `    }
+          `    if (new URL(request.url).pathname !== '/stop' && this.leaseActive) {
+          `      const response = await this.env.outbound.fetch('http://127.0.0.1:39002/unit-callback?host=' + expectedHost);
+          `      const actual = await response.text(); if (actual !== expectedHost) throw new Error('Wrong native callback owner: ' + actual);
           `    }
           `    const response = await this.child.fetch(request);
           `    return new Response(this.birth + ':' + await response.text());
@@ -2672,7 +2697,8 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           (name = "objects", durableObjectNamespace = "Host"),
           (name = "factory", workerLoader = (factory = true)),
           (name = "loader", workerLoader = ()),
-          (name = "outbound", service = "network")
+          (name = "outbound", service = "network"),
+          (name = "engine", service = "docker")
         ],
         durableObjectNamespaces = [(className = "Host", uniqueKey = "owner", enableSql = true)],
         durableObjectStorage = (localDisk = "storage"),
@@ -2685,10 +2711,13 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
       (name = "docker", worker = (
         compatibilityDate = "2026-09-08",
         modules = [(name = "docker.js", esModule =
-          `const states = new Map([['a'.repeat(64),true],['a'.repeat(64)+'-proxy',true]]);
+          `const states = new Map(); let requests = 0;
           `export default {async fetch(request) {
           `  await request.arrayBuffer();
           `  const path = new URL(request.url).pathname; const name = path.split('/')[2];
+          `  if (path === '/stats') return new Response(String(requests));
+          `  ++requests;
+          `  if (path.endsWith('/archive')) return new Response(null,{status:200});
           `  if (path === '/containers/create') return Response.json({Id:new URL(request.url).searchParams.get('name')},{status:201});
           `  if (path.endsWith('/start')) { states.set(name,true); return new Response(null,{status:204}); }
           `  if (path === '/volumes') return Response.json({Volumes:[]});
@@ -2705,10 +2734,11 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
       (name = "sidecar", worker = (
         compatibilityDate = "2026-09-08",
         modules = [(name = "sidecar.js", esModule =
-          `let idle = 0;
-          `export default {async connect(socket) {
-          `  const reader = socket.readable.getReader();
-          `  const writer = socket.writable.getWriter();
+          `import { DurableObject } from 'cloudflare:workers';
+          `let idle = 0; let dns = []; const channels = []; let ready;
+          `export class Sidecar extends DurableObject {async serve(readable, writable) {
+          `  const reader = readable.getReader();
+          `  const writer = writable.getWriter();
           `  let request = '';
           `  while (!request.includes('\r\n\r\n')) {
           `    const part = await reader.read();
@@ -2728,15 +2758,44 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
           `    try {
           `    if (idle > 16) await scheduler.wait(3600000);
           `    await writer.write(new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'));
-          `    await reader.read();
+          `    let release; const done = new Promise(resolve => { release = resolve; });
+          `    const first = reader.read();
+          `    const channel = {reader, writer, first, release}; channels.push(channel); if (ready) { ready(); ready = undefined; }
+          `    first.then(part => { if (part.done) { const index = channels.indexOf(channel); if (index >= 0) channels.splice(index,1); release(); } });
+          `    await done;
           `    } finally { --idle; }
           `  } else {
-          `    const body = request.startsWith('GET /ca ') ? 'unit protocol certificate' : '';
+          `    if (request.startsWith('GET /unit-callback?')) {
+          `      const host = new URL('http://unit' + request.split(' ')[1]).searchParams.get('host');
+          `      let result;
+          `      for (let attempt = 0; attempt < 32; ++attempt) {
+          `        const channel = channels.shift();
+          `        if (!channel) { await new Promise(resolve => { ready = resolve; }); continue; }
+          `        try {
+          `          await channel.writer.write(new TextEncoder().encode('CONNECT 203.0.113.1:80 HTTP/1.1\r\nHost: 203.0.113.1:80\r\nX-Hostname: ' + host + '\r\nX-Proto: http\r\nX-Open-Compute-Container-Callback: ' + 'd'.repeat(64) + '\r\n\r\n'));
+          `          let response = new TextDecoder().decode((await channel.first).value);
+          `          while (!response.includes('\r\n\r\n')) { const part = await channel.reader.read(); if(part.done) throw new Error('Callback closed'); response += new TextDecoder().decode(part.value); }
+          `          if (!response.startsWith('HTTP/1.1 200 ')) throw new Error('Callback CONNECT rejected');
+          `          await channel.writer.write(new TextEncoder().encode('GET / HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n'));
+          `          let inner = ''; for (;;) { const part = await channel.reader.read(); if (part.done) break; inner += new TextDecoder().decode(part.value); const end = inner.indexOf('\r\n\r\n'); if (end >= 0) { const size = inner.slice(0,end).match(/content-length: (\d+)/i); if ((size && inner.length >= end+4+Number(size[1])) || /\r\n0\r\n\r\n$/.test(inner)) break; } } await channel.writer.close();
+          `          result = inner.slice(inner.indexOf('\r\n\r\n') + 4); if (/transfer-encoding: chunked/i.test(inner)) { let rest = result; result = ''; for (;;) { const end = rest.indexOf('\r\n'); const length = parseInt(rest.slice(0,end),16); if (!length) break; result += rest.slice(end+2,end+2+length); rest = rest.slice(end+2+length+2); } } break;
+          `        } catch {} finally { channel.release(); }
+          `      }
+          `      const body = result ?? 'callback failed';
+          `      await writer.write(new TextEncoder().encode('HTTP/1.1 200 OK\r\nContent-Length: ' + body.length + '\r\n\r\n' + body));
+          `      await writer.close(); return;
+          `    }
+          `    if (request.startsWith('PUT /egress ')) { const config = JSON.parse(request.slice(headerEnd)); if (config.dns) dns = config.dns.allowHostnames; }
+          `    const body = request.startsWith('GET /ca ') ? 'unit protocol certificate' : request.startsWith('GET /unit-dns ') ? JSON.stringify(dns) : '';
           `    await writer.write(new TextEncoder().encode('HTTP/1.1 200 OK\r\nContent-Length: ' + body.length + '\r\n\r\n' + body));
           `    await writer.close();
           `  }
           `}};
-        )]
+          `export default {connect(socket, env) { return env.objects.get(env.objects.idFromName('sidecar')).serve(socket.readable, socket.writable); }};
+        )],
+        bindings = [(name = "objects", durableObjectNamespace = "Sidecar")],
+        durableObjectNamespaces = [(className = "Sidecar", uniqueKey = "unit-sidecar")],
+        durableObjectStorage = (localDisk = "storage")
       ))
     ],
     sockets = [
@@ -2749,7 +2808,7 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
   test.server.allowExperimental();
   test.start();
   auto conn = test.connect("test-addr");
-  conn.httpGet200("/", "1:true:1");
+  conn.httpGet200("/first", "1:true:1");
   test.wait(12);
   auto next = test.connect("test-addr");
   next.httpGet200("/", "1:true:2");

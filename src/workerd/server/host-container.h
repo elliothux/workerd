@@ -9,7 +9,8 @@
 namespace workerd::server {
 
 // Admission stays outside the engine client; returned native capabilities retain their RPC brands.
-class HostContainerRpc final: public capnp::Capability::Server {
+class HostContainerRpc final: public capnp::Capability::Server,
+                              public IoChannelFactory::HostContainerEgressRegistrar {
  public:
   class MutationQueue final: public kj::Refcounted {
    public:
@@ -33,9 +34,28 @@ class HostContainerRpc final: public capnp::Capability::Server {
   };
   using Resolve = kj::Function<kj::Promise<kj::Maybe<Resolved>>(
       bool, bool, bool, kj::String, kj::String, bool)>;
-  HostContainerRpc(Resolve resolve, kj::Own<MutationQueue> mutations)
+  using StageEgress = kj::Function<void(uint16_t, capnp::AnyPointer::Reader)>;
+  using RegisterNativeEgress = kj::Function<kj::Promise<void>(
+      bool, uint16_t, kj::String, kj::Own<IoChannelFactory::SubrequestChannel>)>;
+  HostContainerRpc(Resolve resolve,
+      kj::Own<MutationQueue> mutations,
+      StageEgress stageEgress,
+      RegisterNativeEgress registerNativeEgress)
       : resolve(kj::mv(resolve)),
-        mutations(kj::mv(mutations)) {}
+        mutations(kj::mv(mutations)),
+        stageEgress(kj::mv(stageEgress)),
+        registerNativeEgress(kj::mv(registerNativeEgress)) {}
+
+  kj::Promise<void> registerEgress(uint16_t methodId,
+      kj::String hostPort,
+      kj::Own<IoChannelFactory::SubrequestChannel> channel) override {
+    KJ_REQUIRE(methodId == 8 || methodId == 9 || methodId == 13);
+    auto turn = mutations->take();
+    KJ_DEFER(turn.fulfiller->fulfill());
+    co_await turn.promise;
+    auto target = co_await resolve(false, false, false, kj::str(""), kj::str(""), false);
+    co_await registerNativeEgress(target != kj::none, methodId, kj::mv(hostPort), kj::mv(channel));
+  }
 
   DispatchCallResult dispatchCall(uint64_t interfaceId,
       uint16_t methodId,
@@ -54,7 +74,8 @@ class HostContainerRpc final: public capnp::Capability::Server {
     JSG_REQUIRE(methodId != 10 && methodId != 11, Error, "Container snapshots are unavailable.");
     kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> mutation;
     KJ_DEFER(if (mutation != kj::none) KJ_ASSERT_NONNULL(mutation)->fulfill());
-    if (methodId == 1 || methodId == 3) {
+    bool egress = methodId == 8 || methodId == 9 || methodId == 13;
+    if (methodId == 1 || methodId == 3 || egress) {
       auto turn = mutations->take();
       mutation = kj::mv(turn.fulfiller);
       co_await turn.promise;
@@ -81,6 +102,18 @@ class HostContainerRpc final: public capnp::Capability::Server {
         context.getResults().initAs<rpc::Container::StatusResults>().setRunning(false);
       else
         context.getResults().initAs<rpc::Container::DestroyResults>();
+      co_return;
+    }
+    if (client == kj::none && egress) {
+      // Official interception registration precedes start(). Authority was checked above, but
+      // no lease or engine object exists yet. Register in the owner's native egress state.
+      stageEgress(methodId, context.getParams());
+      if (methodId == 8)
+        context.getResults().initAs<rpc::Container::SetEgressHttpResults>();
+      else if (methodId == 9)
+        context.getResults().initAs<rpc::Container::SetEgressHttpsResults>();
+      else
+        context.getResults().initAs<rpc::Container::SetEgressTcpResults>();
       co_return;
     }
     auto& target = JSG_REQUIRE_NONNULL(client, Error, "The Container is not running.");
@@ -113,6 +146,8 @@ class HostContainerRpc final: public capnp::Capability::Server {
   kj::Maybe<kj::String> startedLeaseKey;
   Resolve resolve;
   kj::Own<MutationQueue> mutations;
+  StageEgress stageEgress;
+  RegisterNativeEgress registerNativeEgress;
 };
 
 }  // namespace workerd::server

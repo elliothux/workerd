@@ -297,9 +297,15 @@ void ExecProcess::resize(jsg::Lock& js, int cols, int rows) {
 // =======================================================================================
 // Basic lifecycle methods
 
-Container::Container(rpc::Container::Client rpcClient, bool running, jsg::Dict<kj::String> images)
+Container::Container(rpc::Container::Client rpcClient,
+    bool running,
+    jsg::Dict<kj::String> images,
+    kj::Maybe<kj::Own<IoChannelFactory::HostContainerEgressRegistrar>> registrar)
     : rpcClient(IoContext::current().addObject(kj::heap(kj::mv(rpcClient)))),
       images(kj::mv(images)) {
+  KJ_IF_SOME(value, registrar) {
+    hostEgressRegistrar = IoContext::current().addObject(kj::mv(value));
+  }
   if (running) startMonitor();
 }
 
@@ -620,6 +626,9 @@ jsg::Promise<void> Container::interceptOutboundHttp(
     jsg::Lock& js, kj::String addr, jsg::Ref<Fetcher> binding) {
   auto& ioctx = IoContext::current();
   auto channel = binding->getSubrequestChannel(ioctx);
+  KJ_IF_SOME(registrar, hostEgressRegistrar) {
+    return ioctx.awaitIo(js, registrar->registerEgress(8, kj::mv(addr), kj::mv(channel)));
+  }
   return ioctx.awaitIo(js, interceptOutboundHttpImpl(*rpcClient, kj::mv(addr), kj::mv(channel)));
 }
 
@@ -640,6 +649,11 @@ kj::Promise<void> Container::interceptOutboundHttpImpl(rpc::Container::Client rp
 jsg::Promise<void> Container::interceptAllOutboundHttp(jsg::Lock& js, jsg::Ref<Fetcher> binding) {
   auto& ioctx = IoContext::current();
   auto channel = binding->getSubrequestChannel(ioctx);
+  KJ_IF_SOME(registrar, hostEgressRegistrar) {
+    auto ipv4 = registrar->registerEgress(8, kj::str("0.0.0.0/0"), kj::addRef(*channel));
+    auto ipv6 = registrar->registerEgress(8, kj::str("::/0"), kj::mv(channel));
+    return ioctx.awaitIo(js, kj::joinPromisesFailFast(kj::arr(kj::mv(ipv4), kj::mv(ipv6))));
+  }
   return ioctx.awaitIo(js, interceptAllOutboundHttpImpl(*rpcClient, kj::mv(channel)));
 }
 
@@ -665,6 +679,9 @@ jsg::Promise<void> Container::interceptOutboundHttps(
     jsg::Lock& js, kj::String addr, jsg::Ref<Fetcher> binding) {
   auto& ioctx = IoContext::current();
   auto channel = binding->getSubrequestChannel(ioctx);
+  KJ_IF_SOME(registrar, hostEgressRegistrar) {
+    return ioctx.awaitIo(js, registrar->registerEgress(9, kj::mv(addr), kj::mv(channel)));
+  }
   return ioctx.awaitIo(js, interceptOutboundHttpsImpl(*rpcClient, kj::mv(addr), kj::mv(channel)));
 }
 
@@ -802,7 +819,7 @@ jsg::Promise<jsg::Ref<ExecProcess>> Container::exec(
           [&ioContext, &byteStreamFactory, options = kj::mv(options), ptyEnabled,
               stdoutInput = kj::mv(stdoutInput), stderrInput = kj::mv(stderrInput)](
               jsg::Lock& js, capnp::Response<rpc::Container::ExecResults> results) mutable
-          -> jsg::Ref<ExecProcess> {
+              -> jsg::Ref<ExecProcess> {
     auto process = results.getProcess();
     auto handle = process.getHandle();
     auto pid = process.getPid();
@@ -869,6 +886,9 @@ jsg::Promise<void> Container::interceptOutboundTcp(
     jsg::Lock& js, kj::String addr, jsg::Ref<Fetcher> binding) {
   auto& ioctx = IoContext::current();
   auto channel = binding->getSubrequestChannel(ioctx);
+  KJ_IF_SOME(registrar, hostEgressRegistrar) {
+    return ioctx.awaitIo(js, registrar->registerEgress(13, kj::mv(addr), kj::mv(channel)));
+  }
   return ioctx.awaitIo(js, interceptOutboundTcpImpl(*rpcClient, kj::mv(addr), kj::mv(channel)));
 }
 

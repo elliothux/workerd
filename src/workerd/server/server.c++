@@ -799,6 +799,9 @@ class Server::ActorNamespace final {
     }
 
     void revokeHostContainerCallbacks() override {
+      KJ_IF_SOME(state, hostContainerEgress) {
+        state->revoke();
+      }
       KJ_IF_SOME(client, hostContainerClient) {
         client->revokeHostCallbacks();
       }
@@ -849,6 +852,7 @@ class Server::ActorNamespace final {
       revokeHostContainerCallbacks();
       hostContainerClient = kj::none;
       hostContainerLease = kj::none;
+      hostContainerEgress = kj::none;
       if (hasHostContainerAttachment) {
         // Its loaded class contains an owner-scoped grant. Retire that class with the Root so
         // the next owner attaches a fresh grant, while retaining the facet's durable storage.
@@ -857,17 +861,71 @@ class Server::ActorNamespace final {
       }
     }
 
-    rpc::Container::Client attachHostContainer(HostContainerOwner& owner,
+    void setHostContainerEgressRegistrar(
+        kj::Own<IoChannelFactory::HostContainerEgressRegistrar> registrar) override {
+      JSG_REQUIRE(parent != kj::none && key == "tenant", Error,
+          "Container attachment requires a host-owned tenant facet.");
+      hostContainerRegistrar = kj::mv(registrar);
+    }
+    kj::Maybe<kj::Own<IoChannelFactory::HostContainerEgressRegistrar>>
+    getHostContainerEgressRegistrar() override {
+      KJ_IF_SOME(registrar, hostContainerRegistrar) { return kj::addRef(*registrar); }
+      return kj::none;
+    }
+    IoChannelFactory::HostContainerAttachment attachHostContainer(HostContainerOwner& owner,
         ResolveHostContainerLease resolve,
         kj::Own<IoChannelFactory::SubrequestChannel> outbound) override {
       JSG_REQUIRE(parent != kj::none && &KJ_ASSERT_NONNULL(parent) == &owner && &root == &owner &&
               key == "tenant",
           Error, "Container attachments require the host's declared tenant facet.");
       root.hasHostContainerAttachment = true;
+      root.revokeHostContainerCallbacks();
+      root.hostContainerEgress = kj::refcounted<ContainerClient::EgressState>();
+      auto staged = kj::addRef(*KJ_ASSERT_NONNULL(root.hostContainerEgress));
+      auto stageEgress = [weak = root.weakSelf->addRef(), state = kj::addRef(*staged)](
+                             uint16_t method, capnp::AnyPointer::Reader params) mutable {
+        auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
+                KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == state.get(),
+            Error, "Container execution authority changed.");
+        if (method == 8) {
+          auto args = params.getAs<rpc::Container::SetEgressHttpParams>();
+          state->registerMapping(owner.ns.channelTokenHandler, EgressProtocol::HTTP,
+              args.getHostPort(), args.getChannelToken());
+        } else if (method == 9) {
+          auto args = params.getAs<rpc::Container::SetEgressHttpsParams>();
+          state->registerMapping(owner.ns.channelTokenHandler, EgressProtocol::HTTPS,
+              args.getHostPort(), args.getChannelToken());
+        } else {
+          KJ_REQUIRE(method == 13);
+          auto args = params.getAs<rpc::Container::SetEgressTcpParams>();
+          state->registerMapping(owner.ns.channelTokenHandler, EgressProtocol::TCP,
+              args.getHostPort(), args.getChannelToken());
+        }
+      };
+      auto registerNativeEgress =
+          [weak = root.weakSelf->addRef(), state = kj::addRef(*staged)](bool admitted,
+              uint16_t method, kj::String hostPort,
+              kj::Own<IoChannelFactory::SubrequestChannel> channel) mutable -> kj::Promise<void> {
+        auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
+                KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == state.get(),
+            Error, "Container execution authority changed.");
+        auto protocol = method == 8 ? EgressProtocol::HTTP
+            : method == 9           ? EgressProtocol::HTTPS
+                                    : EgressProtocol::TCP;
+        if (admitted) {
+          co_await KJ_ASSERT_NONNULL(owner.hostContainerClient)
+              ->registerHostEgress(protocol, hostPort, kj::mv(channel));
+        } else {
+          state->registerMapping(protocol, hostPort, kj::mv(channel));
+        }
+      };
       auto weak = root.weakSelf->addRef();
       auto getClient =
-          [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound)](bool start,
-              bool stop, bool completed, kj::String startup, kj::String expectedLeaseKey,
+          [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound),
+              staged = kj::mv(staged)](bool start, bool stop, bool completed, kj::String startup,
+              kj::String expectedLeaseKey,
               bool monitor) mutable -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
         // A tenant RPC belongs to the stable Root. Keep that owner's existing request tracker
         // active across admission and the actual native operation, including a pending monitor.
@@ -877,6 +935,9 @@ class Server::ActorNamespace final {
         auto lease = co_await resolve(
             start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor);
         auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
+                KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == staged.get(),
+            Error, "Container execution authority changed.");
         if (stop && completed) {
           owner.revokeHostContainerCallbacks();
           owner.hostContainerClient = kj::none;
@@ -892,6 +953,7 @@ class Server::ActorNamespace final {
             KJ_ASSERT_NONNULL(owner.hostContainerClient)
                 ->setHostCredentials(
                     kj::str(identity.controlToken), kj::str(identity.callbackToken));
+            KJ_ASSERT_NONNULL(owner.hostContainerClient)->setHostEgressState(kj::addRef(*staged));
             co_return HostContainerRpc::Resolved{
               rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
               kj::str(identity.leaseKey), kj::mv(activity)};
@@ -901,14 +963,17 @@ class Server::ActorNamespace final {
             kj::StringPtr(identity.imageRef), ContainerPrivileges{}, kj::addRef(*outbound));
         KJ_ASSERT_NONNULL(owner.hostContainerClient)
             ->setHostCredentials(kj::str(identity.controlToken), kj::str(identity.callbackToken));
+        KJ_ASSERT_NONNULL(owner.hostContainerClient)->setHostEgressState(kj::addRef(*staged));
         owner.hostContainerLease = kj::mv(identity);
         co_return HostContainerRpc::Resolved{
           rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
           kj::str(KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey), kj::mv(activity)};
       };
-      capnp::Capability::Client grant(
-          kj::heap<HostContainerRpc>(kj::mv(getClient), kj::addRef(*root.hostContainerMutations)));
-      return grant.castAs<rpc::Container>();
+      auto server = kj::refcounted<HostContainerRpc>(kj::mv(getClient),
+          kj::addRef(*root.hostContainerMutations), kj::mv(stageEgress),
+          kj::mv(registerNativeEgress));
+      capnp::Capability::Client grant(kj::addRef(*server));
+      return {grant.castAs<rpc::Container>(), kj::mv(server)};
     }
 
     kj::Own<IoChannelFactory::ActorChannel> getFacet(
@@ -1020,6 +1085,8 @@ class Server::ActorNamespace final {
     bool hasHostContainerAttachment = false;
     kj::Maybe<HostContainerLease> hostContainerLease;
     kj::Maybe<kj::Own<ContainerClient>> hostContainerClient;
+    kj::Maybe<kj::Own<ContainerClient::EgressState>> hostContainerEgress;
+    kj::Maybe<kj::Own<IoChannelFactory::HostContainerEgressRegistrar>> hostContainerRegistrar;
     kj::Own<HostContainerRpc::MutationQueue> hostContainerMutations =
         kj::refcounted<HostContainerRpc::MutationQueue>();
     kj::Own<WeakRef<ActorContainer>> weakSelf =
@@ -6548,11 +6615,14 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
               KJ_ASSERT_NONNULL(entrypointName) == grant->getClassName()) {
             JSG_REQUIRE(
                 container == kj::none, Error, "Container attachment is already configured.");
-            container =
+            auto attachment =
                 grant->attach(JSG_REQUIRE_NONNULL(facetManager, Error,
                                   "Container attachment requires a host-owned tenant facet."),
                     kj::addRef(*JSG_REQUIRE_NONNULL(isolate->containerOutbound, Error,
                         "Container attachment requires the tenant outbound capability.")));
+            container = kj::mv(attachment.client);
+            KJ_ASSERT_NONNULL(facetManager)
+                .setHostContainerEgressRegistrar(kj::mv(attachment.egress));
           }
         }
         return getInner().newActor(tracker, kj::mv(actorId), kj::mv(makeActorCache),

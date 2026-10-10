@@ -198,7 +198,8 @@ class Container: public jsg::Object {
  public:
   Container(rpc::Container::Client rpcClient,
       bool running,
-      jsg::Dict<kj::String> images = jsg::Dict<kj::String>{});
+      jsg::Dict<kj::String> images = jsg::Dict<kj::String>{},
+      kj::Maybe<kj::Own<IoChannelFactory::HostContainerEgressRegistrar>> registrar = kj::none);
 
   struct DirectorySnapshot {
     kj::String id;
@@ -391,6 +392,7 @@ class Container: public jsg::Object {
 
  private:
   IoOwn<rpc::Container::Client> rpcClient;
+  kj::Maybe<IoOwn<IoChannelFactory::HostContainerEgressRegistrar>> hostEgressRegistrar;
   jsg::Dict<kj::String> images;
 
   struct Monitor final {

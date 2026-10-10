@@ -1105,7 +1105,7 @@ struct ContainerClient::EgressMapping {
 
 // Holds all egress mapping state. Stored via kj::Own<EgressState> in ContainerClient
 // so that the EgressMapping type is not visible in container-client.h.
-struct ContainerClient::EgressState {
+struct ContainerClient::EgressState::Data {
   kj::Vector<EgressMapping> mappings;
   kj::Canceler callbacks;
 };
@@ -1137,7 +1137,7 @@ ContainerClient::ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
       pendingCleanup(kj::mv(pendingCleanup).fork()),
       cleanupCallback(kj::mv(cleanupCallback)),
       channelTokenHandler(channelTokenHandler),
-      egressState(kj::heap<EgressState>()) {
+      egressState(kj::refcounted<EgressState>()) {
   if (this->outbound == kj::none && !staleSnapshotVolumeCheckScheduled.exchange(true)) {
     waitUntilTasks.add(warnAboutStaleSnapshotVolumes(network, kj::str(this->dockerPath))
             .catch_([](kj::Exception&& e) {
@@ -1146,9 +1146,23 @@ ContainerClient::ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
   }
 }
 
+ContainerClient::EgressState::EgressState(): data(kj::heap<Data>()) {}
+ContainerClient::EgressState::~EgressState() noexcept(false) {}
+
+void ContainerClient::EgressState::revoke() {
+  data->callbacks.cancel("Container attachment revoked.");
+  data->mappings.clear();
+}
+
+void ContainerClient::setHostEgressState(kj::Own<EgressState> state) {
+  JSG_REQUIRE(outbound != kj::none, Error, "The Container has no host attachment.");
+  if (state.get() == egressState.get()) return;
+  revokeHostCallbacks();
+  egressState = kj::mv(state);
+}
+
 void ContainerClient::revokeHostCallbacks() {
-  egressState->callbacks.cancel("Container attachment revoked.");
-  egressState->mappings.clear();
+  egressState->revoke();
   reverseCallbackTask = kj::none;
 }
 
@@ -1262,7 +1276,7 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
     auto downPump =
         connectionRef.pumpTo(downEndRef).then([&downEndRef](uint64_t) { return downEndRef.end(); });
 
-    pumpTasks.add(containerClient.egressState->callbacks.wrap(
+    pumpTasks.add(containerClient.egressState->data->callbacks.wrap(
         kj::joinPromisesFailFast(kj::arr(kj::mv(upPump), kj::mv(downPump)))
             .attach(kj::mv(httpClient), kj::mv(upEnd), kj::mv(connection), kj::mv(downEnd))));
     co_return;
@@ -1317,7 +1331,7 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       // always combined into stdout when a PTY is active, so there is no separate stderr stream.
       auto task = copyRawExecOutput(*sharedConnection->connection, kj::mv(stdoutStream))
                       .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
-      streamClosedTask = this->containerClient->egressState->callbacks
+      streamClosedTask = this->containerClient->egressState->data->callbacks
                              .wrap(kj::mv(task).attach(
                                  kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
         shared->disconnect();
@@ -1338,7 +1352,7 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
         *sharedConnection->connection, kj::mv(stdoutStream), kj::mv(stderrStream), combinedOutput)
                     .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
     streamClosedTask =
-        this->containerClient->egressState->callbacks
+        this->containerClient->egressState->data->callbacks
             .wrap(kj::mv(task).attach(kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
       shared->disconnect();
     }))).fork();
@@ -1508,7 +1522,7 @@ class EgressHttpService final: public kj::HttpService {
       kj::AsyncIoStream& connection,
       ConnectResponse& response,
       kj::HttpConnectSettings settings) override {
-    return containerClient.egressState->callbacks.wrap(
+    return containerClient.egressState->data->callbacks.wrap(
         connectImpl(host, headers, connection, response, settings));
   }
 
@@ -2719,7 +2733,7 @@ kj::Promise<void> ContainerClient::start(StartContext context) {
   caCertInjected.store(false, std::memory_order_release);
   co_await createContainer(image, entrypoint, environment, restoreMounts.asPtr(), params);
 
-  for (auto& mapping: egressState->mappings) {
+  for (auto& mapping: egressState->data->mappings) {
     if (mapping.protocol == EgressProtocol::HTTPS) {
       co_await injectCACert();
       break;
@@ -3008,8 +3022,8 @@ kj::Promise<void> ContainerClient::listenTcp(ListenTcpContext context) {
   KJ_UNIMPLEMENTED("listenTcp not implemented for Docker containers - use port mapping instead");
 }
 
-void ContainerClient::upsertEgressMapping(EgressMapping mapping) {
-  for (auto& m: egressState->mappings) {
+void ContainerClient::EgressState::upsert(EgressMapping mapping) {
+  for (auto& m: data->mappings) {
     // If the mapping differs in port or protocol, we skip it as it's
     // not the same.
     if (m.port != mapping.port || m.protocol != mapping.protocol) {
@@ -3036,14 +3050,46 @@ void ContainerClient::upsertEgressMapping(EgressMapping mapping) {
     }
   }
 
-  egressState->mappings.add(kj::mv(mapping));
+  data->mappings.add(kj::mv(mapping));
+}
+
+ContainerClient::EgressMapping ContainerClient::prepareEgressMapping(ChannelTokenHandler& tokens,
+    EgressProtocol protocol,
+    kj::StringPtr hostPort,
+    kj::ArrayPtr<const byte> token) {
+  return prepareEgressMapping(protocol, hostPort,
+      tokens.decodeSubrequestChannelToken(
+          workerd::IoChannelFactory::ChannelTokenUsage::RPC, token));
+}
+
+ContainerClient::EgressMapping ContainerClient::prepareEgressMapping(EgressProtocol protocol,
+    kj::StringPtr hostPort,
+    kj::Own<IoChannelFactory::SubrequestChannel> channel) {
+  auto parsed = parseHostPort(hostPort);
+  auto port = parsed.port.orDefault(protocol == EgressProtocol::TCP ? 0
+          : protocol == EgressProtocol::HTTPS                       ? 443
+                                                                    : 80);
+  return EgressMapping{kj::mv(parsed.destination), port, protocol, kj::mv(channel)};
+}
+
+void ContainerClient::EgressState::registerMapping(EgressProtocol protocol,
+    kj::StringPtr hostPort,
+    kj::Own<IoChannelFactory::SubrequestChannel> channel) {
+  upsert(prepareEgressMapping(protocol, hostPort, kj::mv(channel)));
+}
+
+void ContainerClient::EgressState::registerMapping(ChannelTokenHandler& tokens,
+    EgressProtocol protocol,
+    kj::StringPtr hostPort,
+    kj::ArrayPtr<const byte> token) {
+  upsert(prepareEgressMapping(tokens, protocol, hostPort, token));
 }
 
 kj::Vector<kj::String> ContainerClient::getDnsAllowHostnames() const {
-  // result N can be at most size of egressState->mappings.
+  // result N can be at most size of egressState->data->mappings.
   kj::Vector<kj::String> result;
 
-  for (auto& mapping: egressState->mappings) {
+  for (auto& mapping: egressState->data->mappings) {
     KJ_SWITCH_ONEOF(mapping.destination) {
       KJ_CASE_ONEOF(_, kj::CidrRange) {
         result.add(kj::str("*"));
@@ -3082,7 +3128,7 @@ kj::Maybe<kj::Own<workerd::IoChannelFactory::SubrequestChannel>> ContainerClient
     normalizedHostname = normalizeHostname(hostnameValue);
   }
 
-  for (auto& mapping: egressState->mappings) {
+  for (auto& mapping: egressState->data->mappings) {
     // Mappings can differ in port, protocol and the cidr/hostname.
     // Users can specify things like google.com:7070, or 0.0.0.0:7070. On top of that,
     // they might want TLS interception (HTTPS) or raw TCP forwarding.
@@ -3177,7 +3223,7 @@ kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::connectReverseCallback(
 kj::Promise<void> ContainerClient::serveReverseCallbacks(kj::Own<kj::AsyncIoStream> connection) {
   for (;;) {
     if (connection.get() != nullptr) {
-      waitUntilTasks.add(egressState->callbacks
+      waitUntilTasks.add(egressState->data->callbacks
               .wrap(KJ_ASSERT_NONNULL(egressHttpServer)->listenHttp(kj::mv(connection)))
               .catch_([](kj::Exception&&) {
       }).attach(addRef()));
@@ -3199,7 +3245,7 @@ kj::Promise<void> ContainerClient::serveReverseCallbacks(kj::Own<kj::AsyncIoStre
 kj::Promise<void> ContainerClient::ensureReverseCallbacks() {
   if (outbound == kj::none || reverseCallbackTask != kj::none) co_return;
   auto connection = co_await timer.timeoutAfter(5 * kj::SECONDS, connectReverseCallback());
-  reverseCallbackTask = egressState->callbacks.wrap(serveReverseCallbacks(kj::mv(connection)))
+  reverseCallbackTask = egressState->data->callbacks.wrap(serveReverseCallbacks(kj::mv(connection)))
                             .eagerlyEvaluate([](kj::Exception&&) {
     KJ_LOG(ERROR, "Container reverse callback channel ended.");
   });
@@ -3222,112 +3268,54 @@ kj::Promise<void> ContainerClient::ensureEgressListenerStarted(uint16_t port) {
   succeeded = true;
 }
 
+kj::Promise<void> ContainerClient::applyEgressMapping(EgressMapping mapping) {
+  co_await ensureEgressListenerStarted();
+  if (containerStarted.load(std::memory_order_acquire)) {
+    if (mapping.protocol == EgressProtocol::HTTPS)
+      co_await injectCACert();
+    else
+      co_await ensureSidecarStarted();
+  }
+  egressState->upsert(kj::mv(mapping));
+  KJ_IF_SOME(port, sidecarIngressHostPort) {
+    co_await updateSidecarEgressConfig(port, egressListenerPort);
+  }
+}
+
+kj::Promise<void> ContainerClient::registerHostEgress(EgressProtocol protocol,
+    kj::StringPtr hostPort,
+    kj::Own<IoChannelFactory::SubrequestChannel> channel) {
+  auto [ready, done] = getRpcTurn();
+  co_await ready;
+  KJ_DEFER(done->fulfill());
+  co_await applyEgressMapping(prepareEgressMapping(protocol, hostPort, kj::mv(channel)));
+}
+
 kj::Promise<void> ContainerClient::setEgressHttp(SetEgressHttpContext context) {
   auto [ready, done] = getRpcTurn();
   co_await ready;
   KJ_DEFER(done->fulfill());
-
   auto params = context.getParams();
-  auto hostPortStr = kj::str(params.getHostPort());
-  auto tokenBytes = params.getChannelToken();
-
-  auto parsed = parseHostPort(hostPortStr);
-  uint16_t port = parsed.port.orDefault(80);
-
-  co_await ensureEgressListenerStarted();
-
-  if (containerStarted.load(std::memory_order_acquire)) {
-    // Only try to create and start a sidecar container
-    // if the user container is running.
-    co_await ensureSidecarStarted();
-  }
-
-  auto subrequestChannel = channelTokenHandler.decodeSubrequestChannelToken(
-      workerd::IoChannelFactory::ChannelTokenUsage::RPC, tokenBytes);
-
-  upsertEgressMapping(EgressMapping{
-    .destination = kj::mv(parsed.destination),
-    .port = port,
-    .protocol = EgressProtocol::HTTP,
-    .channel = kj::mv(subrequestChannel),
-  });
-
-  KJ_IF_SOME(ingressHostPort, sidecarIngressHostPort) {
-    co_await updateSidecarEgressConfig(ingressHostPort, egressListenerPort);
-  }
-
-  co_return;
+  co_await applyEgressMapping(prepareEgressMapping(
+      channelTokenHandler, EgressProtocol::HTTP, params.getHostPort(), params.getChannelToken()));
 }
 
 kj::Promise<void> ContainerClient::setEgressHttps(SetEgressHttpsContext context) {
   auto [ready, done] = getRpcTurn();
   co_await ready;
   KJ_DEFER(done->fulfill());
-
   auto params = context.getParams();
-  auto hostPortStr = kj::str(params.getHostPort());
-  auto tokenBytes = params.getChannelToken();
-
-  auto parsed = parseHostPort(hostPortStr);
-  uint16_t port = parsed.port.orDefault(443);
-
-  co_await ensureEgressListenerStarted();
-
-  if (containerStarted.load(std::memory_order_acquire)) {
-    co_await injectCACert();
-  }
-
-  auto subrequestChannel = channelTokenHandler.decodeSubrequestChannelToken(
-      workerd::IoChannelFactory::ChannelTokenUsage::RPC, tokenBytes);
-
-  upsertEgressMapping(EgressMapping{
-    .destination = kj::mv(parsed.destination),
-    .port = port,
-    .protocol = EgressProtocol::HTTPS,
-    .channel = kj::mv(subrequestChannel),
-  });
-
-  KJ_IF_SOME(ingressHostPort, sidecarIngressHostPort) {
-    co_await updateSidecarEgressConfig(ingressHostPort, egressListenerPort);
-  }
-
-  co_return;
+  co_await applyEgressMapping(prepareEgressMapping(
+      channelTokenHandler, EgressProtocol::HTTPS, params.getHostPort(), params.getChannelToken()));
 }
 
 kj::Promise<void> ContainerClient::setEgressTcp(SetEgressTcpContext context) {
   auto [ready, done] = getRpcTurn();
   co_await ready;
   KJ_DEFER(done->fulfill());
-
   auto params = context.getParams();
-  auto hostPortStr = kj::str(params.getHostPort());
-  auto tokenBytes = params.getChannelToken();
-
-  auto parsed = parseHostPort(hostPortStr);
-  // For TCP, default to port 0 (match all ports) when no port is specified.
-  uint16_t port = parsed.port.orDefault(0);
-
-  co_await ensureEgressListenerStarted();
-
-  if (containerStarted.load(std::memory_order_acquire)) {
-    co_await ensureSidecarStarted();
-  }
-
-  auto subrequestChannel = channelTokenHandler.decodeSubrequestChannelToken(
-      workerd::IoChannelFactory::ChannelTokenUsage::RPC, tokenBytes);
-
-  upsertEgressMapping(EgressMapping{
-    .destination = kj::mv(parsed.destination),
-    .port = port,
-    .protocol = EgressProtocol::TCP,
-    .channel = kj::mv(subrequestChannel),
-  });
-
-  KJ_IF_SOME(ingressHostPort, sidecarIngressHostPort) {
-    co_await updateSidecarEgressConfig(ingressHostPort, egressListenerPort);
-  }
-
-  co_return;
+  co_await applyEgressMapping(prepareEgressMapping(
+      channelTokenHandler, EgressProtocol::TCP, params.getHostPort(), params.getChannelToken()));
 }
 
 kj::Own<ContainerClient> ContainerClient::addRef() {

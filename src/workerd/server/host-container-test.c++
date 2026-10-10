@@ -10,6 +10,15 @@
 namespace workerd::server {
 namespace {
 
+kj::Promise<void> rejectNativeEgress(
+    bool, uint16_t, kj::String, kj::Own<IoChannelFactory::SubrequestChannel>) {
+  KJ_FAIL_REQUIRE("Unexpected native egress registration");
+}
+
+void rejectPrestartEgress(uint16_t, capnp::AnyPointer::Reader) {
+  KJ_FAIL_ASSERT("Unexpected pre-start egress registration");
+}
+
 KJ_TEST("Container callback credentials reject missing duplicate stale and malformed headers") {
   kj::HttpHeaderTable table;
   kj::Maybe<kj::String> token =
@@ -30,7 +39,7 @@ KJ_TEST("Host Container status and destroy do not reserve an absent lease") {
   kj::EventLoop loop;
   kj::WaitScope wait(loop);
   uint calls = 0;
-  capnp::Capability::Client capability(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client capability(kj::refcounted<HostContainerRpc>(
       [&calls](bool start, bool stop, bool completed, kj::String startup,
           kj::String expectedLeaseKey, bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     KJ_EXPECT(!start && !completed && startup.size() == 0);
@@ -38,7 +47,7 @@ KJ_TEST("Host Container status and destroy do not reserve an absent lease") {
     ++calls;
     return kj::Maybe<HostContainerRpc::Resolved>(kj::none);
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto container = capability.castAs<rpc::Container>();
   KJ_EXPECT(!container.statusRequest().send().wait(wait).getRunning());
   container.destroyRequest().send().wait(wait);
@@ -69,7 +78,7 @@ KJ_TEST("Host Container mutation callbacks bracket the original native engine op
   auto& inspect = *engine;
   rpc::Container::Client native(kj::mv(engine));
   uint calls = 0;
-  capnp::Capability::Client capability(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client capability(kj::refcounted<HostContainerRpc>(
       [&calls, &inspect, &native](bool start, bool stop, bool completed, kj::String startup,
           kj::String expectedLeaseKey, bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     switch (calls++) {
@@ -91,7 +100,7 @@ KJ_TEST("Host Container mutation callbacks bracket the original native engine op
     return kj::Maybe<HostContainerRpc::Resolved>(
         HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto container = capability.castAs<rpc::Container>();
   container.startRequest().send().wait(wait);
   container.destroyRequest().send().wait(wait);
@@ -150,7 +159,7 @@ KJ_TEST(
   rpc::Container::Client native(kj::mv(engine));
   auto reserved = kj::newPromiseAndFulfiller<void>();
   uint lookups = 0;
-  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
       [&native, &reserved, &lookups](bool start, bool, bool, kj::String, kj::String,
           bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     ++lookups;
@@ -158,7 +167,7 @@ KJ_TEST(
     co_return kj::Maybe<HostContainerRpc::Resolved>(
         HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto container = grant.castAs<rpc::Container>();
   auto start = container.startRequest().send().dropPipeline();
   auto monitor = container.monitorRequest().send().dropPipeline();
@@ -182,13 +191,13 @@ KJ_TEST(
   kj::EventLoop loop;
   kj::WaitScope wait(loop);
   auto reserved = kj::newPromiseAndFulfiller<void>();
-  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
       [&reserved](bool start, bool, bool, kj::String, kj::String,
           bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     if (start) co_await kj::mv(reserved.promise);
     co_return kj::none;
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto container = grant.castAs<rpc::Container>();
   auto start = container.startRequest().send().dropPipeline();
   auto monitor = container.monitorRequest().send().dropPipeline();
@@ -205,13 +214,13 @@ KJ_TEST("Container epoch revocation interrupts pending reservation and queued mo
   kj::WaitScope wait(loop);
   auto reserved = kj::newPromiseAndFulfiller<void>();
   auto revocation = kj::newPromiseAndFulfiller<void>();
-  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
       [&reserved](bool start, bool, bool, kj::String, kj::String,
           bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     if (start) co_await kj::mv(reserved.promise);
     co_return kj::none;
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto membrane = kj::refcounted<RevokerMembrane>(kj::mv(revocation.promise));
   auto container = capnp::membrane(grant.castAs<rpc::Container>(), kj::mv(membrane));
   auto start = container.startRequest().send().dropPipeline();
@@ -246,14 +255,15 @@ KJ_TEST("Host Container owner activity follows monitor completion failure and re
     auto& native = *engine;
     native.started = true;
     rpc::Container::Client client(kj::mv(engine));
-    capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+    capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
         [&tracker, &client](bool, bool, bool, kj::String, kj::String,
             bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
       return kj::Maybe<HostContainerRpc::Resolved>(
           HostContainerRpc::Resolved{rpc::Container::Client(client), kj::str("lease"),
             kj::heap<RequestTracker::ActiveRequest>(tracker->startRequest())});
     },
-        kj::refcounted<HostContainerRpc::MutationQueue>()));
+        kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress,
+        rejectNativeEgress));
     auto revocation = kj::newPromiseAndFulfiller<void>();
     auto fenced =
         capnp::membrane(kj::mv(grant), kj::refcounted<RevokerMembrane>(kj::mv(revocation.promise)));
@@ -286,7 +296,7 @@ KJ_TEST("Delayed monitor cleanup retains its original lease key after replacemen
   rpc::Container::Client replacementClient(kj::mv(replacementEngine));
   kj::StringPtr current = "old";
   uint stops = 0;
-  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
       [&oldClient, &replacementClient, &current, &stops](bool start, bool stop, bool, kj::String,
           kj::String expected, bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     if (start) current = "replacement";
@@ -296,7 +306,7 @@ KJ_TEST("Delayed monitor cleanup retains its original lease key after replacemen
       rpc::Container::Client(current == "old" ? oldClient : replacementClient), kj::str(current),
       {}});
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto container = grant.castAs<rpc::Container>();
   auto monitor = container.monitorRequest().send().dropPipeline();
   KJ_EXPECT(!monitor.poll(wait) && old.monitoring);
@@ -331,7 +341,7 @@ KJ_TEST(
   for (int32_t code: {0, 7, 137}) {
     rpc::Container::Client native(kj::heap<ExitedEngine>(code, false));
     uint stage = 0;
-    capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+    capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
         [&native, &stage](bool start, bool stop, bool completed, kj::String,
             kj::String expectedLeaseKey,
             bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
@@ -343,7 +353,8 @@ KJ_TEST(
       return kj::Maybe<HostContainerRpc::Resolved>(
           HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
     },
-        kj::refcounted<HostContainerRpc::MutationQueue>()));
+        kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress,
+        rejectNativeEgress));
     auto result = grant.castAs<rpc::Container>().monitorRequest().send().wait(wait);
     KJ_EXPECT(result.getExitCode() == code && stage == 3);
   }
@@ -354,7 +365,7 @@ KJ_TEST("Unknown native monitor transport failure never requests stop or release
   kj::WaitScope wait(loop);
   rpc::Container::Client native(kj::heap<ExitedEngine>(0, true));
   uint lookups = 0;
-  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
       [&native, &lookups](bool start, bool stop, bool completed, kj::String, kj::String,
           bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     KJ_EXPECT(!start && !stop && !completed);
@@ -362,7 +373,7 @@ KJ_TEST("Unknown native monitor transport failure never requests stop or release
     return kj::Maybe<HostContainerRpc::Resolved>(
         HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   KJ_EXPECT_THROW_MESSAGE("Container operation failed",
       grant.castAs<rpc::Container>().monitorRequest().send().wait(wait));
   KJ_EXPECT(lookups == 1);
@@ -374,7 +385,7 @@ KJ_TEST("Monitor lookup after a proved start can wait an exited lease without Ru
   for (int32_t code: {0, 7, 137}) {
     rpc::Container::Client native(kj::heap<ExitedEngine>(code, false));
     uint stage = 0;
-    capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+    capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
         [&native, &stage](bool start, bool stop, bool completed, kj::String, kj::String expected,
             bool monitor) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
       KJ_EXPECT(start == (stage == 0));
@@ -386,7 +397,8 @@ KJ_TEST("Monitor lookup after a proved start can wait an exited lease without Ru
       return kj::Maybe<HostContainerRpc::Resolved>(
           HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
     },
-        kj::refcounted<HostContainerRpc::MutationQueue>()));
+        kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress,
+        rejectNativeEgress));
     auto container = grant.castAs<rpc::Container>();
     container.startRequest().send().wait(wait);
     KJ_EXPECT(stage == 2);
@@ -400,7 +412,7 @@ KJ_TEST("Monitor lookup cannot bind a replacement after its original start was p
   kj::WaitScope wait(loop);
   rpc::Container::Client native(kj::heap<ExitedEngine>(0, false));
   uint stops = 0;
-  capnp::Capability::Client grant(kj::heap<HostContainerRpc>(
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
       [&native, &stops](bool, bool stop, bool, kj::String, kj::String expected,
           bool monitor) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
     if (stop) ++stops;
@@ -408,7 +420,7 @@ KJ_TEST("Monitor lookup cannot bind a replacement after its original start was p
     return kj::Maybe<HostContainerRpc::Resolved>(HostContainerRpc::Resolved{
       rpc::Container::Client(native), kj::str(monitor ? "replacement" : "lease"), {}});
   },
-      kj::refcounted<HostContainerRpc::MutationQueue>()));
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress));
   auto container = grant.castAs<rpc::Container>();
   container.startRequest().send().wait(wait);
   KJ_EXPECT_THROW_MESSAGE(
@@ -555,6 +567,88 @@ KJ_TEST("Container reverse callback streams exceed the idle pool and all revoke 
   kj::byte byte;
   for (auto& tunnel: tunnels) KJ_EXPECT(tunnel->tryRead(&byte, 1, 1).wait(io.waitScope) == 0);
   kj::joinPromises(serving.releaseAsArray()).wait(io.waitScope);
+}
+
+class PrestartEngine final: public rpc::Container::Server {
+ public:
+  explicit PrestartEngine(uint& staged): staged(staged) {}
+  uint starts = 0;
+  uint runningRegistrations = 0;
+  kj::Promise<void> start(StartContext) override {
+    KJ_EXPECT(staged == 3);
+    ++starts;
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> setEgressHttp(SetEgressHttpContext) override {
+    ++runningRegistrations;
+    return kj::READY_NOW;
+  }
+
+ private:
+  uint& staged;
+};
+
+KJ_TEST("Host interception registers before a lease without reserving or starting the Engine") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  uint staged = 0;
+  uint reservations = 0;
+  bool admitted = false;
+  bool authority = true;
+  auto engine = kj::heap<PrestartEngine>(staged);
+  auto& inspect = *engine;
+  rpc::Container::Client native(kj::mv(engine));
+  capnp::Capability::Client capability(kj::refcounted<HostContainerRpc>(
+      [&](bool start, bool stop, bool, kj::String startup, kj::String,
+          bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+    KJ_REQUIRE(authority, "Frozen authority has ended");
+    KJ_EXPECT(!stop);
+    if (start) {
+      admitted = true;
+      ++reservations;
+    } else {
+      KJ_EXPECT(startup.size() == 0);
+    }
+    if (!admitted) return kj::Maybe<HostContainerRpc::Resolved>(kj::none);
+    return kj::Maybe<HostContainerRpc::Resolved>(
+        HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}});
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>(),
+      [&](uint16_t method, capnp::AnyPointer::Reader params) {
+    KJ_EXPECT(inspect.starts == 0 && reservations == 0);
+    if (method == 8) {
+      KJ_EXPECT(
+          params.getAs<rpc::Container::SetEgressHttpParams>().getHostPort() == "http.invalid");
+    } else if (method == 9) {
+      KJ_EXPECT(
+          params.getAs<rpc::Container::SetEgressHttpsParams>().getHostPort() == "https.invalid");
+    } else {
+      KJ_EXPECT(method == 13 &&
+          params.getAs<rpc::Container::SetEgressTcpParams>().getHostPort() == "tcp.invalid");
+    }
+    ++staged;
+  }, rejectNativeEgress));
+  auto container = capability.castAs<rpc::Container>();
+  auto http = container.setEgressHttpRequest();
+  http.setHostPort("http.invalid");
+  http.send().wait(wait);
+  auto https = container.setEgressHttpsRequest();
+  https.setHostPort("https.invalid");
+  https.send().wait(wait);
+  auto tcp = container.setEgressTcpRequest();
+  tcp.setHostPort("tcp.invalid");
+  tcp.send().wait(wait);
+  KJ_EXPECT(staged == 3 && reservations == 0 && inspect.starts == 0);
+  KJ_EXPECT(!container.statusRequest().send().wait(wait).getRunning());
+  authority = false;
+  KJ_EXPECT_THROW_MESSAGE(
+      "Container operation failed", container.setEgressHttpRequest().send().wait(wait));
+  KJ_EXPECT(staged == 3 && reservations == 0 && inspect.starts == 0);
+  authority = true;
+  container.startRequest().send().wait(wait);
+  KJ_EXPECT(reservations == 1 && inspect.starts == 1);
+  container.setEgressHttpRequest().send().wait(wait);
+  KJ_EXPECT(staged == 3 && inspect.runningRegistrations == 1);
 }
 
 }  // namespace

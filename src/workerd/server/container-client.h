@@ -100,6 +100,34 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
       ChannelTokenHandler& channelTokenHandler,
       ContainerPrivileges privileges);
 
+  // The owner can register outbound routes before a lease exists. The same state is used by
+  // the admitted native client, so staging never creates an engine object or another proxy.
+  struct EgressMapping;
+  class EgressState final: public kj::Refcounted {
+   public:
+    EgressState();
+    ~EgressState() noexcept(false);
+    void registerMapping(ChannelTokenHandler& tokens,
+        EgressProtocol protocol,
+        kj::StringPtr hostPort,
+        kj::ArrayPtr<const byte> token);
+    void registerMapping(EgressProtocol protocol,
+        kj::StringPtr hostPort,
+        kj::Own<IoChannelFactory::SubrequestChannel> channel);
+    void revoke();
+    struct Data;
+    kj::Own<Data> data;
+
+   private:
+    void upsert(EgressMapping mapping);
+    friend class ContainerClient;
+  };
+
+  void setHostEgressState(kj::Own<EgressState> state);
+  kj::Promise<void> registerHostEgress(EgressProtocol protocol,
+      kj::StringPtr hostPort,
+      kj::Own<IoChannelFactory::SubrequestChannel> channel);
+
   ~ContainerClient() noexcept(false);
 
   // Starts best-effort Docker cleanup before this client is destroyed. This is used during
@@ -257,12 +285,17 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // Opaque implementation struct holding egress mappings. Defined in container-client.c++ to
   // avoid pulling heavy types (kj::OneOf, kj::CidrRange, kj::Vector) into server.c++ which
   // includes this header.
-  struct EgressState;
   kj::Own<EgressState> egressState;
 
-  // Insert or replace an egress mapping.
-  struct EgressMapping;
-  void upsertEgressMapping(EgressMapping mapping);
+  // Parse and redeem outbound routes once for both pre-start and running registration.
+  static EgressMapping prepareEgressMapping(ChannelTokenHandler& tokens,
+      EgressProtocol protocol,
+      kj::StringPtr hostPort,
+      kj::ArrayPtr<const byte> token);
+  static EgressMapping prepareEgressMapping(EgressProtocol protocol,
+      kj::StringPtr hostPort,
+      kj::Own<IoChannelFactory::SubrequestChannel> channel);
+  kj::Promise<void> applyEgressMapping(EgressMapping mapping);
   kj::Vector<kj::String> getDnsAllowHostnames() const;
 
   // Find a matching egress mapping for the given destination address (host:port format).
