@@ -29,8 +29,8 @@ class HostContainerRpc final: public capnp::Capability::Server {
     rpc::Container::Client client;
     kj::String leaseKey;
   };
-  using Resolve =
-      kj::Function<kj::Promise<kj::Maybe<Resolved>>(bool, bool, bool, kj::String, kj::String)>;
+  using Resolve = kj::Function<kj::Promise<kj::Maybe<Resolved>>(
+      bool, bool, bool, kj::String, kj::String, bool)>;
   HostContainerRpc(Resolve resolve, kj::Own<MutationQueue> mutations)
       : resolve(kj::mv(resolve)),
         mutations(kj::mv(mutations)) {}
@@ -69,8 +69,11 @@ class HostContainerRpc final: public capnp::Capability::Server {
       codec.setHasMode(capnp::HasMode::NON_DEFAULT);
       startup = codec.encode(context.getParams().getAs<rpc::Container::StartParams>());
     }
-    auto client =
-        co_await resolve(methodId == 1, methodId == 3, false, kj::mv(startup), kj::str(""));
+    auto client = co_await resolve(methodId == 1, methodId == 3, false, kj::mv(startup),
+        methodId == 2
+            ? startedLeaseKey.map([](auto& key) { return kj::str(key); }).orDefault(kj::str(""))
+            : kj::str(""),
+        methodId == 2);
     if (client == kj::none && (methodId == 0 || methodId == 3)) {
       if (methodId == 0)
         context.getResults().initAs<rpc::Container::StatusResults>().setRunning(false);
@@ -79,6 +82,11 @@ class HostContainerRpc final: public capnp::Capability::Server {
       co_return;
     }
     auto& target = JSG_REQUIRE_NONNULL(client, Error, "The Container is not running.");
+    if (methodId == 2) {
+      KJ_IF_SOME(expected, startedLeaseKey) {
+        JSG_REQUIRE(expected == target.leaseKey, Error, "Container execution authority changed.");
+      }
+    }
     auto leaseKey = kj::str(target.leaseKey);
     auto request =
         target.client.typelessRequest(capnp::typeId<rpc::Container>(), methodId, kj::none, {});
@@ -89,15 +97,18 @@ class HostContainerRpc final: public capnp::Capability::Server {
         // The native monitor RPC succeeds with an exact exit code, including signal/nonzero exits.
         // Transport failures reject above and must retain unknown leases. Persist a stop intent
         // before the provider proves process fencing and cleanup.
-        co_await resolve(false, true, false, kj::str(""), kj::str(leaseKey));
+        co_await resolve(false, true, false, kj::str(""), kj::str(leaseKey), false);
       }
-      co_await resolve(false, methodId != 1, true, kj::str(""), kj::mv(leaseKey));
+      co_await resolve(false, methodId != 1, true, kj::str(""), kj::str(leaseKey), false);
+      if (methodId == 1) startedLeaseKey = kj::str(leaseKey);
+      if (methodId == 3) startedLeaseKey = kj::none;
       context.getResults().setAs<capnp::AnyPointer>(response);
     } else {
       co_await context.tailCall(kj::mv(request));
     }
   }
 
+  kj::Maybe<kj::String> startedLeaseKey;
   Resolve resolve;
   kj::Own<MutationQueue> mutations;
 };

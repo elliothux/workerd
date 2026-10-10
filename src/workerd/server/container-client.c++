@@ -2739,7 +2739,8 @@ kj::Promise<void> ContainerClient::monitor(MonitorContext context) {
   // If start() ran but failed (e.g. snapshot restore error), containerStarted
   // remains false. Reject immediately rather than hanging on Docker /wait for a
   // container that was never started.
-  JSG_REQUIRE(containerStarted.load(std::memory_order_acquire), Error, "Container failed to start");
+  JSG_REQUIRE(outbound != kj::none || containerStarted.load(std::memory_order_acquire), Error,
+      "Container failed to start");
 
   auto results = context.getResults();
 

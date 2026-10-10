@@ -18,8 +18,10 @@ export class Host extends DurableObject {
   async check() {
     assert.equal(this.ctx.container, undefined);
     const calls = [];
-    const grant = this.env.factory.getContainer(this.ctx.facets, 'App', async (start, stop, completed, startup) => {
-      calls.push({start, stop, completed, startup});
+    const grant = this.env.factory.getContainer(this.ctx.facets, 'App', async (start, stop, completed, startup, expectedLeaseKey, monitor) => {
+      assert.equal(typeof expectedLeaseKey, 'string');
+      assert.equal(typeof monitor, 'boolean');
+      calls.push({start, stop, completed, startup, monitor});
       return undefined;
     });
     const loader = this.env.loader;

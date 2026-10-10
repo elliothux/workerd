@@ -811,12 +811,12 @@ class Server::ActorNamespace final {
               key == "tenant",
           Error, "Container attachments require the host's declared tenant facet.");
       auto weak = root.weakSelf->addRef();
-      auto getClient = [weak = kj::mv(weak), resolve = kj::mv(resolve),
-                           outbound = kj::mv(outbound)](bool start, bool stop, bool completed,
-                           kj::String startup, kj::String expectedLeaseKey) mutable
-          -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
-        auto lease =
-            co_await resolve(start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey));
+      auto getClient =
+          [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound)](bool start,
+              bool stop, bool completed, kj::String startup, kj::String expectedLeaseKey,
+              bool monitor) mutable -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+        auto lease = co_await resolve(
+            start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor);
         auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
         if (stop && completed) {
           owner.revokeHostContainerCallbacks();

@@ -40,8 +40,13 @@ struct HostContainerLease {
       leaseKey, imageRef, providerContractSha256, controlToken, callbackToken, nativeStartupJson);
 };
 
-using ResolveHostContainerLease = kj::Function<kj::Promise<kj::Maybe<HostContainerLease>>(
-    bool start, bool stop, bool completed, kj::String startup, kj::String expectedLeaseKey)>;
+using ResolveHostContainerLease =
+    kj::Function<kj::Promise<kj::Maybe<HostContainerLease>>(bool start,
+        bool stop,
+        bool completed,
+        kj::String startup,
+        kj::String expectedLeaseKey,
+        bool monitor)>;
 
 class HostContainerOwner;
 
