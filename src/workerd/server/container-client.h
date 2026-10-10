@@ -286,6 +286,9 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // avoid pulling heavy types (kj::OneOf, kj::CidrRange, kj::Vector) into server.c++ which
   // includes this header.
   kj::Own<EgressState> egressState;
+  // Client retirement cancels its pipes without revoking the shared owner mappings.
+  kj::Canceler executionCallbacks;
+  kj::Promise<void> wrapCallbacks(kj::Promise<void> task);
 
   // Parse and redeem outbound routes once for both pre-start and running registration.
   static EgressMapping prepareEgressMapping(ChannelTokenHandler& tokens,

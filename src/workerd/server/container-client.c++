@@ -1162,15 +1162,22 @@ void ContainerClient::setHostEgressState(kj::Own<EgressState> state) {
 }
 
 void ContainerClient::revokeHostCallbacks() {
-  egressState->revoke();
+  executionCallbacks.cancel("Container execution callbacks revoked.");
   reverseCallbackTask = kj::none;
+}
+
+kj::Promise<void> ContainerClient::wrapCallbacks(kj::Promise<void> task) {
+  return executionCallbacks.wrap(egressState->data->callbacks.wrap(kj::mv(task)));
 }
 
 void ContainerClient::setHostCredentials(kj::String control, kj::String callback) {
   JSG_REQUIRE(
       outbound != kj::none && control.size() == 64 && callback.size() == 64 && control != callback,
       Error, "Invalid Container provider credentials.");
-  if (controlToken != kj::none && !containerTokenMatches(KJ_ASSERT_NONNULL(controlToken), control))
+  if ((controlToken != kj::none &&
+          !containerTokenMatches(KJ_ASSERT_NONNULL(controlToken), control)) ||
+      (callbackToken != kj::none &&
+          !containerTokenMatches(KJ_ASSERT_NONNULL(callbackToken), callback)))
     revokeHostCallbacks();
   controlToken = kj::mv(control);
   callbackToken = kj::mv(callback);
@@ -1185,6 +1192,8 @@ void ContainerClient::shutdown() {
   shutdownStarted = true;
 
   revokeHostCallbacks();
+  // Standalone clients own their mappings; private clients share the Root owner state.
+  if (outbound == kj::none) egressState->revoke();
   stopEgressListener();
 
   // The host authority owns private lease termination across native owner retirement and restart.
@@ -1282,7 +1291,7 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
     auto downPump =
         connectionRef.pumpTo(downEndRef).then([&downEndRef](uint64_t) { return downEndRef.end(); });
 
-    pumpTasks.add(containerClient.egressState->data->callbacks.wrap(
+    pumpTasks.add(containerClient.wrapCallbacks(
         kj::joinPromisesFailFast(kj::arr(kj::mv(upPump), kj::mv(downPump)))
             .attach(kj::mv(httpClient), kj::mv(upEnd), kj::mv(connection), kj::mv(downEnd))));
     co_return;
@@ -1337,8 +1346,8 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       // always combined into stdout when a PTY is active, so there is no separate stderr stream.
       auto task = copyRawExecOutput(*sharedConnection->connection, kj::mv(stdoutStream))
                       .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
-      streamClosedTask = this->containerClient->egressState->data->callbacks
-                             .wrap(kj::mv(task).attach(
+      streamClosedTask = this->containerClient
+                             ->wrapCallbacks(kj::mv(task).attach(
                                  kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
         shared->disconnect();
       }))).fork();
@@ -1357,9 +1366,9 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
     auto task = demuxDockerExecOutput(
         *sharedConnection->connection, kj::mv(stdoutStream), kj::mv(stderrStream), combinedOutput)
                     .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
-    streamClosedTask =
-        this->containerClient->egressState->data->callbacks
-            .wrap(kj::mv(task).attach(kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
+    streamClosedTask = this->containerClient
+                           ->wrapCallbacks(kj::mv(task).attach(
+                               kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
       shared->disconnect();
     }))).fork();
   }
@@ -1528,7 +1537,7 @@ class EgressHttpService final: public kj::HttpService {
       kj::AsyncIoStream& connection,
       ConnectResponse& response,
       kj::HttpConnectSettings settings) override {
-    return containerClient.egressState->data->callbacks.wrap(
+    return containerClient.wrapCallbacks(
         connectImpl(host, headers, connection, response, settings));
   }
 
@@ -3229,8 +3238,8 @@ kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::connectReverseCallback(
 kj::Promise<void> ContainerClient::serveReverseCallbacks(kj::Own<kj::AsyncIoStream> connection) {
   for (;;) {
     if (connection.get() != nullptr) {
-      waitUntilTasks.add(egressState->data->callbacks
-              .wrap(KJ_ASSERT_NONNULL(egressHttpServer)->listenHttp(kj::mv(connection)))
+      waitUntilTasks.add(
+          wrapCallbacks(KJ_ASSERT_NONNULL(egressHttpServer)->listenHttp(kj::mv(connection)))
               .catch_([](kj::Exception&&) {
       }).attach(addRef()));
     }
@@ -3251,8 +3260,8 @@ kj::Promise<void> ContainerClient::serveReverseCallbacks(kj::Own<kj::AsyncIoStre
 kj::Promise<void> ContainerClient::ensureReverseCallbacks() {
   if (outbound == kj::none || reverseCallbackTask != kj::none) co_return;
   auto connection = co_await timer.timeoutAfter(5 * kj::SECONDS, connectReverseCallback());
-  reverseCallbackTask = egressState->data->callbacks.wrap(serveReverseCallbacks(kj::mv(connection)))
-                            .eagerlyEvaluate([](kj::Exception&&) {
+  reverseCallbackTask =
+      wrapCallbacks(serveReverseCallbacks(kj::mv(connection))).eagerlyEvaluate([](kj::Exception&&) {
     KJ_LOG(ERROR, "Container reverse callback channel ended.");
   });
 }

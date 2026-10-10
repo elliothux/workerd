@@ -841,9 +841,27 @@ class Server::ActorNamespace final {
       }
     };
 
-    kj::Promise<void> hostContainerStarted() override {
+    kj::Promise<void> hostContainerStarted(bool newExecution) override {
       auto& tenant = JSG_REQUIRE_NONNULL(
           facets.findEntry("tenant"_kj), Error, "The host has no declared tenant facet.");
+      if (newExecution) {
+        // Reconstruct against the proved execution. A prior cold constructor cannot observe a
+        // later native start; retiring its context also fences callbacks from the old execution.
+        auto& facet = *tenant.value;
+        facet.onBrokenTask = kj::none;
+        facet.shutdownTask = kj::none;
+        for (auto& child: facet.facets) {
+          child.value->abort(KJ_EXCEPTION(DISCONNECTED, "Container execution changed."));
+        }
+        facet.facets.clear();
+        KJ_IF_SOME(actor, facet.actor) {
+          actor->abort(KJ_EXCEPTION(DISCONNECTED, "Container execution changed."));
+        }
+        facet.actor = kj::none;
+        facet.manager = kj::none;
+        facet.containerClient = kj::none;
+        facet.hostContainerRegistrar = kj::none;
+      }
       auto request = co_await tenant.value->startRequest({}).attach(tenant.value->addRef());
       co_await request->customEvent(kj::heap<HostContainerStartedEvent>());
     }
@@ -869,7 +887,9 @@ class Server::ActorNamespace final {
     }
     kj::Maybe<kj::Own<IoChannelFactory::HostContainerEgressRegistrar>>
     getHostContainerEgressRegistrar() override {
-      KJ_IF_SOME(registrar, hostContainerRegistrar) { return kj::addRef(*registrar); }
+      KJ_IF_SOME(registrar, hostContainerRegistrar) {
+        return kj::addRef(*registrar);
+      }
       return kj::none;
     }
     IoChannelFactory::HostContainerAttachment attachHostContainer(HostContainerOwner& owner,
@@ -939,7 +959,9 @@ class Server::ActorNamespace final {
                 KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == staged.get(),
             Error, "Container execution authority changed.");
         if (stop && completed) {
-          owner.revokeHostContainerCallbacks();
+          KJ_IF_SOME(client, owner.hostContainerClient) {
+            client->revokeHostCallbacks();
+          }
           owner.hostContainerClient = kj::none;
           owner.hostContainerLease = kj::none;
         }

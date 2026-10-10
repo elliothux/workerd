@@ -60,14 +60,42 @@ jobs:
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
           --test_output=errors
-      - name: Qualify Root ownership across native Container idle
-        run: >-
-          bazel test //src/workerd/server:server-test@
-          --strip=always
-          --config=${{ matrix.config }}
-          --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
-          --test_arg=-f --test_arg=server-test.c++:2618
-          --test_output=all
+      - name: Qualify Root ownership across native Container executions
+        env:
+          BAZEL_CONFIG: ${{ matrix.config }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import subprocess
+
+          names = [
+              "Server: Host Container monitor retains its owner across the idle window",
+              "Server: Host warm start registers callbacks for a previously constructed cold facet",
+              "Server: Old execution retirement preserves the current owner's outbound callbacks",
+              "Server: Shared outbound mappings survive completed stop and client replacement",
+          ]
+          source = Path("src/workerd/server/server-test.c++").read_text().splitlines()
+          filters = []
+          expected = []
+          for name in names:
+              lines = [line for line, value in enumerate(source, 1)
+                       if value == f'KJ_TEST("{name}") {{']
+              if len(lines) != 1:
+                  raise SystemExit("Native owner regression source inventory is ambiguous")
+              filters.extend(["-f", f"server-test.c++:{lines[0]}"])
+              expected.append(f"[ TEST ] server-test.c++:{lines[0]}: {name}")
+          flags = ["--strip=always", "--config=" + os.environ["BAZEL_CONFIG"],
+                   "--@rules_rust//:extra_exec_rustc_flags=-Cstrip=none"]
+          subprocess.run(["bazel", "build", "//src/workerd/server:server-test_binary", *flags], check=True)
+          listed = subprocess.run(["bazel-bin/src/workerd/server/server-test_binary", "--list", *filters],
+                                  capture_output=True, text=True, check=True)
+          if sorted(listed.stdout.splitlines()) != sorted(expected) or listed.stderr:
+              raise SystemExit("Native owner regression binary inventory does not match source")
+          print(listed.stdout, end="", flush=True)
+          subprocess.run(["bazel", "test", "//src/workerd/server:server-test@", *flags,
+                          *["--test_arg=" + value for value in filters], "--test_output=all"], check=True)
+          PYTHON
       - name: Record inputs
         run: |
           bazel --version > build-inputs.txt

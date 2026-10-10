@@ -142,8 +142,9 @@ class RevocableContainerEgress final: public IoChannelFactory::HostContainerEgre
       kj::Own<IoChannelFactory::SubrequestChannel> channel) override {
     return inner->registerEgress(methodId, kj::mv(hostPort), kj::mv(channel))
         .exclusiveJoin(KJ_ASSERT_NONNULL(membrane->onRevoked()))
-        .catch_([](kj::Exception&&) { JSG_FAIL_REQUIRE(Error, "Container operation failed."); })
-        .attach(kj::addRef(*this));
+        .catch_([](kj::Exception&&) {
+      JSG_FAIL_REQUIRE(Error, "Container operation failed.");
+    }).attach(kj::addRef(*this));
   }
 
  private:
@@ -193,7 +194,7 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
     co_await owner.ensureHostContainerAttached();
     auto& capability = JSG_REQUIRE_NONNULL(attached, Error, "Container attachment is unavailable.");
     if ((co_await capability.statusRequest().send()).getRunning()) {
-      co_await owner.hostContainerStarted();
+      co_await owner.hostContainerStarted(false);
       co_return;
     }
     auto lease = co_await resolve(true, false, false, kj::str(""), kj::str(""), false);
@@ -204,7 +205,7 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
     capnp::JsonCodec codec;
     codec.decode(execution.nativeStartupJson, request);
     co_await request.send();
-    co_await owner.hostContainerStarted();
+    co_await owner.hostContainerStarted(true);
   }
   kj::StringPtr getClassName() const override {
     return className;

@@ -727,7 +727,7 @@ class HostContainerOwner {
     JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
   }
 
-  virtual kj::Promise<void> hostContainerStarted() {
+  virtual kj::Promise<void> hostContainerStarted(bool newExecution) {
     JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
   }
 
