@@ -74,6 +74,10 @@ jobs:
               "Server: Host warm start registers callbacks for a previously constructed cold facet",
               "Server: Old execution retirement preserves the current owner's outbound callbacks",
               "Server: Shared outbound mappings survive completed stop and client replacement",
+              "Server: Private Container inactivity survives idle and positively stops its lease",
+              "Server: Active egress delays inactivity; unused reverse channels do not",
+              "Server: Ordinary tenant waitUntil outlasts the monitor owner window",
+              "Server: Default Container inactivity positively stops without an explicit setter",
           ]
           source = Path("src/workerd/server/server-test.c++").read_text().splitlines()
           filters = []
@@ -108,7 +112,7 @@ jobs:
         run: |
           bazel-bin/src/workerd/server/workerd container-protocol-version > container-protocol.stdout 2> container-protocol.stderr
           test ! -s container-protocol.stderr
-          printf 'open-compute-container-protocol-v1\n' > container-protocol.expected
+          printf 'open-compute-container-protocol-v2\n' > container-protocol.expected
           cmp container-protocol.expected container-protocol.stdout
           cat container-protocol.stdout >> build-inputs.txt
       - name: Record compatibility catalog

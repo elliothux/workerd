@@ -27,6 +27,25 @@ namespace workerd {
 
 class WorkerInterface;
 
+// Safe presentation supplied by the same immutable lease authority as execution credentials.
+struct HostContainerLabel {
+  kj::String name;
+  kj::String value;
+  JSG_STRUCT(name, value);
+};
+struct HostContainerInspection {
+  kj::String image;
+  kj::Array<HostContainerLabel> labels;
+  JSG_STRUCT(image, labels);
+
+  HostContainerInspection clone() const {
+    auto copy = kj::heapArrayBuilder<HostContainerLabel>(labels.size());
+    for (auto& label: labels)
+      copy.add(HostContainerLabel{kj::str(label.name), kj::str(label.value)});
+    return {kj::str(image), copy.finish()};
+  }
+};
+
 // Host-issued immutable execution identity. It has no tenant or RPC serialization.
 struct HostContainerLease {
   kj::String leaseKey;
@@ -35,9 +54,15 @@ struct HostContainerLease {
   kj::String controlToken;
   kj::String callbackToken;
   kj::String nativeStartupJson;
+  HostContainerInspection inspection;
 
-  JSG_STRUCT(
-      leaseKey, imageRef, providerContractSha256, controlToken, callbackToken, nativeStartupJson);
+  JSG_STRUCT(leaseKey,
+      imageRef,
+      providerContractSha256,
+      controlToken,
+      callbackToken,
+      nativeStartupJson,
+      inspection);
 };
 
 using ResolveHostContainerLease =
@@ -47,6 +72,18 @@ using ResolveHostContainerLease =
         kj::String startup,
         kj::String expectedLeaseKey,
         bool monitor)>;
+
+// Only metadata crosses the host boundary; the daemon owns snapshot bytes and persistence.
+struct HostContainerSnapshot {
+  kj::String id;
+  double size;
+  jsg::Optional<kj::String> name;
+
+  JSG_STRUCT(id, size, name);
+};
+
+using CaptureHostContainerSnapshot = kj::Function<kj::Promise<HostContainerSnapshot>(
+    kj::String expectedLeaseKey, kj::Maybe<kj::String> name)>;
 
 class HostContainerOwner;
 
@@ -742,6 +779,7 @@ class HostContainerOwner {
 
   virtual IoChannelFactory::HostContainerAttachment attachHostContainer(HostContainerOwner& owner,
       ResolveHostContainerLease resolve,
+      CaptureHostContainerSnapshot capture,
       kj::Own<IoChannelFactory::SubrequestChannel> outbound) {
     JSG_FAIL_REQUIRE(Error, "Native Container attachment is unavailable.");
   }

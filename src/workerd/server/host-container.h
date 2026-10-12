@@ -5,8 +5,91 @@
 #include <workerd/io/request-tracker.h>
 
 #include <capnp/compat/json.h>
+#include <kj/timer.h>
 
 namespace workerd::server {
+
+// The timer belongs to the host owner, not to a tenant capability or an engine client.
+class HostContainerInactivity final {
+ public:
+  HostContainerInactivity(kj::Timer& timer, bool active, kj::Function<kj::Promise<void>()> stop)
+      : timer(timer),
+        activeNow(active),
+        stop(kj::mv(stop)) {}
+
+  static void requireValid(int64_t durationMs) {
+    JSG_REQUIRE(durationMs > 0, TypeError,
+        "setInactivityTimeout() cannot be called with a durationMs <= 0");
+    JSG_REQUIRE(
+        durationMs <= 6 * 60 * 60 * 1000, Error, "setInactivityTimeout() cannot exceed 6 hours");
+  }
+
+  void configure(int64_t durationMs) {
+    requireValid(durationMs);
+    duration = durationMs * kj::MILLISECONDS;
+    if (!activeNow) inactive();
+  }
+
+  void reset() {
+    duration = kj::none;
+    if (!stopping) task = kj::none;
+  }
+
+  void active() {
+    activeNow = true;
+    if (!stopping) task = kj::none;
+  }
+
+  void inactive() {
+    activeNow = false;
+    if (stopping) return;
+    KJ_IF_SOME(timeout, duration) {
+      task = timer.afterDelay(timeout)
+                 .then([this]() -> kj::Promise<void> {
+        duration = kj::none;
+        stopping = true;
+        KJ_DEFER(stopping = false);
+        co_await stop();
+      }).eagerlyEvaluate([](kj::Exception&&) {
+        // The persisted stop intent and capacity remain owned by platform reconciliation.
+        KJ_LOG(ERROR, "Container inactivity cleanup failed.");
+      });
+    }
+  }
+
+  bool retainsOwner() const {
+    return duration != kj::none || stopping;
+  }
+
+ private:
+  kj::Timer& timer;
+  bool activeNow;
+  bool stopping = false;
+  kj::Maybe<kj::Duration> duration;
+  kj::Function<kj::Promise<void>()> stop;
+  kj::Maybe<kj::Promise<void>> task;
+};
+
+// Each operation retains the control owner for at most the documented 15-minute window.
+class HostContainerActivity final: public kj::Refcounted {
+ public:
+  HostContainerActivity(RequestTracker& tracker, kj::Timer& timer)
+      : request(kj::heap<RequestTracker::ActiveRequest>(tracker.startRequest())) {
+    timeout = timer.afterDelay(15 * kj::MINUTES).then([this] {
+      request = kj::none;
+    }).eagerlyEvaluate(nullptr);
+  }
+
+ private:
+  kj::Maybe<kj::Own<RequestTracker::ActiveRequest>> request;
+  kj::Maybe<kj::Promise<void>> timeout;
+};
+
+class HostContainerAuthority final: public kj::Refcounted {
+ public:
+  explicit HostContainerAuthority(ResolveHostContainerLease resolve): resolve(kj::mv(resolve)) {}
+  ResolveHostContainerLease resolve;
+};
 
 // Admission stays outside the engine client; returned native capabilities retain their RPC brands.
 class HostContainerRpc final: public capnp::Capability::Server,
@@ -30,7 +113,8 @@ class HostContainerRpc final: public capnp::Capability::Server,
   struct Resolved {
     rpc::Container::Client client;
     kj::String leaseKey;
-    kj::Own<RequestTracker::ActiveRequest> ownerActivity;
+    kj::Own<void> ownerActivity;
+    HostContainerInspection inspection;
   };
   using Resolve = kj::Function<kj::Promise<kj::Maybe<Resolved>>(
       bool, bool, bool, kj::String, kj::String, bool)>;
@@ -40,11 +124,15 @@ class HostContainerRpc final: public capnp::Capability::Server,
   HostContainerRpc(Resolve resolve,
       kj::Own<MutationQueue> mutations,
       StageEgress stageEgress,
-      RegisterNativeEgress registerNativeEgress)
+      RegisterNativeEgress registerNativeEgress,
+      CaptureHostContainerSnapshot capture,
+      kj::Function<void(int64_t)> configureInactivity)
       : resolve(kj::mv(resolve)),
         mutations(kj::mv(mutations)),
         stageEgress(kj::mv(stageEgress)),
-        registerNativeEgress(kj::mv(registerNativeEgress)) {}
+        registerNativeEgress(kj::mv(registerNativeEgress)),
+        capture(kj::mv(capture)),
+        configureInactivity(kj::mv(configureInactivity)) {}
 
   kj::Promise<void> registerEgress(uint16_t methodId,
       kj::String hostPort,
@@ -71,11 +159,11 @@ class HostContainerRpc final: public capnp::Capability::Server,
  private:
   kj::Promise<void> forward(
       uint16_t methodId, capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
-    JSG_REQUIRE(methodId != 10 && methodId != 11, Error, "Container snapshots are unavailable.");
+    JSG_REQUIRE(methodId != 10, Error, "Container directory snapshots are unavailable.");
     kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> mutation;
     KJ_DEFER(if (mutation != kj::none) KJ_ASSERT_NONNULL(mutation)->fulfill());
     bool egress = methodId == 8 || methodId == 9 || methodId == 13;
-    if (methodId == 1 || methodId == 3 || egress) {
+    if (methodId == 1 || methodId == 3 || methodId == 11 || methodId == 7 || egress) {
       auto turn = mutations->take();
       mutation = kj::mv(turn.fulfiller);
       co_await turn.promise;
@@ -97,11 +185,20 @@ class HostContainerRpc final: public capnp::Capability::Server,
             ? startedLeaseKey.map([](auto& key) { return kj::str(key); }).orDefault(kj::str(""))
             : kj::str(""),
         methodId == 2);
-    if (client == kj::none && (methodId == 0 || methodId == 3)) {
+    if (methodId == 7) {
+      auto durationMs =
+          context.getParams().getAs<rpc::Container::SetInactivityTimeoutParams>().getDurationMs();
+      configureInactivity(durationMs);
+      context.getResults().initAs<rpc::Container::SetInactivityTimeoutResults>();
+      co_return;
+    }
+    if (client == kj::none && (methodId == 0 || methodId == 3 || methodId == 14)) {
       if (methodId == 0)
         context.getResults().initAs<rpc::Container::StatusResults>().setRunning(false);
-      else
+      else if (methodId == 3)
         context.getResults().initAs<rpc::Container::DestroyResults>();
+      else
+        context.getResults().initAs<rpc::Container::InspectResults>().initInfo().setNone();
       co_return;
     }
     if (client == kj::none && egress) {
@@ -123,9 +220,50 @@ class HostContainerRpc final: public capnp::Capability::Server,
       }
     }
     auto leaseKey = kj::str(target.leaseKey);
+    if (methodId == 11) {
+      auto params = context.getParams().getAs<rpc::Container::SnapshotContainerParams>();
+      auto name = params.hasName() ? kj::Maybe<kj::String>(kj::str(params.getName())) : kj::none;
+      auto snapshot = co_await capture(kj::mv(leaseKey), kj::mv(name));
+      JSG_REQUIRE(snapshot.id.size() > 0 && snapshot.id.size() <= 256 &&
+              snapshot.id.findFirst('\0') == kj::none && snapshot.size >= 0 &&
+              snapshot.size <= jsg::MAX_SAFE_INTEGER &&
+              snapshot.size == static_cast<uint64_t>(snapshot.size),
+          Error, "Invalid Container snapshot metadata.");
+      auto result =
+          context.getResults().initAs<rpc::Container::SnapshotContainerResults>().initSnapshot();
+      result.setId(snapshot.id);
+      result.setSize(static_cast<uint64_t>(snapshot.size));
+      KJ_IF_SOME(name, snapshot.name) {
+        result.setName(name);
+      }
+      co_return;
+    }
     auto request =
         target.client.typelessRequest(capnp::typeId<rpc::Container>(), methodId, kj::none, {});
     request.setAs<capnp::AnyPointer>(context.getParams());
+    if (methodId == 14) {
+      // Engine status is authoritative for running/null; presentation belongs to this exact lease.
+      auto response = co_await request.send();
+      auto info = response.getAs<rpc::Container::InspectResults>().getInfo();
+      auto result = context.getResults().initAs<rpc::Container::InspectResults>().initInfo();
+      if (info.isStarted()) {
+        auto current = co_await resolve(false, false, false, kj::str(""), kj::str(leaseKey), false);
+        auto& presentation =
+            JSG_REQUIRE_NONNULL(current, Error, "Container execution authority changed.");
+        JSG_REQUIRE(
+            presentation.leaseKey == leaseKey, Error, "Container execution authority changed.");
+        auto started = result.initStarted();
+        started.setImage(presentation.inspection.image);
+        auto labels = started.initLabels(presentation.inspection.labels.size());
+        for (auto i: kj::indices(presentation.inspection.labels)) {
+          labels[i].setName(presentation.inspection.labels[i].name);
+          labels[i].setValue(presentation.inspection.labels[i].value);
+        }
+      } else {
+        result.setNone();
+      }
+      co_return;
+    }
     if (methodId == 1 || methodId == 2 || methodId == 3) {
       auto response = co_await request.send();
       if (methodId == 2) {
@@ -135,6 +273,7 @@ class HostContainerRpc final: public capnp::Capability::Server,
         co_await resolve(false, true, false, kj::str(""), kj::str(leaseKey), false);
       }
       co_await resolve(false, methodId != 1, true, kj::str(""), kj::str(leaseKey), false);
+      target.ownerActivity = {};
       if (methodId == 1) startedLeaseKey = kj::str(leaseKey);
       if (methodId == 3) startedLeaseKey = kj::none;
       context.getResults().setAs<capnp::AnyPointer>(response);
@@ -148,6 +287,8 @@ class HostContainerRpc final: public capnp::Capability::Server,
   kj::Own<MutationQueue> mutations;
   StageEgress stageEgress;
   RegisterNativeEgress registerNativeEgress;
+  CaptureHostContainerSnapshot capture;
+  kj::Function<void(int64_t)> configureInactivity;
 };
 
 }  // namespace workerd::server

@@ -615,6 +615,8 @@ jsg::Promise<Container::Snapshot> Container::snapshotContainer(
 jsg::Promise<void> Container::setInactivityTimeout(jsg::Lock& js, int64_t durationMs) {
   JSG_REQUIRE(
       durationMs > 0, TypeError, "setInactivityTimeout() cannot be called with a durationMs <= 0");
+  JSG_REQUIRE(
+      durationMs <= 6 * 60 * 60 * 1000, Error, "setInactivityTimeout() cannot exceed 6 hours");
 
   auto req = rpcClient->setInactivityTimeoutRequest();
 

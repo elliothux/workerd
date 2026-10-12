@@ -275,7 +275,9 @@ class WorkerLoaderFactory: public jsg::Object {
       jsg::Ref<DurableObjectFacets> facets,
       kj::String className,
       jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(
-          bool, bool, bool, kj::String, kj::String, bool)> resolve);
+          bool, bool, bool, kj::String, kj::String, bool)> resolve,
+      jsg::Function<jsg::Promise<HostContainerSnapshot>(kj::String, jsg::Optional<kj::String>)>
+          capture);
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
       jsg::Ref<WorkerStub> stub,
       kj::Array<jsg::Ref<Fetcher>> tails,
@@ -361,7 +363,8 @@ class HostExtensionFactory: public jsg::Object {
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
       api::WorkerLoader::Module, api::WorkerLoader::WorkerCode,                                    \
       api::WorkerLoader::WorkerCode::HostBinding, api::WorkerLoaderFactory, api::HostFacets,       \
-      api::HostContainer, workerd::HostContainerLease, api::HostExtensionPort,                     \
+      api::HostContainer, workerd::HostContainerLease, workerd::HostContainerLabel,                \
+      workerd::HostContainerInspection, workerd::HostContainerSnapshot, api::HostExtensionPort,    \
       api::HostExtensionFactory, workerd::ResourceLimits
 
 }  // namespace workerd::api

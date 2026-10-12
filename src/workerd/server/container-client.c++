@@ -1183,6 +1183,18 @@ void ContainerClient::setHostCredentials(kj::String control, kj::String callback
   callbackToken = kj::mv(callback);
 }
 
+void ContainerClient::setHostActivityFactory(kj::Function<kj::Own<void>()> factory) {
+  JSG_REQUIRE(outbound != kj::none, Error, "The Container has no host attachment.");
+  hostActivityFactory = kj::mv(factory);
+}
+
+kj::Own<void> ContainerClient::startHostActivity() {
+  KJ_IF_SOME(factory, hostActivityFactory) {
+    return factory();
+  }
+  return {};
+}
+
 ContainerClient::~ContainerClient() noexcept(false) {
   shutdown();
 }
@@ -1236,6 +1248,7 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
         pumpTasks(*this) {}
 
   kj::Promise<void> connect(ConnectContext context) override {
+    auto activity = containerClient.startHostActivity();
     auto mappedPort = JSG_REQUIRE_NONNULL(containerClient.sidecarIngressHostPort, Error,
         "connect(): Container ingress proxy is not running.");
 
@@ -1293,7 +1306,8 @@ class ContainerClient::DockerPort final: public rpc::Container::Port::Server,
 
     pumpTasks.add(containerClient.wrapCallbacks(
         kj::joinPromisesFailFast(kj::arr(kj::mv(upPump), kj::mv(downPump)))
-            .attach(kj::mv(httpClient), kj::mv(upEnd), kj::mv(connection), kj::mv(downEnd))));
+            .attach(kj::mv(httpClient), kj::mv(upEnd), kj::mv(connection), kj::mv(downEnd),
+                kj::mv(activity))));
     co_return;
   }
 
@@ -1333,6 +1347,7 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
         killToken(kj::mv(killToken)),
         pty(pty),
         sharedConnection(kj::refcounted<SharedExecConnection>(kj::mv(connection))) {
+    auto activity = this->containerClient->startHostActivity();
     kj::Maybe<kj::Own<capnp::ExplicitEndOutputStream>> stdoutStream = kj::none;
     KJ_IF_SOME(out, stdoutWriter) {
       stdoutStream = this->containerClient->byteStreamFactory.capnpToKjExplicitEnd(out);
@@ -1345,7 +1360,8 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       // it straight through to stdout instead of demultiplexing Docker's frame protocol. stderr is
       // always combined into stdout when a PTY is active, so there is no separate stderr stream.
       auto task = copyRawExecOutput(*sharedConnection->connection, kj::mv(stdoutStream))
-                      .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
+                      .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection),
+                          kj::mv(activity));
       streamClosedTask = this->containerClient
                              ->wrapCallbacks(kj::mv(task).attach(
                                  kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
@@ -1365,7 +1381,8 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
     // process-completion signal, even when stdout/stderr are ignored.
     auto task = demuxDockerExecOutput(
         *sharedConnection->connection, kj::mv(stdoutStream), kj::mv(stderrStream), combinedOutput)
-                    .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection));
+                    .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection),
+                        kj::mv(activity));
     streamClosedTask = this->containerClient
                            ->wrapCallbacks(kj::mv(task).attach(
                                kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
@@ -1374,6 +1391,7 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
   }
 
   kj::Promise<void> wait(WaitContext context) override {
+    auto activity = containerClient->startHostActivity();
     waitStarted = true;
     if (!sharedConnection->stdinOpened && !sharedConnection->stdinClosed) {
       sharedConnection->connection->shutdownWrite();
@@ -1552,6 +1570,7 @@ class EgressHttpService final: public kj::HttpService {
       auto body = response.reject(401, "Unauthorized", rejection, uint64_t(0));
       co_return;
     }
+    auto activity = containerClient.startHostActivity();
     auto destAddr = kj::str(host);
     if (co_await handleConnectMode(destAddr, headers, connection, response, "X-Tls-Sni",
             /*defaultPort=*/443, EgressProtocol::HTTPS)) {

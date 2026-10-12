@@ -2615,8 +2615,8 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
     Internal Server Error)"_blockquote);
 }
 
-kj::StringPtr hostContainerOwnerConfig() {
-  return R"((
+kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0, bool defaultCleanup = false) {
+  return kj::str(R"((
     extensions = [(modules = [
       (name = "cloudflare-internal:open-compute-host-policy", internal = true,
        esModule = "export default () => namespace => namespace;")
@@ -2628,7 +2628,7 @@ kj::StringPtr hostContainerOwnerConfig() {
         modules = [(name = "host.js", esModule =
           `import { DurableObject } from 'cloudflare:workers';
           `let births = 0; const grants = [];
-          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { fetch() { return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { constructorSerial() { return this.serial; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
           `export class Host extends DurableObject {
           `  constructor(ctx, env) {
           `    super(ctx, env);
@@ -2639,24 +2639,29 @@ kj::StringPtr hostContainerOwnerConfig() {
           `    this.leaseActive = (this.birth === 1 && this.replaced) || this.birth > 2; this.leaseKey = (this.birth === 1 ? 'a' : '9').repeat(64);
           `    this.grant = env.factory.getContainer(ctx.facets, 'Tenant', async (_start, stop, completed, _startup, expected) => {
           `      if (expected && expected !== this.leaseKey) throw new Error('Stale execution authority');
-          `      if (stop && completed) { this.leaseActive = false; return undefined; }
+          `      if (stop && completed) { if (env.inactivityMs || env.defaultCleanup) { await env.engine.fetch('http://unit/containers/' + this.leaseKey, {method:'DELETE'}); await env.engine.fetch('http://unit/containers/' + this.leaseKey + '-proxy', {method:'DELETE'}); } this.leaseActive = false; return undefined; }
           `      if (_start) this.leaseActive = true;
           `      if (!this.leaseActive) return undefined;
           `      return ({
           `      leaseKey: this.leaseKey, imageRef: 'sha256:' + 'b'.repeat(64),
           `      providerContractSha256: 'e'.repeat(64), controlToken: (this.controlRotated ? '6' : 'c').repeat(64),
-          `      callbackToken: (this.callbackRotated ? '8' : 'd').repeat(64), nativeStartupJson: '{}'
-          `    }); });
+          `      callbackToken: (this.callbackRotated ? '8' : 'd').repeat(64), nativeStartupJson: '{}',
+          `      inspection: {image: 'registry/owner@sha256:' + 'b'.repeat(64), labels: [{name:'owner',value:'tenant'}]}
+          `    }); }, async (expected, name) => {
+          `      if (expected !== this.leaseKey || !this.leaseActive || name !== 'owner-checkpoint') throw new Error('Invalid capture authority');
+          `      return {id: 'ee2acc27-21e4-48a7-96f4-9790eb855d78', size: 2850, name};
+          `    });
           `    grants.push(this.grant);
           `    const loaded = env.loader.load({compatibilityDate:'2026-09-08',
           `      compatibilityFlags:[], mainModule:'tenant.js',
-          `      modules:{'tenant.js':source}, env:{OUTBOUND_HOST: this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid'}, openComputePrivateEnv:{},
+          `      modules:{'tenant.js':source}, env:{INACTIVITY_MS: env.inactivityMs, OUTBOUND_HOST: this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid'}, openComputePrivateEnv:{},
           `      openComputeHostPolicy:true, openComputeContainer:this.grant,
           `      globalOutbound:env.outbound});
           `    this.child = ctx.facets.get('tenant', () => ({
           `      class:loaded.getDurableObjectClass('Tenant'), id:'tenant'}));
           `  }
           `  async fetch(request) {
+          `    if (new URL(request.url).pathname === '/snapshot') return new Response(JSON.stringify(await this.child.capture()));
           `    if (new URL(request.url).pathname === '/retire') this.ctx.abort('Server shutting down.');
           `    if (new URL(request.url).pathname === '/failed-warm') {
           `      const serial = await this.child.constructorSerial();
@@ -2725,6 +2730,10 @@ kj::StringPtr hostContainerOwnerConfig() {
           `}};
         )],
         bindings = [
+          (name = "inactivityMs", json = ")",
+      inactivityMs, R"("),
+          (name = "defaultCleanup", json = ")",
+      defaultCleanup ? "true" : "false", R"("),
           (name = "objects", durableObjectNamespace = "Host"),
           (name = "factory", workerLoader = (factory = true)),
           (name = "loader", workerLoader = ()),
@@ -2750,6 +2759,7 @@ kj::StringPtr hostContainerOwnerConfig() {
           `  if (path === '/stats') return new Response(String(requests));
           `  if (path === '/shutdown-proof') return new Response(String(states.get('9'.repeat(64))) + ':' + String(states.get('9'.repeat(64) + '-proxy')));
           `  if (path === '/process-proof') return new Response(String(starts) + ':' + String(deletes));
+          `  if (path === '/live-count') return new Response(String([...states.values()].filter(Boolean).length));
           `  ++requests;
           `  if (path.endsWith('/archive')) return new Response(null,{status:200});
           `  if (path === '/containers/create') return Response.json({Id:new URL(request.url).searchParams.get('name')},{status:201});
@@ -2788,33 +2798,36 @@ kj::StringPtr hostContainerOwnerConfig() {
           `  }
 
           `  if (request.startsWith('CONNECT ')) {
-          `    const owner = pool; ++owner.idle;
+          `    const owner = pool; while (owner.idle >= 16) await scheduler.wait(200); ++owner.idle;
+          `    let unused = true; const take = () => { if (unused) { unused = false; --owner.idle; } };
           `    try {
-          `    if (owner.idle > 16) await scheduler.wait(3600000);
           `    await writer.write(new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\n'));
           `    let release; const done = new Promise(resolve => { release = resolve; });
           `    const first = reader.read();
-          `    const channel = {reader, writer, first, release}; channels.push(channel); if (ready) { ready(); ready = undefined; }
-          `    first.then(part => { if (part.done) { const index = channels.indexOf(channel); if (index >= 0) channels.splice(index,1); release(); } }, () => release());
+          `    const channel = {reader, writer, first, release, take}; channels.push(channel); if (ready) { ready(); ready = undefined; }
+          `    const closed = () => { const index = channels.indexOf(channel); if (index >= 0) channels.splice(index,1); take(); release(); };
+          `    first.then(part => { if (part.done) closed(); }, closed);
           `    await done;
-          `    } finally { --owner.idle; }
+          `    } finally { take(); }
           `  } else {
           `    if (request.startsWith('GET /unit-rotate ')) callbackToken = '8'.repeat(64);
           `    if (request.startsWith('GET /unit-mark-retired ')) { retired = channels.splice(0); pool = {idle:0}; }
           `    if (request.startsWith('GET /unit-close-retired ')) { await Promise.all(retired.map(async channel => { channel.release(); await channel.reader.cancel(); await channel.writer.abort(); })); retired = []; }
           `    if (request.startsWith('GET /unit-callback?')) {
           `      const host = new URL('http://unit' + request.split(' ')[1]).searchParams.get('host');
-          `      let result; let expired = false; const deadline = scheduler.wait(5000).then(() => { expired = true; });
+          `      const innerPath = new URL('http://unit' + request.split(' ')[1]).searchParams.has('delay') ? '/slow' : '/';
+          `      let result; let expired = false; const deadline = scheduler.wait(innerPath === '/slow' ? 940000 : 5000).then(() => { expired = true; });
           `      for (let attempt = 0; attempt < 32 && !expired; ++attempt) {
           `        const channel = channels.shift();
           `        if (!channel) { await Promise.race([new Promise(resolve => { ready = resolve; }), deadline]); continue; }
+          `        channel.take();
           `        try {
           `          const read = promise => Promise.race([promise, deadline.then(() => { throw new Error('Unit callback deadline exceeded'); })]);
           `          await channel.writer.write(new TextEncoder().encode('CONNECT 203.0.113.1:80 HTTP/1.1\r\nHost: 203.0.113.1:80\r\nX-Hostname: ' + host + '\r\nX-Proto: http\r\nX-Open-Compute-Container-Callback: ' + callbackToken + '\r\n\r\n'));
           `          let response = new TextDecoder().decode((await read(channel.first)).value);
           `          while (!response.includes('\r\n\r\n')) { const part = await read(channel.reader.read()); if(part.done) throw new Error('Callback closed'); response += new TextDecoder().decode(part.value); }
           `          if (!response.startsWith('HTTP/1.1 200 ')) throw new Error('Callback CONNECT rejected');
-          `          await channel.writer.write(new TextEncoder().encode('GET / HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n'));
+          `          await channel.writer.write(new TextEncoder().encode('GET ' + innerPath + ' HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n'));
           `          let inner = ''; for (;;) { const part = await read(channel.reader.read()); if (part.done) break; inner += new TextDecoder().decode(part.value); const end = inner.indexOf('\r\n\r\n'); if (end >= 0) { const size = inner.slice(0,end).match(/content-length: (\d+)/i); if ((size && inner.length >= end+4+Number(size[1])) || /\r\n0\r\n\r\n$/.test(inner)) break; } } await channel.writer.close();
           `          result = inner.slice(inner.indexOf('\r\n\r\n') + 4); if (/transfer-encoding: chunked/i.test(inner)) { let rest = result; result = ''; for (;;) { const end = rest.indexOf('\r\n'); const length = parseInt(rest.slice(0,end),16); if (!length) break; result += rest.slice(end+2,end+2+length); rest = rest.slice(end+2+length+2); } } break;
           `        } catch {} finally { channel.release(); await channel.reader.cancel().catch(() => {}); await channel.writer.abort().catch(() => {}); }
@@ -2841,7 +2854,7 @@ kj::StringPtr hostContainerOwnerConfig() {
       (name = "docker", address = "docker-addr", service = "docker"),
       (name = "sidecar", address = "127.0.0.1:39002", service = "sidecar", tcp = ())
     ]
-  ))"_kj;
+  ))"_kj);
 }
 
 KJ_TEST("Server: Host Container monitor retains its owner across the idle window") {
@@ -2851,10 +2864,14 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
   test.start();
   auto conn = test.connect("test-addr");
   conn.httpGet200("/first", "1:true:1");
+  conn.httpGet200("/snapshot",
+      R"({"id":"ee2acc27-21e4-48a7-96f4-9790eb855d78","size":2850,"name":"owner-checkpoint"})");
   test.wait(12);
   auto next = test.connect("test-addr");
   next.httpGet200("/", "1:true:2");
   next.httpGet200("/replace", "1:true:3");
+  next.httpGet200("/snapshot",
+      R"({"id":"ee2acc27-21e4-48a7-96f4-9790eb855d78","size":2850,"name":"owner-checkpoint"})");
   test.wait(12);
   auto replaced = test.connect("test-addr");
   replaced.httpGet200("/", "1:true:4");
@@ -2888,6 +2905,92 @@ KJ_TEST("Server: Host Container monitor retains its owner across the idle window
   test.wait(12);
   auto recoveredIdle = test.connect("test-addr");
   recoveredIdle.httpGet200("/", "3:true:10");
+}
+
+KJ_TEST("Server: Private Container inactivity survives idle and positively stops its lease") {
+  TestServer test(hostContainerOwnerConfig(2000));
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto first = test.connect("test-addr");
+  first.httpGet200("/first", "1:true:1");
+  test.wait(12);
+  auto active = test.connect("test-addr");
+  active.httpGet200("/", "1:true:2");
+  // The automatic monitor and SDK waitUntil stop retaining the actors after 15 minutes.
+  // Retain only the internal control context until the inactivity stop has positive authority.
+  test.wait(15 * 60 + 25);
+  auto stopped = test.connect("test-addr");
+  stopped.httpGet200("/", "2:false:3");
+  stopped.httpGet200("/start", "2:true:4");
+  // A reconstructed DO must configure the timeout again; the constructor above does so.
+  test.wait(15 * 60 + 25);
+  // The third host in the shared fixture models daemon recovery of an admitted lease. Its
+  // provider flag is deliberately live; the previous execution still has positive cleanup.
+  auto proof = test.connect("docker-addr");
+  proof.httpGet200("/shutdown-proof", "false:false");
+}
+
+KJ_TEST("Server: Active egress delays inactivity; unused reverse channels do not") {
+  TestServer test(hostContainerOwnerConfig(2000));
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto first = test.connect("test-addr");
+  first.httpGet200("/first", "1:true:1");
+  // A real callback arrives independently of the host's HTTP request. Its live tunnel must
+  // outlast the monitor's 15-minute owner hold.
+  test.wait(890);
+  auto before = test.connect("docker-addr");
+  before.httpGet200("/live-count", "2");
+  auto warm = test.connect("test-addr");
+  warm.sendHttpGet("/");
+  test.wait(1);
+  warm.recvHttp200("1:true:2");
+  auto callback = test.connect("127.0.0.1:39002");
+  callback.send("GET /unit-callback?host=first.invalid&delay=1 HTTP/1.1\r\nHost: test\r\n\r\n");
+  test.wait(13);
+  auto live = test.connect("docker-addr");
+  live.httpGet200("/live-count", "2");
+  test.wait(17);
+  callback.recv("HTTP/1.1 200 OK\nContent-Length: 13\n\nfirst.invalid");
+  test.wait(3);
+  auto gone = test.connect("docker-addr");
+  gone.httpGet200("/live-count", "0");
+}
+
+KJ_TEST("Server: Ordinary tenant waitUntil outlasts the monitor owner window") {
+  TestServer test(hostContainerOwnerConfig(2000));
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto first = test.connect("test-addr");
+  first.httpGet200("/first", "1:true:1");
+  test.wait(890);
+  auto background = test.connect("test-addr");
+  background.sendHttpGet("/background");
+  test.wait(1);
+  background.recvHttp200("1:true:2");
+  test.wait(13);
+  auto live = test.connect("docker-addr");
+  live.httpGet200("/live-count", "2");
+  test.wait(20);
+  auto gone = test.connect("docker-addr");
+  gone.httpGet200("/live-count", "0");
+}
+
+KJ_TEST("Server: Default Container inactivity positively stops without an explicit setter") {
+  TestServer test(hostContainerOwnerConfig(0, true));
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto first = test.connect("test-addr");
+  first.httpGet200("/first", "1:true:1");
+  test.wait(15 * 60 + 25);
+  auto stopped = test.connect("docker-addr");
+  stopped.httpGet200("/live-count", "0");
+  auto reconstructed = test.connect("test-addr");
+  reconstructed.httpGet200("/", "2:false:2");
 }
 
 KJ_TEST("Server: Host warm start registers callbacks for a previously constructed cold facet") {

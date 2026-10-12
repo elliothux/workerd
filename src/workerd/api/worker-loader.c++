@@ -154,12 +154,15 @@ class RevocableContainerEgress final: public IoChannelFactory::HostContainerEgre
 
 class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChannel {
  public:
-  HostContainerChannelImpl(
-      Worker::Actor::FacetManager& owner, kj::String className, ResolveHostContainerLease resolve)
+  HostContainerChannelImpl(Worker::Actor::FacetManager& owner,
+      kj::String className,
+      ResolveHostContainerLease resolve,
+      CaptureHostContainerSnapshot capture)
       : origin(IoContext::current().getWeakRef()),
         owner(owner),
         className(kj::mv(className)),
         resolve(kj::mv(resolve)),
+        capture(kj::mv(capture)),
         revocation(kj::newPromiseAndFulfiller<void>()),
         membrane(kj::refcounted<RevokerMembrane>(
             kj::mv(revocation.promise).exclusiveJoin(IoContext::current().onAbort()))) {}
@@ -182,6 +185,18 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
       return self
           .resolve(start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor)
           .attach(kj::addRef(self));
+    },
+        [weak = weakSelf->addRef()](kj::String expectedLeaseKey,
+            kj::Maybe<kj::String> name) mutable -> kj::Promise<HostContainerSnapshot> {
+      auto& self =
+          JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container attachment grant has ended.");
+      auto keepAlive = kj::addRef(self);
+      JSG_REQUIRE(!self.revoked && self.origin->tryGet() != kj::none, Error,
+          "The Container attachment grant has been revoked.");
+      auto result = co_await self.capture(kj::mv(expectedLeaseKey), kj::mv(name));
+      JSG_REQUIRE(!self.revoked && self.origin->tryGet() != kj::none, Error,
+          "The Container attachment grant has been revoked.");
+      co_return kj::mv(result);
     },
         kj::mv(outbound));
     attached = capnp::membrane(kj::mv(attachment.client), kj::addRef(*membrane));
@@ -227,6 +242,7 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
   Worker::Actor::FacetManager& owner;
   kj::String className;
   ResolveHostContainerLease resolve;
+  CaptureHostContainerSnapshot capture;
   kj::PromiseFulfillerPair<void> revocation;
   kj::Own<RevokerMembrane> membrane;
   bool revoked = false;
@@ -253,7 +269,9 @@ jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
     jsg::Ref<DurableObjectFacets> facets,
     kj::String className,
     jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(
-        bool, bool, bool, kj::String, kj::String, bool)> resolve) {
+        bool, bool, bool, kj::String, kj::String, bool)> resolve,
+    jsg::Function<jsg::Promise<HostContainerSnapshot>(kj::String, jsg::Optional<kj::String>)>
+        capture) {
   JSG_REQUIRE(
       className.size() > 0 && className.size() <= 256, TypeError, "Invalid Container class name.");
   auto& ioctx = IoContext::current();
@@ -277,14 +295,42 @@ jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
                 value.controlToken != value.callbackToken && value.imageRef.startsWith("sha256:") &&
                 validDigest(value.imageRef.slice(7)),
             Error, "Invalid Container execution authority.");
+        auto& inspection = value.inspection;
+        JSG_REQUIRE(inspection.image.size() <= 584 && inspection.labels.size() <= 10, Error,
+            "Invalid Container inspection authority.");
+        for (auto c: inspection.image) {
+          JSG_REQUIRE(c >= 0x21 && c <= 0x7e, Error, "Invalid Container inspection authority.");
+        }
+        for (auto i: kj::indices(inspection.labels)) {
+          auto& label = inspection.labels[i];
+          JSG_REQUIRE(label.name.size() > 0 && label.name.size() <= 16 && label.value.size() <= 64,
+              Error, "Invalid Container inspection authority.");
+          for (auto c: label.name) {
+            JSG_REQUIRE(
+                static_cast<kj::byte>(c) >= 0x20, Error, "Invalid Container inspection authority.");
+          }
+          for (auto c: label.value) {
+            JSG_REQUIRE(
+                static_cast<kj::byte>(c) >= 0x20, Error, "Invalid Container inspection authority.");
+          }
+          for (auto j: kj::zeroTo(i)) {
+            JSG_REQUIRE(inspection.labels[j].name != label.name, Error,
+                "Invalid Container inspection authority.");
+          }
+        }
         return kj::mv(value);
       }
       return kj::none;
     }));
   });
+  auto captureCallback = ioctx.makeReentryCallbackWeak(
+      [capture = kj::mv(capture)](jsg::Lock& js, IoContext& ioctx, kj::String expectedLeaseKey,
+          kj::Maybe<kj::String> name) mutable {
+    return capture(js, kj::mv(expectedLeaseKey), jsg::Optional<kj::String>(kj::mv(name)));
+  });
   kj::Own<IoChannelFactory::HostContainerChannel> channel =
       kj::refcounted<HostContainerChannelImpl>(
-          facets->getFacetManager(), kj::mv(className), kj::mv(callback));
+          facets->getFacetManager(), kj::mv(className), kj::mv(callback), kj::mv(captureCallback));
   return js.alloc<HostContainer>(ioctx.addObject(kj::mv(channel)));
 }
 

@@ -354,7 +354,8 @@ class Server::ActorClass: public IoChannelFactory::ActorClassChannel {
       kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager,
       kj::Maybe<rpc::Container::Client> container,
       jsg::Dict<kj::String> containerImages,
-      kj::Maybe<Worker::Actor::FacetManager&> facetManager) = 0;
+      kj::Maybe<Worker::Actor::FacetManager&> facetManager,
+      kj::Maybe<kj::Own<Worker::Actor::WaitUntilTaskTracker>> waitUntilTaskTracker) = 0;
 
   // Start a request on the actor. (The actor must have been created using newActor().)
   virtual kj::Own<WorkerInterface> startRequest(
@@ -513,6 +514,27 @@ class Server::ActorNamespace final {
                               public kj::Refcounted,
                               public Worker::Actor::FacetManager {
    public:
+    class HostWaitUntilTracker final: public Worker::Actor::WaitUntilTaskTracker {
+     public:
+      explicit HostWaitUntilTracker(ActorContainer& owner): owner(owner) {}
+      kj::Own<Worker::Actor::WaitUntilTaskHandle> registerTask() override {
+        if (!owner.privateHostContainerTenant) return {};
+        class Handle final: public Worker::Actor::WaitUntilTaskHandle {
+         public:
+          explicit Handle(ActorContainer& owner)
+              : activity(kj::refcounted<HostContainerActivity>(*owner.root.tracker, owner.timer)) {}
+          ~Handle() noexcept override {}
+
+         private:
+          kj::Own<HostContainerActivity> activity;
+        };
+        return kj::heap<Handle>(owner);
+      }
+
+     private:
+      ActorContainer& owner;
+    };
+
     // Information which is needed before start() can be called, but may not be available yet
     // when the ActorContainer is constructed (especially in the case of facets).
     struct ClassAndId {
@@ -591,6 +613,11 @@ class Server::ActorNamespace final {
     void active() override {
       // We're handling a new request, cancel the eviction promise.
       shutdownTask = kj::none;
+      if (&root == this) {
+        KJ_IF_SOME(inactivity, hostContainerInactivity) {
+          inactivity->active();
+        }
+      }
     }
 
     void inactive() override {
@@ -598,6 +625,11 @@ class Server::ActorNamespace final {
         fulfiller->fulfill();
       }
       inactiveFulfillers.clear();
+      if (&root == this) {
+        KJ_IF_SOME(inactivity, hostContainerInactivity) {
+          inactivity->inactive();
+        }
+      }
 
       if (ns.isEvictable()) {
         KJ_IF_SOME(a, actor) {
@@ -633,6 +665,12 @@ class Server::ActorNamespace final {
       // If anyone holds a reference to the container other than the actor map, then it must be
       // a client.
       if (isShared()) return true;
+      if (&root == this && hasHostContainerAttachment) {
+        if (tracker->isActive()) return true;
+        KJ_IF_SOME(inactivity, hostContainerInactivity) {
+          if (inactivity->retainsOwner()) return true;
+        }
+      }
       for (auto& facet: facets) {
         if (facet.value->hasClients()) return true;
       }
@@ -799,6 +837,7 @@ class Server::ActorNamespace final {
     }
 
     void revokeHostContainerCallbacks() override {
+      if (&root == this || privateHostContainerTenant) root.hostContainerInactivity = kj::none;
       KJ_IF_SOME(state, hostContainerEgress) {
         state->revoke();
       }
@@ -839,6 +878,41 @@ class Server::ActorNamespace final {
       tracing::EventInfo getEventInfo() const override {
         return tracing::CustomEventInfo();
       }
+    };
+
+    class HostContainerControlEvent final: public WorkerInterface::CustomEvent {
+     public:
+      explicit HostContainerControlEvent(kj::Function<kj::Promise<void>()> operation)
+          : operation(kj::mv(operation)) {}
+      kj::Promise<Result> run(kj::Own<IoContext_IncomingRequest> incoming,
+          kj::Maybe<kj::StringPtr>,
+          kj::Maybe<Worker_VersionInfo>,
+          Frankenvalue,
+          kj::TaskSet& tasks,
+          bool) override {
+        incoming->delivered();
+        KJ_DEFER(incoming->drain(tasks, kj::mv(incoming)));
+        co_await operation();
+        co_return Result{.outcome = EventOutcome::OK};
+      }
+      kj::Promise<Result> sendRpc(capnp::HttpOverCapnpFactory&,
+          capnp::ByteStreamFactory&,
+          FrankenvalueHandler&,
+          rpc::EventDispatcher::Client) override {
+        JSG_FAIL_REQUIRE(Error, "Native Container control is local only.");
+      }
+      kj::Promise<Result> notSupported() override {
+        JSG_FAIL_REQUIRE(Error, "Native Container control is unavailable.");
+      }
+      uint16_t getType() override {
+        return 0;
+      }
+      tracing::EventInfo getEventInfo() const override {
+        return tracing::CustomEventInfo();
+      }
+
+     private:
+      kj::Function<kj::Promise<void>()> operation;
     };
 
     kj::Promise<void> hostContainerStarted(bool newExecution) override {
@@ -894,10 +968,12 @@ class Server::ActorNamespace final {
     }
     IoChannelFactory::HostContainerAttachment attachHostContainer(HostContainerOwner& owner,
         ResolveHostContainerLease resolve,
+        CaptureHostContainerSnapshot capture,
         kj::Own<IoChannelFactory::SubrequestChannel> outbound) override {
       JSG_REQUIRE(parent != kj::none && &KJ_ASSERT_NONNULL(parent) == &owner && &root == &owner &&
               key == "tenant",
           Error, "Container attachments require the host's declared tenant facet.");
+      privateHostContainerTenant = true;
       root.hasHostContainerAttachment = true;
       root.revokeHostContainerCallbacks();
       root.hostContainerEgress = kj::refcounted<ContainerClient::EgressState>();
@@ -941,24 +1017,106 @@ class Server::ActorNamespace final {
           state->registerMapping(protocol, hostPort, kj::mv(channel));
         }
       };
+      auto captureSnapshot =
+          [weak = root.weakSelf->addRef(), state = kj::addRef(*staged), capture = kj::mv(capture)](
+              kj::String expectedLeaseKey,
+              kj::Maybe<kj::String> name) mutable -> kj::Promise<HostContainerSnapshot> {
+        auto requireCurrent = [&]() {
+          auto& owner =
+              JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+          JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
+                  KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == state.get() &&
+                  owner.hostContainerLease != kj::none &&
+                  KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey == expectedLeaseKey,
+              Error, "Container execution authority changed.");
+        };
+        requireCurrent();
+        auto result = co_await capture(kj::str(expectedLeaseKey), kj::mv(name));
+        requireCurrent();
+        co_return kj::mv(result);
+      };
+      auto authority = kj::refcounted<HostContainerAuthority>(kj::mv(resolve));
+      auto configureInactivity = [weak = root.weakSelf->addRef(), state = kj::addRef(*staged),
+                                     authority = kj::addRef(*authority)](
+                                     int64_t durationMs) mutable {
+        auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
+                KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == state.get(),
+            Error, "Container execution authority changed.");
+        if (owner.hostContainerInactivity == kj::none) {
+          owner.hostContainerInactivity =
+              kj::heap<HostContainerInactivity>(owner.timer, owner.tracker->isActive(),
+                  [weak = weak->addRef(), state = kj::addRef(*state),
+                      authority = kj::addRef(*authority)]() mutable -> kj::Promise<void> {
+            auto& owner =
+                JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+            auto keepOwner = owner.addRef();
+            auto expected =
+                owner.hostContainerLease.map([](auto& lease) { return kj::str(lease.leaseKey); });
+            // Only the bounded stop operation creates a control request; the idle timer is not activity.
+            KJ_DEFER(if (!owner.tracker->isActive()) {
+              owner.shutdownTask = owner.handleShutdown().eagerlyEvaluate(
+                  [](kj::Exception&&) { KJ_LOG(ERROR, "Container owner retirement failed."); });
+            });
+            auto request = co_await owner.startRequest({});
+            co_await request->customEvent(kj::heap<HostContainerControlEvent>(
+                [&owner, state = kj::addRef(*state), authority = kj::addRef(*authority),
+                    expected = kj::mv(expected)]() mutable -> kj::Promise<void> {
+              auto turn = owner.hostContainerMutations->take();
+              KJ_DEFER(turn.fulfiller->fulfill());
+              co_await turn.promise;
+              JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
+                      KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == state.get(),
+                  Error, "Container execution authority changed.");
+              KJ_IF_SOME(key, expected) {
+                JSG_REQUIRE(owner.hostContainerLease != kj::none &&
+                        KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey == key,
+                    Error, "Container execution authority changed.");
+                co_await authority->resolve(false, true, false, kj::str(""), kj::str(key), false);
+                co_await authority->resolve(false, true, true, kj::str(""), kj::str(key), false);
+                // Both callbacks are generation fenced; only positive platform cleanup reaches here.
+                KJ_ASSERT_NONNULL(owner.hostContainerClient)->revokeHostCallbacks();
+                owner.hostContainerClient = kj::none;
+                owner.hostContainerLease = kj::none;
+              }
+            }));
+          });
+        }
+        KJ_ASSERT_NONNULL(owner.hostContainerInactivity)->configure(durationMs);
+      };
+      // A newly constructed DO starts with the local actor eviction interval. Its setter can
+      // replace this duration, but ordinary operations never reset the configured policy.
+      configureInactivity(10000);
       auto weak = root.weakSelf->addRef();
       auto getClient =
-          [weak = kj::mv(weak), resolve = kj::mv(resolve), outbound = kj::mv(outbound),
-              staged = kj::mv(staged)](bool start, bool stop, bool completed, kj::String startup,
-              kj::String expectedLeaseKey,
+          [weak = kj::mv(weak), tenant = weakSelf->addRef(), authority = kj::addRef(*authority),
+              outbound = kj::mv(outbound), staged = kj::mv(staged)](bool start, bool stop,
+              bool completed, kj::String startup, kj::String expectedLeaseKey,
               bool monitor) mutable -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
         // A tenant RPC belongs to the stable Root. Keep that owner's existing request tracker
         // active across admission and the actual native operation, including a pending monitor.
-        auto activity = kj::heap<RequestTracker::ActiveRequest>(
-            JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.")
-                .tracker->startRequest());
-        auto lease = co_await resolve(
-            start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor);
+        auto& initialOwner =
+            JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        kj::Own<void> activity =
+            kj::refcounted<HostContainerActivity>(*initialOwner.tracker, initialOwner.timer);
+        kj::Maybe<HostContainerLease> lease;
+        auto control = co_await initialOwner.startRequest({});
+        co_await control->customEvent(kj::heap<HostContainerControlEvent>(
+            [&lease, authority = kj::addRef(*authority), start, stop, completed, monitor,
+                startup = kj::mv(startup),
+                expectedLeaseKey = kj::mv(expectedLeaseKey)]() mutable -> kj::Promise<void> {
+          lease = co_await authority->resolve(
+              start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor);
+        }));
+        control = nullptr;
         auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
         JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
                 KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == staged.get(),
             Error, "Container execution authority changed.");
         if (stop && completed) {
+          KJ_IF_SOME(inactivity, owner.hostContainerInactivity) {
+            inactivity->reset();
+          }
           KJ_IF_SOME(client, owner.hostContainerClient) {
             client->revokeHostCallbacks();
           }
@@ -967,33 +1125,52 @@ class Server::ActorNamespace final {
         }
         if (lease == kj::none) co_return kj::none;
         auto& identity = KJ_ASSERT_NONNULL(lease);
+        if (start) {
+          KJ_IF_SOME(inactivity, owner.hostContainerInactivity) {
+            if (!inactivity->retainsOwner()) inactivity->configure(10000);
+          }
+        }
+        auto configureClient = [&](ContainerClient& client) {
+          client.setHostCredentials(
+              kj::str(identity.controlToken), kj::str(identity.callbackToken));
+          client.setHostEgressState(kj::addRef(*staged));
+          client.setHostActivityFactory(
+              [weak = weak->addRef(), tenant = tenant->addRef(), state = kj::addRef(*staged),
+                  key = kj::str(identity.leaseKey)]() -> kj::Own<void> {
+            auto& current =
+                JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+            JSG_REQUIRE(current.hostContainerEgress != kj::none &&
+                    KJ_ASSERT_NONNULL(current.hostContainerEgress).get() == state.get() &&
+                    current.hostContainerLease != kj::none &&
+                    KJ_ASSERT_NONNULL(current.hostContainerLease).leaseKey == key,
+                Error, "Container execution authority changed.");
+            JSG_REQUIRE(tenant->tryGet() != kj::none, Error, "The Container tenant has ended.");
+            return kj::refcounted<HostContainerActivity>(*current.tracker, current.timer);
+          });
+        };
         KJ_IF_SOME(existing, owner.hostContainerLease) {
           if (existing.leaseKey == identity.leaseKey) {
             JSG_REQUIRE(existing.imageRef == identity.imageRef &&
                     existing.providerContractSha256 == identity.providerContractSha256,
                 Error, "Container execution authority changed.");
-            KJ_ASSERT_NONNULL(owner.hostContainerClient)
-                ->setHostCredentials(
-                    kj::str(identity.controlToken), kj::str(identity.callbackToken));
-            KJ_ASSERT_NONNULL(owner.hostContainerClient)->setHostEgressState(kj::addRef(*staged));
+            configureClient(*KJ_ASSERT_NONNULL(owner.hostContainerClient));
             co_return HostContainerRpc::Resolved{
               rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
-              kj::str(identity.leaseKey), kj::mv(activity)};
+              kj::str(identity.leaseKey), kj::mv(activity), identity.inspection.clone()};
           }
         }
         owner.hostContainerClient = owner.ns.getContainerClient(identity.leaseKey,
             kj::StringPtr(identity.imageRef), ContainerPrivileges{}, kj::addRef(*outbound));
-        KJ_ASSERT_NONNULL(owner.hostContainerClient)
-            ->setHostCredentials(kj::str(identity.controlToken), kj::str(identity.callbackToken));
-        KJ_ASSERT_NONNULL(owner.hostContainerClient)->setHostEgressState(kj::addRef(*staged));
+        configureClient(*KJ_ASSERT_NONNULL(owner.hostContainerClient));
         owner.hostContainerLease = kj::mv(identity);
         co_return HostContainerRpc::Resolved{
           rpc::Container::Client(KJ_ASSERT_NONNULL(owner.hostContainerClient)->addRef()),
-          kj::str(KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey), kj::mv(activity)};
+          kj::str(KJ_ASSERT_NONNULL(owner.hostContainerLease).leaseKey), kj::mv(activity),
+          KJ_ASSERT_NONNULL(owner.hostContainerLease).inspection.clone()};
       };
       auto server = kj::refcounted<HostContainerRpc>(kj::mv(getClient),
           kj::addRef(*root.hostContainerMutations), kj::mv(stageEgress),
-          kj::mv(registerNativeEgress));
+          kj::mv(registerNativeEgress), kj::mv(captureSnapshot), kj::mv(configureInactivity));
       capnp::Capability::Client grant(kj::addRef(*server));
       return {grant.castAs<rpc::Container>(), kj::mv(server)};
     }
@@ -1105,6 +1282,8 @@ class Server::ActorNamespace final {
 
     // The root owns execution across replacement tenant facets; grants only borrow it.
     bool hasHostContainerAttachment = false;
+    bool privateHostContainerTenant = false;
+    kj::Maybe<kj::Own<HostContainerInactivity>> hostContainerInactivity;
     kj::Maybe<HostContainerLease> hostContainerLease;
     kj::Maybe<kj::Own<ContainerClient>> hostContainerClient;
     kj::Maybe<kj::Own<ContainerClient::EgressState>> hostContainerEgress;
@@ -1317,6 +1496,11 @@ class Server::ActorNamespace final {
       // JS WebSockets.
       // TODO(someday): We could make this timeout configurable to make testing less burdensome.
       co_await timer.afterDelay(10 * kj::SECONDS);
+      if (&root == this) {
+        KJ_IF_SOME(inactivity, hostContainerInactivity) {
+          if (inactivity->retainsOwner()) co_return;
+        }
+      }
       // Cancel the onBroken promise, since we're about to destroy the actor anyways and don't
       // want to trigger it.
       onBrokenTask = kj::none;
@@ -1651,7 +1835,7 @@ class Server::ActorNamespace final {
 
       auto actor = actorClass->newActor(getTracker(), Worker::Actor::cloneId(id),
           kj::mv(makeActorCache), kj::mv(makeStorage), kj::mv(loopback), tryGetManagerRef(),
-          kj::mv(container), kj::mv(containerImages), *this);
+          kj::mv(container), kj::mv(containerImages), *this, kj::heap<HostWaitUntilTracker>(*this));
       onBrokenTask = monitorOnBroken(*actor);
       this->actor = kj::mv(actor);
     }
@@ -2342,7 +2526,8 @@ class Server::InvalidConfigActorClass final: public ActorClass {
       kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager,
       kj::Maybe<rpc::Container::Client> container,
       jsg::Dict<kj::String> containerImages,
-      kj::Maybe<Worker::Actor::FacetManager&> facetManager) override {
+      kj::Maybe<Worker::Actor::FacetManager&> facetManager,
+      kj::Maybe<kj::Own<Worker::Actor::WaitUntilTaskTracker>> waitUntilTaskTracker) override {
     JSG_FAIL_REQUIRE(
         Error, "Cannot instantiate Durable Object class because its config is invalid.");
   }
@@ -4851,7 +5036,8 @@ class Server::WorkerService final: public Service,
         kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager,
         kj::Maybe<rpc::Container::Client> container,
         jsg::Dict<kj::String> containerImages,
-        kj::Maybe<Worker::Actor::FacetManager&> facetManager) override {
+        kj::Maybe<Worker::Actor::FacetManager&> facetManager,
+        kj::Maybe<kj::Own<Worker::Actor::WaitUntilTaskTracker>> waitUntilTaskTracker) override {
       TimerChannel& timerChannel = *service;
 
       // We define this event ID in the internal codebase, but to have WebSocket Hibernation
@@ -4868,7 +5054,8 @@ class Server::WorkerService final: public Service,
       return kj::refcounted<Worker::Actor>(*service->worker, tracker, kj::mv(actorId), true,
           kj::mv(makeActorCache), className, kj::mv(props), kj::mv(makeStorage), kj::mv(loopback),
           timerChannel, kj::refcounted<ActorObserver>(), kj::mv(manager), hibernationEventTypeId,
-          kj::mv(container), kj::mv(containerImages), facetManager);
+          kj::mv(container), kj::mv(containerImages), facetManager, kj::none, kj::none,
+          kj::mv(waitUntilTaskTracker));
     }
 
     kj::Own<WorkerInterface> startRequest(
@@ -6630,7 +6817,8 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
           kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager,
           kj::Maybe<rpc::Container::Client> container,
           jsg::Dict<kj::String> containerImages,
-          kj::Maybe<Worker::Actor::FacetManager&> facetManager) override {
+          kj::Maybe<Worker::Actor::FacetManager&> facetManager,
+          kj::Maybe<kj::Own<Worker::Actor::WaitUntilTaskTracker>> waitUntilTaskTracker) override {
         isolate->requireActiveNamespace();
         KJ_IF_SOME(grant, isolate->hostContainer) {
           if (entrypointName != kj::none &&
@@ -6649,7 +6837,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
         }
         return getInner().newActor(tracker, kj::mv(actorId), kj::mv(makeActorCache),
             kj::mv(makeStorage), kj::mv(loopback), kj::mv(manager), kj::mv(container),
-            kj::mv(containerImages), facetManager);
+            kj::mv(containerImages), facetManager, kj::mv(waitUntilTaskTracker));
       }
 
       kj::Own<WorkerInterface> startRequest(

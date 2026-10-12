@@ -140,6 +140,10 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // Replace provider generation credentials without changing the persisted execution identity.
   void setHostCredentials(kj::String controlToken, kj::String callbackToken);
 
+  // Only live work holds the control owner's activity, never an idle capability or pool slot.
+  void setHostActivityFactory(kj::Function<kj::Own<void>()> factory);
+  kj::Own<void> startHostActivity();
+
   // Implement rpc::Container::Server interface
   kj::Promise<void> status(StatusContext context) override;
   kj::Promise<void> start(StartContext context) override;
@@ -184,6 +188,7 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // via containerCleanupCanceler, in which case the .catch_() resolves it immediately).
   kj::ForkedPromise<void> pendingCleanup;
 
+  kj::Maybe<kj::Function<kj::Own<void>()>> hostActivityFactory;
   kj::Maybe<kj::String> controlToken;
   kj::Maybe<kj::String> callbackToken;
 
