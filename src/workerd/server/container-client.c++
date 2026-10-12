@@ -18,6 +18,7 @@
 #include <workerd/util/strong-bool.h>
 #include <workerd/util/uuid.h>
 
+#include <openssl/rand.h>
 #include <stdio.h>
 
 #include <capnp/compat/json.h>
@@ -31,6 +32,7 @@
 #include <kj/exception.h>
 #include <kj/string.h>
 
+#include <cmath>
 #include <limits>
 
 namespace workerd::server {
@@ -38,13 +40,72 @@ namespace workerd::server {
 // Whether an exec's stderr is merged into its stdout stream.
 WD_STRONG_BOOL(CombinedOutput);
 
-// Whether an exec was started with a PTY (raw single-stream output) rather than Docker's
-// multiplexed frame protocol.
+// Whether the application process uses a PTY. Private helpers retain Docker's frame protocol.
 WD_STRONG_BOOL(Pty);
 
 namespace {
 
 constexpr uint16_t SIDECAR_INGRESS_PORT = 39001;
+constexpr kj::StringPtr PRIVATE_EXEC_READY = "OC_EXEC_READY_V1\n"_kj;
+
+kj::String privateExecRandomHex() {
+  byte bytes[32];
+  KJ_REQUIRE(RAND_bytes(bytes, sizeof(bytes)) == 1, "Container exec entropy unavailable.");
+  return kj::encodeHex(kj::arrayPtr(bytes));
+}
+
+void setJsonText(capnp::JsonValue::Field::Builder field, kj::StringPtr name, kj::StringPtr value) {
+  field.setName(name);
+  field.initValue().setString(value);
+}
+
+void setJsonNumber(capnp::JsonValue::Field::Builder field, kj::StringPtr name, uint32_t value) {
+  field.setName(name);
+  field.initValue().setNumber(value);
+}
+
+kj::String privateExecStartJson(
+    capnp::List<capnp::Text>::Reader argv, bool pty, uint16_t rows, uint16_t cols) {
+  capnp::MallocMessageBuilder message;
+  auto fields = message.initRoot<capnp::JsonValue>().initObject(4);
+  fields[0].setName("argv");
+  auto args = fields[0].initValue().initArray(argv.size());
+  for (auto i: kj::indices(argv)) args[i].setString(argv[i]);
+  fields[1].setName("pty");
+  fields[1].initValue().setBoolean(pty);
+  setJsonNumber(fields[2], "rows", rows);
+  setJsonNumber(fields[3], "cols", cols);
+  auto body = capnp::JsonCodec().encodeRaw(message.getRoot<capnp::JsonValue>());
+  JSG_REQUIRE(body.size() <= 1048576, Error, "Container exec start request exceeds its limit.");
+  return body;
+}
+
+kj::Promise<void> bootstrapPrivateExec(
+    kj::AsyncIoStream& connection, kj::String key, kj::String start) {
+  byte header[8];
+  byte ready[17];
+  static_assert(PRIVATE_EXEC_READY.size() == sizeof(ready));
+  size_t offset = 0;
+  while (offset < sizeof(ready)) {
+    co_await connection.read(header, sizeof(header));
+    uint32_t length = (uint32_t(header[4]) << 24) | (uint32_t(header[5]) << 16) |
+        (uint32_t(header[6]) << 8) | header[7];
+    KJ_REQUIRE(header[0] == 1 && header[1] == 0 && header[2] == 0 && header[3] == 0 && length > 0 &&
+            length <= sizeof(ready) - offset,
+        "Container exec bootstrap frame rejected.");
+    co_await connection.read(kj::arrayPtr(ready + offset, length));
+    offset += length;
+  }
+  KJ_REQUIRE(kj::arrayPtr(ready).asChars() == PRIVATE_EXEC_READY.asArray(),
+      "Container exec bootstrap marker rejected.");
+  auto decoded = kj::decodeHex(key);
+  KJ_REQUIRE(!decoded.hadErrors && decoded.size() == 32);
+  byte size[] = {byte(start.size() >> 24), byte(start.size() >> 16), byte(start.size() >> 8),
+    byte(start.size())};
+  co_await connection.write(decoded.asPtr());
+  co_await connection.write(kj::arrayPtr(size));
+  co_await connection.write(start.asBytes());
+}
 
 constexpr kj::StringPtr SIDECAR_DNS_SERVERS[] = {
   "1.1.1.1"_kj,
@@ -129,6 +190,7 @@ struct DockerStreamedResponse {
   kj::uint statusCode;
   kj::String statusText;
   kj::Own<kj::AsyncIoStream> connection;
+  kj::Maybe<kj::String> upgrade;
 };
 
 // Validates an absolute path for snapshot use and returns the parsed component path.
@@ -477,75 +539,6 @@ ParsedAddress parseHostPort(kj::StringPtr str) {
   };
 }
 
-kj::StringPtr signalToString(uint32_t signal) {
-  switch (signal) {
-    case 1:
-      return "SIGHUP"_kj;  // Hangup
-    case 2:
-      return "SIGINT"_kj;  // Interrupt
-    case 3:
-      return "SIGQUIT"_kj;  // Quit
-    case 4:
-      return "SIGILL"_kj;  // Illegal instruction
-    case 5:
-      return "SIGTRAP"_kj;  // Trace trap
-    case 6:
-      return "SIGABRT"_kj;  // Abort
-    case 7:
-      return "SIGBUS"_kj;  // Bus error
-    case 8:
-      return "SIGFPE"_kj;  // Floating point exception
-    case 9:
-      return "SIGKILL"_kj;  // Kill
-    case 10:
-      return "SIGUSR1"_kj;  // User signal 1
-    case 11:
-      return "SIGSEGV"_kj;  // Segmentation violation
-    case 12:
-      return "SIGUSR2"_kj;  // User signal 2
-    case 13:
-      return "SIGPIPE"_kj;  // Broken pipe
-    case 14:
-      return "SIGALRM"_kj;  // Alarm clock
-    case 15:
-      return "SIGTERM"_kj;  // Termination
-    case 16:
-      return "SIGSTKFLT"_kj;  // Stack fault (Linux)
-    case 17:
-      return "SIGCHLD"_kj;  // Child status changed
-    case 18:
-      return "SIGCONT"_kj;  // Continue
-    case 19:
-      return "SIGSTOP"_kj;  // Stop
-    case 20:
-      return "SIGTSTP"_kj;  // Terminal stop
-    case 21:
-      return "SIGTTIN"_kj;  // Background read from tty
-    case 22:
-      return "SIGTTOU"_kj;  // Background write to tty
-    case 23:
-      return "SIGURG"_kj;  // Urgent condition on socket
-    case 24:
-      return "SIGXCPU"_kj;  // CPU limit exceeded
-    case 25:
-      return "SIGXFSZ"_kj;  // File size limit exceeded
-    case 26:
-      return "SIGVTALRM"_kj;  // Virtual alarm clock
-    case 27:
-      return "SIGPROF"_kj;  // Profiling alarm clock
-    case 28:
-      return "SIGWINCH"_kj;  // Window size change
-    case 29:
-      return "SIGIO"_kj;  // I/O now possible
-    case 30:
-      return "SIGPWR"_kj;  // Power failure restart (Linux)
-    case 31:
-      return "SIGSYS"_kj;  // Bad system call
-    default:
-      return "SIGKILL"_kj;
-  }
-}
-
 void writeTarField(kj::ArrayPtr<kj::byte> field, kj::StringPtr value) {
   auto len = kj::min(value.size(), field.size());
   field.write(value.asBytes().first(len));
@@ -764,6 +757,8 @@ kj::Promise<DockerStreamedResponse> readDockerStreamedResponse(
         .statusCode = statusCode,
         .statusText = kj::mv(statusText),
         .connection = kj::mv(prefixedConnection),
+        .upgrade =
+            headers.get(kj::HttpHeaderId::UPGRADE).map([](auto value) { return kj::str(value); }),
       };
     }
 
@@ -815,7 +810,8 @@ void detachEnd(kj::Maybe<kj::Own<capnp::ExplicitEndOutputStream>> stream) {
 kj::Promise<void> demuxDockerExecOutput(kj::AsyncInputStream& input,
     kj::Maybe<kj::Own<capnp::ExplicitEndOutputStream>> stdoutWriter,
     kj::Maybe<kj::Own<capnp::ExplicitEndOutputStream>> stderrWriter,
-    CombinedOutput combinedOutput) {
+    CombinedOutput combinedOutput,
+    kj::Maybe<kj::Promise<void>> runCompletion) {
   kj::Vector<kj::byte> buffer;
   size_t offset = 0;
 
@@ -876,6 +872,9 @@ kj::Promise<void> demuxDockerExecOutput(kj::AsyncInputStream& input,
 
     if (buffer.size() != offset) {
       KJ_FAIL_REQUIRE("Docker exec raw stream ended with a truncated frame header");
+    }
+    KJ_IF_SOME(completion, runCompletion) {
+      co_await completion;
     }
 
     // We need to detach ourselves from the end() as the user might've
@@ -1341,12 +1340,19 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       kj::Maybe<capnp::ByteStream::Client> stdoutWriter,
       kj::Maybe<capnp::ByteStream::Client> stderrWriter,
       CombinedOutput combinedOutput,
-      Pty pty)
+      Pty pty,
+      bool processStarted,
+      kj::Maybe<kj::ForkedPromise<int32_t>> terminal = kj::none,
+      kj::Maybe<kj::String> privateKey = kj::none,
+      kj::Maybe<kj::Promise<void>> runCompletion = kj::none)
       : containerClient(containerClient.addRef()),
         execId(kj::mv(execId)),
         killToken(kj::mv(killToken)),
         pty(pty),
-        sharedConnection(kj::refcounted<SharedExecConnection>(kj::mv(connection))) {
+        sharedConnection(kj::refcounted<SharedExecConnection>(kj::mv(connection))),
+        processStarted(processStarted),
+        terminal(kj::mv(terminal)),
+        privateKey(kj::mv(privateKey)) {
     auto activity = this->containerClient->startHostActivity();
     kj::Maybe<kj::Own<capnp::ExplicitEndOutputStream>> stdoutStream = kj::none;
     KJ_IF_SOME(out, stdoutWriter) {
@@ -1355,18 +1361,19 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       stdoutStream = capnp::ExplicitEndOutputStream::wrap(newNullOutputStream(), []() {});
     }
 
-    if (pty) {
+    if (pty && this->privateKey == kj::none) {
       // A PTY hijacks the connection as a single raw stream that merges stdout and stderr, so copy
       // it straight through to stdout instead of demultiplexing Docker's frame protocol. stderr is
       // always combined into stdout when a PTY is active, so there is no separate stderr stream.
       auto task = copyRawExecOutput(*sharedConnection->connection, kj::mv(stdoutStream))
                       .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection),
                           kj::mv(activity));
-      streamClosedTask = this->containerClient
-                             ->wrapCallbacks(kj::mv(task).attach(
-                                 kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
-        shared->disconnect();
-      }))).fork();
+      streamClosedTask =
+          this->containerClient
+              ->wrapCallbacks(kj::mv(task).attach(kj::defer(
+                  [shared = kj::addRef(*sharedConnection)]() mutable { shared->disconnect(); })))
+              .eagerlyEvaluate(nullptr)
+              .fork();
       return;
     }
 
@@ -1377,17 +1384,18 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       stderrStream = capnp::ExplicitEndOutputStream::wrap(newNullOutputStream(), []() {});
     }
 
-    // Always drain the Docker exec stream. This lets wait() use stream closure as the primary
-    // process-completion signal, even when stdout/stderr are ignored.
-    auto task = demuxDockerExecOutput(
-        *sharedConnection->connection, kj::mv(stdoutStream), kj::mv(stderrStream), combinedOutput)
+    // Drain output independently of process exit, including bytes from descendants that keep
+    // stdout/stderr open after the inspected process has exited.
+    auto task = demuxDockerExecOutput(*sharedConnection->connection, kj::mv(stdoutStream),
+        kj::mv(stderrStream), combinedOutput, kj::mv(runCompletion))
                     .attach(this->containerClient->addRef(), kj::addRef(*sharedConnection),
                         kj::mv(activity));
-    streamClosedTask = this->containerClient
-                           ->wrapCallbacks(kj::mv(task).attach(
-                               kj::defer([shared = kj::addRef(*sharedConnection)]() mutable {
-      shared->disconnect();
-    }))).fork();
+    streamClosedTask =
+        this->containerClient
+            ->wrapCallbacks(kj::mv(task).attach(kj::defer(
+                [shared = kj::addRef(*sharedConnection)]() mutable { shared->disconnect(); })))
+            .eagerlyEvaluate(nullptr)
+            .fork();
   }
 
   kj::Promise<void> wait(WaitContext context) override {
@@ -1398,23 +1406,25 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
       sharedConnection->stdinClosed = true;
     }
 
-    co_await KJ_ASSERT_NONNULL(streamClosedTask).addBranch();
+    KJ_IF_SOME(cached, terminal) {
+      context.getResults().setExitCode(co_await cached.addBranch());
+      co_return;
+    }
 
-    // Docker's exec-inspect state can lag slightly behind the hijacked stream closing, so after
-    // we observe EOF we allow a short bounded retry window to obtain the final exit code.
-    for (auto attempt: kj::zeroTo(20)) {
+    // Descendants can retain stdout/stderr after the process exits. Only process state determines
+    // exitCode; the independent attach pump keeps those streams open until their own EOF.
+    for (;;) {
       auto inspect = co_await containerClient->inspectExec(execId);
-      if (!inspect.running) {
+      processStarted = processStarted || inspect.running || inspect.pid != 0;
+      if (!inspect.running && (processStarted || sharedConnection->connection.get() == nullptr)) {
+        // A false/zero inspect before spawn is not an exit proof. EOF also covers commands that
+        // finish before Docker exposes their PID, while retaining any stream failure.
+        if (!processStarted) co_await KJ_ASSERT_NONNULL(streamClosedTask).addBranch();
         context.getResults().setExitCode(inspect.exitCode);
         co_return;
       }
-
-      if (attempt + 1 < 20) {
-        co_await containerClient->timer.afterDelay(50 * kj::MILLISECONDS);
-      }
+      co_await containerClient->timer.afterDelay(50 * kj::MILLISECONDS);
     }
-
-    JSG_FAIL_REQUIRE(Error, "Docker exec stream closed before exit status became available.");
   }
 
   kj::Promise<void> stdinWriter(StdinWriterContext context) override {
@@ -1429,6 +1439,12 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
   }
 
   kj::Promise<void> kill(KillContext context) override {
+    auto signo = context.getParams().getSigno();
+    JSG_REQUIRE(signo >= 1 && signo <= 64, Error, "Invalid signal number.");
+    KJ_IF_SOME(key, privateKey) {
+      co_await containerClient->privateExecControl(killToken, key, "signal", signo);
+      co_return;
+    }
     // The exec's wrapper shell records its container-namespaced PID to a file keyed by killToken
     // (see createExec). Read that PID inside the container and signal it. This works regardless of
     // whether the container shares the host PID namespace, unlike signalling by the host PID that
@@ -1443,6 +1459,11 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
     JSG_REQUIRE(pty.toBool(), Error,
         "resize() can only be called on a process that was started with a PTY.");
     auto params = context.getParams();
+    KJ_IF_SOME(key, privateKey) {
+      co_await containerClient->privateExecControl(
+          killToken, key, "resize", 0, params.getRows(), params.getCols());
+      co_return;
+    }
     co_await containerClient->resizeExec(execId, params.getCols(), params.getRows());
   }
 
@@ -1453,7 +1474,10 @@ class ContainerClient::DockerProcessHandle final: public rpc::Container::Process
   Pty pty;
   kj::Own<SharedExecConnection> sharedConnection;
   bool waitStarted = false;
+  bool processStarted;
   kj::Maybe<kj::ForkedPromise<void>> streamClosedTask;
+  kj::Maybe<kj::ForkedPromise<int32_t>> terminal;
+  kj::Maybe<kj::String> privateKey;
 };
 
 // ConnectResponse adapter for TCP egress. Since we've already accepted the sidecar's HTTP
@@ -2004,11 +2028,14 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::Docker::ContainerCreateRequest>();
   jsonRoot.setImage(resolveContainerImage(effectiveImage));
-  // Add entrypoint if provided
+  // A nonempty override replaces both image startup fields; an empty list keeps image defaults.
   KJ_IF_SOME(ep, entrypoint) {
-    auto jsonCmd = jsonRoot.initCmd(ep.size());
-    for (uint32_t i: kj::zeroTo(ep.size())) {
-      jsonCmd.set(i, ep[i]);
+    if (ep.size() > 0) {
+      auto jsonEntrypoint = jsonRoot.initEntrypoint(ep.size());
+      for (uint32_t i: kj::zeroTo(ep.size())) {
+        jsonEntrypoint.set(i, ep[i]);
+      }
+      jsonRoot.initCmd(0);
     }
   }
 
@@ -2115,25 +2142,23 @@ kj::Promise<kj::String> ContainerClient::createExec(capnp::List<capnp::Text>::Re
   request.setAttachStdin(true);
   request.setAttachStdout(attachStdout);
   request.setAttachStderr(attachStderr);
-  request.setTty(params.hasPty());
+  request.setTty(outbound == kj::none && params.hasPty());
 
-  // Wrap the user command in a small shell prologue that records the process's own
-  // container-namespaced PID before exec'ing the real command. Docker's exec-inspect only reports
-  // the process PID in the daemon's (host) PID namespace, which is not addressable from inside the
-  // container when it runs in its own PID namespace, so kill() reads this recorded PID instead.
-  // The `exec "$@"` replaces the shell in place, so the recorded PID ($$) is exactly the PID the
-  // user command runs as, and argv is preserved unchanged.
-  auto pidFile = killTokenPidFile(killToken);
-  auto prologue = kj::str("echo $$ > ", pidFile, "; exec \"$@\"");
-
-  auto jsonCmd = request.initCmd(cmd.size() + 4);
-  jsonCmd.set(0, "/bin/sh"_kj);
-  jsonCmd.set(1, "-c"_kj);
-  jsonCmd.set(2, prologue);
-  // A conventional argv[0] for the wrapper shell; "$@" starts at the next argument.
-  jsonCmd.set(3, "sh"_kj);
-  for (auto i: kj::zeroTo(cmd.size())) {
-    jsonCmd.set(i + 4, cmd[i]);
+  if (outbound != kj::none) {
+    auto jsonCmd = request.initCmd(3);
+    jsonCmd.set(0, "/opt/open-compute/exec/helper");
+    jsonCmd.set(1, "--open-compute-exec");
+    jsonCmd.set(2, killToken);
+  } else {
+    // Standalone Docker records the container-namespaced PID before replacing the wrapper shell.
+    auto pidFile = killTokenPidFile(killToken);
+    auto prologue = kj::str("echo $$ > ", pidFile, "; exec \"$@\"");
+    auto jsonCmd = request.initCmd(cmd.size() + 4);
+    jsonCmd.set(0, "/bin/sh"_kj);
+    jsonCmd.set(1, "-c"_kj);
+    jsonCmd.set(2, prologue);
+    jsonCmd.set(3, "sh"_kj);
+    for (auto i: kj::zeroTo(cmd.size())) jsonCmd.set(i + 4, cmd[i]);
   }
 
   if (params.hasEnv()) {
@@ -2231,6 +2256,184 @@ kj::Promise<ContainerClient::ExecInspectResponse> ContainerClient::inspectExec(
   };
 }
 
+kj::Promise<void> ContainerClient::privateExecControl(kj::StringPtr identity,
+    kj::StringPtr key,
+    kj::StringPtr operation,
+    uint32_t signal,
+    uint16_t rows,
+    uint16_t cols) {
+  try {
+    KJ_REQUIRE(operation == "signal" || operation == "resize");
+    capnp::MallocMessageBuilder message;
+    auto fields = message.initRoot<capnp::JsonValue>().initObject(operation == "signal" ? 4 : 5);
+    setJsonText(fields[0], "identity", identity);
+    setJsonText(fields[1], "key", key);
+    setJsonText(fields[2], "op", operation);
+    if (operation == "signal") setJsonNumber(fields[3], "signal", signal);
+    if (operation == "resize") {
+      JSG_REQUIRE(rows > 0 && cols > 0, Error, "Invalid Container exec dimensions.");
+      setJsonNumber(fields[3], "rows", rows);
+      setJsonNumber(fields[4], "cols", cols);
+    }
+    auto port =
+        JSG_REQUIRE_NONNULL(sidecarIngressHostPort, Error, "Container sidecar unavailable.");
+    auto token =
+        kj::str(JSG_REQUIRE_NONNULL(controlToken, Error, "Container credentials unavailable."));
+    auto body = capnp::JsonCodec().encodeRaw(message.getRoot<capnp::JsonValue>());
+    auto response = co_await dockerApiRequestRaw(network, kj::str("127.0.0.1:", port),
+        kj::HttpMethod::POST, kj::str("/open-compute/exec"),
+        kj::ArrayPtr<const byte>(body.asBytes()), "application/json", 4096, kj::mv(token));
+    KJ_REQUIRE(response.statusCode == 200);
+    capnp::MallocMessageBuilder parsed;
+    auto root = parsed.initRoot<capnp::JsonValue>();
+    capnp::JsonCodec().decodeRaw(kj::str(response.body.asChars()), root);
+    KJ_REQUIRE(root.isObject() && root.getObject().size() == 1);
+    auto field = root.getObject()[0];
+    KJ_REQUIRE(
+        field.getName() == "ok" && field.getValue().isBoolean() && field.getValue().getBoolean());
+  } catch (...) {
+    JSG_FAIL_REQUIRE(Error, "Container exec control failed.");
+  }
+}
+
+kj::Promise<kj::Own<kj::AsyncIoStream>> ContainerClient::openPrivateExecRun(
+    kj::StringPtr identity, kj::StringPtr key) {
+  try {
+    capnp::MallocMessageBuilder message;
+    auto fields = message.initRoot<capnp::JsonValue>().initObject(3);
+    setJsonText(fields[0], "identity", identity);
+    setJsonText(fields[1], "key", key);
+    setJsonText(fields[2], "op", "run");
+    auto body = capnp::JsonCodec().encodeRaw(message.getRoot<capnp::JsonValue>());
+    auto port =
+        JSG_REQUIRE_NONNULL(sidecarIngressHostPort, Error, "Container sidecar unavailable.");
+    kj::HttpHeaders headers(headerTable);
+    headers.setPtr(kj::HttpHeaderId::HOST, "localhost");
+    headers.setPtr(kj::HttpHeaderId::CONNECTION, "Upgrade");
+    headers.setPtr(kj::HttpHeaderId::UPGRADE, "open-compute-exec-v1");
+    headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+    headers.set(kj::HttpHeaderId::CONTENT_LENGTH, kj::str(body.size()));
+    headers.add(CONTAINER_CONTROL_HEADER,
+        JSG_REQUIRE_NONNULL(controlToken, Error, "Container credentials unavailable."));
+    auto response = co_await dockerApiStreamedRequest(network, kj::str("127.0.0.1:", port),
+        kj::HttpMethod::POST, kj::str("/open-compute/exec"), headers,
+        kj::ArrayPtr<const byte>(body.asBytes()));
+    KJ_REQUIRE(response.statusCode == 101 &&
+        response.upgrade.map([](auto& value) {
+      return value == "open-compute-exec-v1";
+    }).orDefault(false));
+    co_return kj::mv(response.connection);
+  } catch (...) {
+    JSG_FAIL_REQUIRE(Error, "Container exec control failed.");
+  }
+}
+
+kj::Promise<ContainerClient::PrivateExecResponse> ContainerClient::readPrivateExecFrame(
+    kj::AsyncInputStream& input) {
+  try {
+    byte header[4];
+    co_await input.read(header, sizeof(header));
+    uint32_t size = (uint32_t(header[0]) << 24) | (uint32_t(header[1]) << 16) |
+        (uint32_t(header[2]) << 8) | header[3];
+    KJ_REQUIRE(size > 0 && size <= 4096);
+    auto bytes = kj::heapArray<byte>(size);
+    co_await input.read(bytes.asPtr());
+    capnp::MallocMessageBuilder parsed;
+    auto root = parsed.initRoot<capnp::JsonValue>();
+    capnp::JsonCodec().decodeRaw(kj::str(bytes.asChars()), root);
+    KJ_REQUIRE(root.isObject());
+    bool ok = false;
+    uint seen = 0;
+    kj::String state;
+    kj::String code;
+    PrivateExecResponse result{.spawnFailed = false,
+      .running = false,
+      .drained = false,
+      .pid = 0,
+      .startTicks = kj::str(""),
+      .exitCode = kj::none};
+    for (auto field: root.getObject()) {
+      auto name = field.getName();
+      auto value = field.getValue();
+      uint bit;
+      if (name == "ok") {
+        bit = 1;
+        KJ_REQUIRE(value.isBoolean());
+        ok = value.getBoolean();
+      } else if (name == "code") {
+        bit = 2;
+        KJ_REQUIRE(value.isString());
+        code = kj::str(value.getString());
+      } else if (name == "state") {
+        bit = 4;
+        KJ_REQUIRE(value.isString());
+        state = kj::str(value.getString());
+      } else if (name == "pid" || name == "startTicks" || name == "exitCode") {
+        bit = name == "pid" ? 8 : name == "startTicks" ? 16 : 32;
+        KJ_REQUIRE(value.isNumber());
+        double number = value.getNumber();
+        KJ_REQUIRE(std::isfinite(number) && std::floor(number) == number);
+        if (name == "pid") {
+          KJ_REQUIRE(number > 0 && number <= INT32_MAX);
+          result.pid = static_cast<int32_t>(number);
+        } else if (name == "startTicks") {
+          // JsonValue represents numbers as doubles. Reject values whose identity can lose bits.
+          KJ_REQUIRE(number > 0 && number <= 9007199254740991.0);
+          result.startTicks = kj::str(static_cast<uint64_t>(number));
+        } else {
+          KJ_REQUIRE(number >= 0 && number <= 255);
+          result.exitCode = static_cast<int32_t>(number);
+        }
+      } else {
+        KJ_FAIL_REQUIRE("Unexpected Container exec response field.");
+      }
+      KJ_REQUIRE((seen & bit) == 0);
+      seen |= bit;
+    }
+    KJ_REQUIRE((seen & 1) != 0);
+    if (!ok && code == "SPAWN_FAILED") {
+      KJ_REQUIRE(seen == 7 && state == "spawn-failed");
+      result.spawnFailed = true;
+      co_return result;
+    }
+    if (ok && state == "drained") {
+      KJ_REQUIRE(seen == 5);
+      result.drained = true;
+      co_return result;
+    }
+    KJ_REQUIRE(ok && (state == "running" || state == "exited"));
+    KJ_REQUIRE(seen == (state == "running" ? 29u : 61u));
+    result.running = state == "running";
+    co_return result;
+  } catch (...) {
+    JSG_FAIL_REQUIRE(Error, "Container exec control failed.");
+  }
+}
+
+kj::Promise<void> ContainerClient::watchPrivateExec(kj::Own<kj::AsyncIoStream> connection,
+    int32_t pid,
+    kj::String startTicks,
+    kj::Own<kj::PromiseFulfiller<int32_t>> terminal) {
+  KJ_DEFER(if (terminal->isWaiting()) {
+    terminal->reject(KJ_EXCEPTION(FAILED, "Container exec control failed."));
+  });
+  auto result = co_await readPrivateExecFrame(*connection);
+  JSG_REQUIRE(!result.spawnFailed && !result.running && result.pid == pid &&
+          result.startTicks == startTicks,
+      Error, "Container exec control failed.");
+  auto code = KJ_ASSERT_NONNULL(result.exitCode);
+  terminal->fulfill(kj::mv(code));
+  auto drained = co_await readPrivateExecFrame(*connection);
+  JSG_REQUIRE(drained.drained, Error, "Container exec control failed.");
+  // EOF alone cannot prove that the helper delivered all descendants' output.
+  byte extra;
+  KJ_REQUIRE(co_await connection->tryRead(&extra, 1, 1) == 0, "Container exec control failed.");
+}
+
+kj::Promise<void> ContainerClient::cleanupPrivateExec(kj::String identity, kj::String key) {
+  co_await privateExecControl(identity, key, "signal", 9);
+}
+
 kj::Promise<void> ContainerClient::runSimpleExec(kj::ArrayPtr<const kj::String> cmd) {
   capnp::JsonCodec codec;
   if (outbound != kj::none) codec.setHasMode(capnp::HasMode::NON_DEFAULT);
@@ -2306,7 +2509,8 @@ kj::Promise<void> ContainerClient::stopContainer() {
 }
 
 kj::Promise<void> ContainerClient::killContainer(uint32_t signal) {
-  auto endpoint = kj::str("/containers/", containerName, "/kill?signal=", signalToString(signal));
+  JSG_REQUIRE(signal > 0 && signal <= 64, RangeError, "Invalid signal number.");
+  auto endpoint = kj::str("/containers/", containerName, "/kill?signal=", signal);
   auto response = co_await dockerApiRequest(
       network, kj::str(dockerPath), kj::HttpMethod::POST, kj::mv(endpoint));
   // statusCode 409 refers to "container is not running"
@@ -2877,13 +3081,55 @@ kj::Promise<void> ContainerClient::exec(ExecContext context) {
     ptyRows = execParams.getPty().getRows();
   }
 
-  // A per-exec random token names the file in which the wrapper shell records the process's
-  // container-namespaced PID, so that kill() can signal it (see createExec / kill).
-  auto killToken = randomUUID(kj::none);
+  // Private helpers use an opaque socket identity; standalone Docker uses a PID-file token.
+  auto killToken = outbound != kj::none ? privateExecRandomHex() : randomUUID(kj::none);
   auto execId =
       co_await createExec(request.getCmd(), execParams, attachStdout, attachStderr, killToken);
   kj::Own<kj::AsyncIoStream> execConnection =
-      co_await startExec(kj::str(execId), pty, ptyCols, ptyRows);
+      co_await startExec(kj::str(execId), outbound == kj::none && pty, ptyCols, ptyRows);
+
+  kj::Maybe<kj::String> privateKey;
+  kj::Maybe<kj::ForkedPromise<int32_t>> terminal;
+  kj::Maybe<kj::Promise<void>> runCompletion;
+  kj::Maybe<PrivateExecResponse> privateStarted;
+  bool unpublished = true;
+  KJ_DEFER(if (unpublished && privateKey != kj::none) {
+    waitUntilTasks.add(timer
+            .timeoutAfter(10 * kj::SECONDS,
+                cleanupPrivateExec(kj::str(killToken), kj::str(KJ_ASSERT_NONNULL(privateKey))))
+            .catch_([](kj::Exception&&) {
+      KJ_LOG(WARNING, "Unpublished Container exec cleanup unconfirmed.");
+    }).attach(addRef()));
+  });
+  if (outbound != kj::none) {
+    privateKey = privateExecRandomHex();
+    co_await wrapCallbacks(timer.timeoutAfter(10 * kj::SECONDS,
+        bootstrapPrivateExec(*execConnection, kj::str(KJ_ASSERT_NONNULL(privateKey)),
+            privateExecStartJson(request.getCmd(), pty, ptyRows, ptyCols))));
+    auto run =
+        co_await executionCallbacks.wrap(egressState->data->callbacks.wrap(timer.timeoutAfter(
+            10 * kj::SECONDS, openPrivateExecRun(killToken, KJ_ASSERT_NONNULL(privateKey)))));
+    privateStarted = co_await executionCallbacks.wrap(egressState->data->callbacks.wrap(
+        timer.timeoutAfter(10 * kj::SECONDS, readPrivateExecFrame(*run))));
+    auto& started = KJ_ASSERT_NONNULL(privateStarted);
+    if (started.spawnFailed) {
+      byte extra;
+      auto amount = co_await timer.timeoutAfter(10 * kj::SECONDS, run->tryRead(&extra, 1, 1));
+      JSG_REQUIRE(amount == 0, Error, "Container exec control failed.");
+      unpublished = false;
+      JSG_FAIL_REQUIRE(Error, "Container exec process could not start.");
+    }
+    JSG_REQUIRE(started.running, Error, "Container exec control failed.");
+    auto completed = kj::newPromiseAndFulfiller<int32_t>();
+    terminal = completed.promise.fork();
+    // This task outlives JS handles and observes terminal state without output backpressure.
+    auto completion = wrapCallbacks(watchPrivateExec(kj::mv(run), started.pid,
+                                        kj::str(started.startTicks), kj::mv(completed.fulfiller)))
+                          .attach(addRef(), startHostActivity())
+                          .fork();
+    waitUntilTasks.add(completion.addBranch().catch_([](kj::Exception&&) {}));
+    runCompletion = completion.addBranch();
+  }
   kj::Maybe<capnp::ByteStream::Client> stdoutWriter = kj::none;
   if (request.hasStdoutWriter()) {
     stdoutWriter = request.getStdoutWriter();
@@ -2898,7 +3144,7 @@ kj::Promise<void> ContainerClient::exec(ExecContext context) {
   // before it has fully spawned the process (as startExec() returns before
   // even docker has spawned the process...)
   ExecInspectResponse inspect{.exitCode = 0, .running = false, .pid = 0};
-  for (auto attempt: kj::zeroTo(20)) {
+  for (auto attempt: kj::zeroTo(privateStarted == kj::none ? 20 : 0)) {
     inspect = co_await inspectExec(execId);
     if (inspect.pid != 0 || !inspect.running || attempt + 1 == 20) {
       break;
@@ -2908,10 +3154,15 @@ kj::Promise<void> ContainerClient::exec(ExecContext context) {
   }
 
   auto process = context.getResults().initProcess();
-  process.setPid(static_cast<int32_t>(inspect.pid));
-  process.setHandle(kj::heap<DockerProcessHandle>(*this, kj::mv(execId), kj::mv(killToken),
+  process.setPid(privateStarted.map([](auto& result) {
+    return result.pid;
+  }).orDefault(static_cast<int32_t>(inspect.pid)));
+  process.setHandle(kj::heap<DockerProcessHandle>(*this, kj::mv(execId), kj::str(killToken),
       kj::mv(execConnection), kj::mv(stdoutWriter), kj::mv(stderrWriter),
-      CombinedOutput(execParams.getCombinedOutput()), Pty(pty)));
+      CombinedOutput(execParams.getCombinedOutput()), Pty(pty), inspect.running || inspect.pid != 0,
+      kj::mv(terminal), privateKey.map([](auto& key) { return kj::str(key); }),
+      kj::mv(runCompletion)));
+  unpublished = false;
 }
 
 kj::Promise<void> ContainerClient::setInactivityTimeout(SetInactivityTimeoutContext context) {

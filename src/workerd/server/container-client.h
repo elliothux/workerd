@@ -231,6 +231,30 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
     uint32_t pid;
   };
 
+  struct PrivateExecResponse {
+    bool spawnFailed;
+    bool running;
+    bool drained;
+    int32_t pid;
+    kj::String startTicks;
+    kj::Maybe<int32_t> exitCode;
+  };
+
+  kj::Promise<void> privateExecControl(kj::StringPtr identity,
+      kj::StringPtr key,
+      kj::StringPtr operation,
+      uint32_t signal = 0,
+      uint16_t rows = 0,
+      uint16_t cols = 0);
+  kj::Promise<kj::Own<kj::AsyncIoStream>> openPrivateExecRun(
+      kj::StringPtr identity, kj::StringPtr key);
+  kj::Promise<PrivateExecResponse> readPrivateExecFrame(kj::AsyncInputStream& input);
+  kj::Promise<void> watchPrivateExec(kj::Own<kj::AsyncIoStream> connection,
+      int32_t pid,
+      kj::String startTicks,
+      kj::Own<kj::PromiseFulfiller<int32_t>> terminal);
+  kj::Promise<void> cleanupPrivateExec(kj::String identity, kj::String key);
+
   kj::Promise<kj::Maybe<InspectResponse>> inspectContainer();
 
   kj::Promise<void> updateSidecarEgressPort(uint16_t ingressHostPort, uint16_t egressPort);

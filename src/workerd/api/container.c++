@@ -10,6 +10,7 @@
 #include <workerd/api/system-streams.h>
 #include <workerd/io/features.h>
 #include <workerd/io/io-context.h>
+#include <workerd/util/stream-utils.h>
 
 #include <capnp/compat/byte-stream.h>
 #include <kj/filesystem.h>
@@ -105,9 +106,14 @@ void requireValidLabels(const jsg::Dict<kj::String>& labels) {
   }
 }
 
-capnp::ByteStream::Client makeExecPipe(
-    capnp::ByteStreamFactory& factory, kj::Own<kj::AsyncOutputStream> output) {
-  return factory.kjToCapnp(capnp::ExplicitEndOutputStream::wrap(kj::mv(output), []() {}));
+capnp::ByteStream::Client makeExecPipe(capnp::ByteStreamFactory& factory, kj::OneWayPipe& pipe) {
+  auto input = newNeuterableInputStream(*pipe.in);
+  auto output = capnp::ExplicitEndOutputStream::wrap(
+      kj::mv(pipe.out), [input = kj::addRef(*input)]() mutable {
+    input->neuter(JSG_KJ_EXCEPTION(DISCONNECTED, Error, "Container exec output was interrupted."));
+  });
+  pipe.in = input.attachToThisReference(kj::mv(pipe.in));
+  return factory.kjToCapnp(kj::mv(output));
 }
 
 }  // namespace
@@ -767,14 +773,14 @@ jsg::Promise<jsg::Ref<ExecProcess>> Container::exec(
   kj::Maybe<kj::Own<kj::AsyncInputStream>> stdoutInput;
   if (stdoutMode == "pipe") {
     auto pipe = kj::newOneWayPipe();
-    req.setStdoutWriter(makeExecPipe(byteStreamFactory, kj::mv(pipe.out)));
+    req.setStdoutWriter(makeExecPipe(byteStreamFactory, pipe));
     stdoutInput = kj::mv(pipe.in);
   }
 
   kj::Maybe<kj::Own<kj::AsyncInputStream>> stderrInput;
   if (!combinedOutput && stderrMode == "pipe") {
     auto pipe = kj::newOneWayPipe();
-    req.setStderrWriter(makeExecPipe(byteStreamFactory, kj::mv(pipe.out)));
+    req.setStderrWriter(makeExecPipe(byteStreamFactory, pipe));
     stderrInput = kj::mv(pipe.in);
   }
 

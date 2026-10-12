@@ -233,6 +233,51 @@ class MockExecContainerServer final: public rpc::Container::Server {
   kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> resizeFulfiller;
 };
 
+class OutputExecContainerServer final: public rpc::Container::Server,
+                                       private kj::TaskSet::ErrorHandler {
+ public:
+  OutputExecContainerServer(
+      capnp::ByteStreamFactory& factory, ExecObservations& observations, uint abortedStream)
+      : factory(factory),
+        observations(observations),
+        abortedStream(abortedStream),
+        tasks(*this) {}
+
+  kj::Promise<void> monitor(MonitorContext) override {
+    return kj::NEVER_DONE;
+  }
+
+  kj::Promise<void> exec(ExecContext context) override {
+    auto params = context.getParams();
+    tasks.add(deliver(factory.capnpToKjExplicitEnd(params.getStdoutWriter()), "stdout", 1));
+    tasks.add(deliver(factory.capnpToKjExplicitEnd(params.getStderrWriter()), "stderr", 2));
+    auto process = context.getResults().initProcess();
+    process.setPid(4321);
+    process.setHandle(kj::heap<MockExecProcessHandle>(factory, observations, kj::none));
+    return kj::READY_NOW;
+  }
+
+ private:
+  capnp::ByteStreamFactory& factory;
+  ExecObservations& observations;
+  uint abortedStream;
+  kj::TaskSet tasks;
+
+  kj::Promise<void> deliver(
+      kj::Own<capnp::ExplicitEndOutputStream> output, kj::StringPtr text, uint stream) {
+    co_await output->write(text.asBytes());
+    if (abortedStream == stream) {
+      output->abortWrite(KJ_EXCEPTION(DISCONNECTED, "Injected output delivery failure"));
+    } else {
+      co_await output->end();
+    }
+  }
+
+  void taskFailed(kj::Exception&& exception) override {
+    kj::throwFatalException(kj::mv(exception));
+  }
+};
+
 struct CapturedDirectorySnapshot {
   bool hasSnapshotId = false;
   kj::String snapshotId;
@@ -966,6 +1011,53 @@ KJ_TEST("Container::start requires mountPoint when no snapshot is given") {
   });
 
   KJ_EXPECT(captured.size() == 0);
+}
+
+KJ_TEST("Container::exec output rejects an unclean stream while retaining its trusted exitCode") {
+  for (uint abortedStream: {0u, 1u, 2u}) {
+    auto fixture = makeFixture();
+    ExecObservations observations;
+    fixture.runInIoContext([&](const TestFixture::Environment& env) -> kj::Promise<void> {
+      auto container =
+          kj::rc<Container>(rpc::Container::Client(kj::heap<OutputExecContainerServer>(
+                                env.context.getByteStreamFactory(), observations, abortedStream)),
+              true);
+      auto result =
+          container->exec(env.js, kj::arr(kj::str("/command")), kj::none)
+              .then(env.js, [abortedStream](jsg::Lock& js, jsg::Ref<ExecProcess> process) {
+        auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<ExecProcess>>());
+        auto object = KJ_REQUIRE_NONNULL(
+            jsg::JsValue(handler.wrap(js, process.addRef())).tryCast<jsg::JsObject>());
+        return js.toPromise(object.get(js, "exitCode"))
+            .then(js,
+                [process = kj::mv(process), abortedStream](
+                    jsg::Lock& js, jsg::Value value) mutable {
+          KJ_EXPECT(jsg::JsValue(value.getHandle(js)).strictEquals(js.num(0)));
+          auto output = process->output(js).then(
+              js, [abortedStream](jsg::Lock& js, jsg::Ref<ExecOutput> result) {
+            KJ_EXPECT(abortedStream == 0);
+            KJ_EXPECT(result->getExitCode() == 0);
+            KJ_EXPECT(result->getStdout(js).asArrayPtr() == "stdout"_kj.asBytes());
+            KJ_EXPECT(result->getStderr(js).asArrayPtr() == "stderr"_kj.asBytes());
+          }, [abortedStream](jsg::Lock& js, jsg::Value error) {
+            KJ_EXPECT(abortedStream != 0);
+            KJ_EXPECT(jsg::JsValue(error.getHandle(js)).toString(js) ==
+                "Error: Container exec output was interrupted.");
+          });
+          return output.then(js, [process = kj::mv(process)](jsg::Lock& js) mutable {
+            auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<ExecProcess>>());
+            auto object = KJ_REQUIRE_NONNULL(
+                jsg::JsValue(handler.wrap(js, process.addRef())).tryCast<jsg::JsObject>());
+            return js.toPromise(object.get(js, "exitCode"))
+                .then(js, [](jsg::Lock& js, jsg::Value value) {
+              KJ_EXPECT(jsg::JsValue(value.getHandle(js)).strictEquals(js.num(0)));
+            });
+          });
+        });
+      });
+      return env.context.awaitJs(env.js, kj::mv(result)).attach(kj::mv(container));
+    });
+  }
 }
 
 KJ_TEST("Container::exec forwards pty options and resize() sends a resize RPC") {
