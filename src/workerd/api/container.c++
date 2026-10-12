@@ -329,8 +329,7 @@ Container::Monitor::Monitor(kj::ForkedPromise<int32_t> promise, uint64_t generat
 
 void Container::hostStarted() {
   if (!getRunning()) resetMonitor();
-  // The host initiated this lifecycle without a tenant request to register its monitor.
-  IoContext::current().addWaitUntil(KJ_ASSERT_NONNULL(currentMonitor)->stopped.addBranch());
+  // Monitor::background observes running state without registering tenant background work.
 }
 
 bool Container::getRunning() {

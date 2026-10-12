@@ -70,6 +70,7 @@ jobs:
           import subprocess
 
           names = [
+              "Server: Automatic Container monitoring does not prevent inactivity",
               "Server: Host Container monitor retains its owner across the idle window",
               "Server: Host warm start registers callbacks for a previously constructed cold facet",
               "Server: Old execution retirement preserves the current owner's outbound callbacks",

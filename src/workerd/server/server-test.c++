@@ -8,6 +8,7 @@
 #include <workerd/jsg/setup.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/capnp-mock.h>
+#include <workerd/util/strong-bool.h>
 
 #include <capnp/compat/http-over-capnp.h>
 #include <capnp/rpc-twoparty.h>
@@ -2615,7 +2616,11 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
     Internal Server Error)"_blockquote);
 }
 
-kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0, bool defaultCleanup = false) {
+WD_STRONG_BOOL(ExplicitMonitor);
+
+kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
+    bool defaultCleanup = false,
+    ExplicitMonitor explicitMonitor = ExplicitMonitor::YES) {
   return kj::str(R"((
     extensions = [(modules = [
       (name = "cloudflare-internal:open-compute-host-policy", internal = true,
@@ -2628,7 +2633,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0, bool defaultCleanu
         modules = [(name = "host.js", esModule =
           `import { DurableObject } from 'cloudflare:workers';
           `let births = 0; const grants = [];
-          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
           `export class Host extends DurableObject {
           `  constructor(ctx, env) {
           `    super(ctx, env);
@@ -2654,7 +2659,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0, bool defaultCleanu
           `    grants.push(this.grant);
           `    const loaded = env.loader.load({compatibilityDate:'2026-09-08',
           `      compatibilityFlags:[], mainModule:'tenant.js',
-          `      modules:{'tenant.js':source}, env:{INACTIVITY_MS: env.inactivityMs, OUTBOUND_HOST: this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid'}, openComputePrivateEnv:{},
+          `      modules:{'tenant.js':source}, env:{INACTIVITY_MS: env.inactivityMs, EXPLICIT_MONITOR: env.explicitMonitor, OUTBOUND_HOST: this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid'}, openComputePrivateEnv:{},
           `      openComputeHostPolicy:true, openComputeContainer:this.grant,
           `      globalOutbound:env.outbound});
           `    this.child = ctx.facets.get('tenant', () => ({
@@ -2734,6 +2739,8 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0, bool defaultCleanu
       inactivityMs, R"("),
           (name = "defaultCleanup", json = ")",
       defaultCleanup ? "true" : "false", R"("),
+          (name = "explicitMonitor", json = ")",
+      explicitMonitor == ExplicitMonitor::YES ? "true" : "false", R"("),
           (name = "objects", durableObjectNamespace = "Host"),
           (name = "factory", workerLoader = (factory = true)),
           (name = "loader", workerLoader = ()),
@@ -2857,6 +2864,24 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0, bool defaultCleanu
   ))"_kj);
 }
 
+KJ_TEST("Server: Automatic Container monitoring does not prevent inactivity") {
+  for (int64_t timeout: {1000, 120000}) {
+    TestServer test(hostContainerOwnerConfig(timeout, false, ExplicitMonitor::NO));
+    test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+    test.server.allowExperimental();
+    test.start();
+    auto first = test.connect("test-addr");
+    first.httpGet200("/first", "1:true:1");
+    auto live = test.connect("docker-addr");
+    live.httpGet200("/live-count", "2");
+    // Neither the tenant nor its host registers monitor() or waitUntil(). The automatic
+    // running-state observer must not extend the configured inactivity interval.
+    test.wait(90);
+    auto observed = test.connect("docker-addr");
+    observed.httpGet200("/live-count", timeout == 1000 ? "0" : "2");
+  }
+}
+
 KJ_TEST("Server: Host Container monitor retains its owner across the idle window") {
   TestServer test(hostContainerOwnerConfig());
   test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
@@ -2917,7 +2942,7 @@ KJ_TEST("Server: Private Container inactivity survives idle and positively stops
   test.wait(12);
   auto active = test.connect("test-addr");
   active.httpGet200("/", "1:true:2");
-  // The automatic monitor and SDK waitUntil stop retaining the actors after 15 minutes.
+  // Explicit tenant monitor() and SDK waitUntil stop retaining the actors after 15 minutes.
   // Retain only the internal control context until the inactivity stop has positive authority.
   test.wait(15 * 60 + 25);
   auto stopped = test.connect("test-addr");

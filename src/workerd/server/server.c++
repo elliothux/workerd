@@ -1093,8 +1093,8 @@ class Server::ActorNamespace final {
               outbound = kj::mv(outbound), staged = kj::mv(staged)](bool start, bool stop,
               bool completed, kj::String startup, kj::String expectedLeaseKey,
               bool monitor) mutable -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
-        // A tenant RPC belongs to the stable Root. Keep that owner's existing request tracker
-        // active across admission and the actual native operation, including a pending monitor.
+        // Retain the Root across admission. Automatic monitor RPCs only observe state; explicit
+        // tenant monitor() calls register their own activity through IoContext::awaitIo().
         auto& initialOwner =
             JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
         kj::Own<void> activity =
@@ -1109,6 +1109,7 @@ class Server::ActorNamespace final {
               start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor);
         }));
         control = nullptr;
+        if (monitor) activity = {};
         auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
         JSG_REQUIRE(owner.hostContainerEgress != kj::none &&
                 KJ_ASSERT_NONNULL(owner.hostContainerEgress).get() == staged.get(),
