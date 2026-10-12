@@ -43,6 +43,18 @@ export class Host extends DurableObject {
         ),
       TypeError
     );
+    assert.throws(
+      () =>
+        this.env.factory.getContainer(
+          this.ctx.facets,
+          'App',
+          async () => undefined,
+          async () => {
+            throw new Error('Unexpected capture');
+          }
+        ),
+      TypeError
+    );
     const calls = [];
     const grant = this.env.factory.getContainer(
       this.ctx.facets,
@@ -55,7 +67,8 @@ export class Host extends DurableObject {
       },
       async () => {
         throw new Error('Unexpected capture');
-      }
+      },
+      {}
     );
     const loader = this.env.loader;
     const loaded = loader.load({
@@ -142,7 +155,8 @@ export class Host extends DurableObject {
         }),
         async () => {
           throw new Error('Unexpected capture');
-        }
+        },
+        {}
       );
       const loaded = this.env.loader.load({
         compatibilityDate: '2026-09-08',

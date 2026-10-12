@@ -589,6 +589,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
         HostContainerOwner& owner, kj::Own<SubrequestChannel> outbound) = 0;
     virtual kj::Promise<void> start() = 0;
     virtual kj::StringPtr getClassName() const = 0;
+    virtual jsg::Dict<kj::String> getImages() const = 0;
     virtual void revoke() = 0;
   };
 

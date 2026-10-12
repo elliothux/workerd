@@ -6832,6 +6832,7 @@ class Server::WorkerLoaderNamespace: public IoChannelFactory::WorkerLoaderChanne
                     kj::addRef(*JSG_REQUIRE_NONNULL(isolate->containerOutbound, Error,
                         "Container attachment requires the tenant outbound capability.")));
             container = kj::mv(attachment.client);
+            containerImages = grant->getImages();
             KJ_ASSERT_NONNULL(facetManager)
                 .setHostContainerEgressRegistrar(kj::mv(attachment.egress));
           }

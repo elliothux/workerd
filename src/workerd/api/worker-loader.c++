@@ -157,10 +157,12 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
   HostContainerChannelImpl(Worker::Actor::FacetManager& owner,
       kj::String className,
       ResolveHostContainerLease resolve,
-      CaptureHostContainerSnapshot capture)
+      CaptureHostContainerSnapshot capture,
+      jsg::Dict<kj::String> images)
       : origin(IoContext::current().getWeakRef()),
         owner(owner),
         className(kj::mv(className)),
+        images(kj::mv(images)),
         resolve(kj::mv(resolve)),
         capture(kj::mv(capture)),
         revocation(kj::newPromiseAndFulfiller<void>()),
@@ -225,6 +227,17 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
   kj::StringPtr getClassName() const override {
     return className;
   }
+  jsg::Dict<kj::String> getImages() const override {
+    return jsg::Dict<kj::String>{
+      .fields =
+          KJ_MAP(field, images.fields) {
+      return jsg::Dict<kj::String>::Field{
+        .name = kj::str(field.name),
+        .value = kj::str(field.value),
+      };
+    },
+    };
+  }
   void revoke() override {
     if (!revoked) {
       revoked = true;
@@ -241,6 +254,7 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
   kj::Own<IoContext::WeakRef> origin;
   Worker::Actor::FacetManager& owner;
   kj::String className;
+  const jsg::Dict<kj::String> images;
   ResolveHostContainerLease resolve;
   CaptureHostContainerSnapshot capture;
   kj::PromiseFulfillerPair<void> revocation;
@@ -271,7 +285,8 @@ jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
     jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(
         bool, bool, bool, kj::String, kj::String, bool)> resolve,
     jsg::Function<jsg::Promise<HostContainerSnapshot>(kj::String, jsg::Optional<kj::String>)>
-        capture) {
+        capture,
+    jsg::Dict<kj::String> images) {
   JSG_REQUIRE(
       className.size() > 0 && className.size() <= 256, TypeError, "Invalid Container class name.");
   auto& ioctx = IoContext::current();
@@ -329,8 +344,8 @@ jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
     return capture(js, kj::mv(expectedLeaseKey), jsg::Optional<kj::String>(kj::mv(name)));
   });
   kj::Own<IoChannelFactory::HostContainerChannel> channel =
-      kj::refcounted<HostContainerChannelImpl>(
-          facets->getFacetManager(), kj::mv(className), kj::mv(callback), kj::mv(captureCallback));
+      kj::refcounted<HostContainerChannelImpl>(facets->getFacetManager(), kj::mv(className),
+          kj::mv(callback), kj::mv(captureCallback), kj::mv(images));
   return js.alloc<HostContainer>(ioctx.addObject(kj::mv(channel)));
 }
 

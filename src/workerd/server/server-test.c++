@@ -2655,7 +2655,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `    }); }, async (expected, name) => {
           `      if (expected !== this.leaseKey || !this.leaseActive || name !== 'owner-checkpoint') throw new Error('Invalid capture authority');
           `      return {id: 'ee2acc27-21e4-48a7-96f4-9790eb855d78', size: 2850, name};
-          `    });
+          `    }, {});
           `    grants.push(this.grant);
           `    const loaded = env.loader.load({compatibilityDate:'2026-09-08',
           `      compatibilityFlags:[], mainModule:'tenant.js',
@@ -2862,6 +2862,69 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
       (name = "sidecar", address = "127.0.0.1:39002", service = "sidecar", tcp = ())
     ]
   ))"_kj);
+}
+
+KJ_TEST("Server: Private Container named images are immutable and class scoped") {
+  TestServer test(R"((
+    extensions = [(modules = [
+      (name = "cloudflare-internal:open-compute-host-policy", internal = true,
+       esModule = "export default () => namespace => namespace;")
+    ])],
+    services = [
+      (name = "host", worker = (
+        compatibilityDate = "2026-09-08",
+        compatibilityFlags = ["experimental"],
+        modules = [(name = "host.js", esModule =
+          `import { DurableObject } from 'cloudflare:workers';
+          `const source = "import { DurableObject } from 'cloudflare:workers'; export class Tenant extends DurableObject { read() { const images = this.ctx.container.images; const value = images.api; images.api = 'mutated'; return {value, preserved: this.ctx.container.images.api === value}; } } export class Other extends DurableObject { read() { return this.ctx.container === undefined; } }";
+          `export class Host extends DurableObject {
+          `  async fetch(request) {
+          `    if (!this.child) {
+          `      const value = 'registry/' + new URL(request.url).pathname.slice(1) + '@sha256:' + 'b'.repeat(64);
+          `      const images = {api: value};
+          `      this.grant = this.env.factory.getContainer(this.ctx.facets, 'Tenant', async () => undefined, async () => { throw new Error('Unexpected capture'); }, images);
+          `      images.api = 'mutated after grant creation';
+          `      const loaded = this.env.loader.load({compatibilityDate:'2026-09-08', compatibilityFlags:[], mainModule:'tenant.js', modules:{'tenant.js':source}, env:{}, openComputePrivateEnv:{}, openComputeHostPolicy:true, openComputeContainer:this.grant, globalOutbound:this.env.outbound});
+          `      this.child = this.ctx.facets.get('tenant', () => ({class:loaded.getDurableObjectClass('Tenant'), id:'tenant'}));
+          `      this.other = this.ctx.facets.get('other', () => ({class:loaded.getDurableObjectClass('Other'), id:'other'}));
+          `    }
+          `    return new Response(JSON.stringify({images:await this.child.read(), other:await this.other.read()}));
+          `  }
+          `}
+          `export default {fetch(request, env) { return env.objects.get(env.objects.idFromName(new URL(request.url).pathname)).fetch(request); }};
+        )],
+        bindings = [
+          (name = "objects", durableObjectNamespace = "Host"),
+          (name = "factory", workerLoader = (factory = true)),
+          (name = "loader", workerLoader = ()),
+          (name = "outbound", service = "network")
+        ],
+        durableObjectNamespaces = [(className = "Host", uniqueKey = "named-images", enableSql = true)],
+        durableObjectStorage = (localDisk = "storage"),
+        containerEngine = (localDocker = (socketPath = "docker-addr",
+          containerEgressInterceptorImage = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")),
+        globalOutbound = "network"
+      )),
+      (name = "storage", disk = (path = "storage", writable = true)),
+      (name = "network", network = (allow = ["network", "local"], deny = ["unix", "unix-abstract"]))
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "host")]
+  ))"_kj);
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto conn = test.connect("test-addr");
+  auto one = kj::str(R"({"images":{"value":"registry/one@sha256:)",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      R"(","preserved":true},"other":true})");
+  auto two = kj::str(R"({"images":{"value":"registry/two@sha256:)",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      R"(","preserved":true},"other":true})");
+  conn.httpGet200("/one", one);
+  conn.httpGet200("/two", two);
+  test.wait(12);
+  auto resumed = test.connect("test-addr");
+  resumed.httpGet200("/one", one);
 }
 
 KJ_TEST("Server: Automatic Container monitoring does not prevent inactivity") {
