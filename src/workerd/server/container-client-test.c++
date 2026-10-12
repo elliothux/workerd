@@ -138,6 +138,7 @@ class ExecDockerFixture final {
     auto terminal = kj::newPromiseAndFulfiller<void>();
     releaseTerminal = kj::mv(terminal.fulfiller);
     terminalReady = terminal.promise.fork();
+    notifyCallbackPool();
   }
 
   bool exited = false;
@@ -168,6 +169,15 @@ class ExecDockerFixture final {
   kj::String bootstrapStart;
   kj::String stdinBytes;
   uint disconnectedRequests = 0;
+  uint unusedCallbacks = 0;
+  uint peakUnusedCallbacks = 0;
+  uint waitingCallbacks = 0;
+
+  kj::Promise<void> waitForFullCallbackPool() {
+    while (unusedCallbacks != 16 || waitingCallbacks != 1) {
+      co_await callbackPoolChanged.addBranch();
+    }
+  }
 
   kj::Promise<void> listen(kj::ConnectionReceiver& listener) {
     for (;;) {
@@ -187,12 +197,40 @@ class ExecDockerFixture final {
   kj::Own<kj::PromiseFulfiller<void>> releaseDrained;
   kj::ForkedPromise<void> outputDrained = nullptr;
   kj::ForkedPromise<void> terminalReady = nullptr;
+  kj::ForkedPromise<void> callbackPoolChanged = nullptr;
+  kj::Own<kj::PromiseFulfiller<void>> callbackPoolNotifier;
+
+  void notifyCallbackPool() {
+    auto changed = kj::newPromiseAndFulfiller<void>();
+    auto previous = kj::mv(callbackPoolNotifier);
+    callbackPoolNotifier = kj::mv(changed.fulfiller);
+    callbackPoolChanged = changed.promise.fork();
+    if (previous.get() != nullptr) previous->fulfill();
+  }
 
   kj::Promise<void> serve(kj::Own<kj::AsyncIoStream> stream) {
     auto input = kj::newHttpInputStream(*stream, table);
     auto incoming = co_await input->readRequestAllowingConnect();
     KJ_IF_SOME(connect, incoming.tryGet<kj::HttpInputStream::Connect>()) {
       KJ_REQUIRE(privateMode && connect.authority == "/open-compute/callback-channel");
+      // Match the sidecar's bounded unused pool: do not acknowledge a seventeenth channel.
+      if (unusedCallbacks == 16) {
+        ++waitingCallbacks;
+        notifyCallbackPool();
+        KJ_DEFER(--waitingCallbacks; notifyCallbackPool());
+        while (unusedCallbacks == 16) {
+          auto disconnected = stream->readAllBytes(1).then([](auto bytes) {
+            KJ_REQUIRE(bytes.size() == 0, "Unexpected idle callback data");
+            kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "Idle callback closed"));
+          });
+          co_await callbackPoolChanged.addBranch().exclusiveJoin(kj::mv(disconnected));
+        }
+      }
+      ++unusedCallbacks;
+      peakUnusedCallbacks = kj::max(peakUnusedCallbacks, unusedCallbacks);
+      KJ_REQUIRE(unusedCallbacks <= 16);
+      notifyCallbackPool();
+      KJ_DEFER(--unusedCallbacks; notifyCallbackPool());
       co_await stream->write("HTTP/1.1 200 Connection Established\r\n\r\n"_kj.asBytes());
       co_await stream->readAllBytes(1024);
       co_return;
@@ -556,6 +594,8 @@ KJ_TEST(
     "Private exec supervises the actual child without shell, PID files, or Docker control execs") {
   for (bool pty: {false, true}) {
     for (bool unknownTerminal: {false, true}) {
+      kj::StringPtr phase = "status";
+      KJ_CONTEXT(pty, unknownTerminal, phase);
       auto io = kj::setupAsyncIo();
       kj::HttpHeaderTable table;
       SignalDockerService resolver(table);
@@ -580,6 +620,10 @@ KJ_TEST(
           kj::str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
       rpc::Container::Client client(implementation->addRef());
       KJ_ASSERT(client.statusRequest().send().wait(io.waitScope).getRunning());
+      phase = "bounded callback admission";
+      fixture.waitForFullCallbackPool().wait(io.waitScope);
+      KJ_EXPECT(fixture.unusedCallbacks == 16 && fixture.waitingCallbacks == 1);
+      phase = "exec bootstrap";
       auto pipe = kj::newOneWayPipe();
       auto output = pipe.in->readAllText().eagerlyEvaluate(nullptr);
       auto request = client.execRequest();
@@ -598,12 +642,14 @@ KJ_TEST(
       KJ_EXPECT(fixture.privatePty == pty);
       auto handle = response.getProcess().getHandle();
       // The eager watcher must not consume the public stdinWriter() call.
+      phase = "stdin";
       auto stdinResponse = handle.stdinWriterRequest().send().wait(io.waitScope);
       auto stdinWriter = byteStreams.capnpToKjExplicitEnd(stdinResponse.getWriter());
       stdinWriter->write("stdin-after-bootstrap"_kj.asBytes()).wait(io.waitScope);
       stdinWriter->end().wait(io.waitScope);
       io.provider->getTimer().afterDelay(10 * kj::MILLISECONDS).wait(io.waitScope);
       KJ_EXPECT(fixture.runRequests == 1);
+      phase = "signals";
       for (uint32_t signo = 1; signo <= 64; ++signo) {
         auto signal = handle.killRequest();
         signal.setSigno(signo);
@@ -618,6 +664,7 @@ KJ_TEST(
       for (auto i: kj::indices(fixture.privateSignals)) {
         KJ_EXPECT(fixture.privateSignals[i] == i + 1);
       }
+      phase = "resize";
       auto resize = handle.resizeRequest();
       resize.setCols(100);
       resize.setRows(40);
@@ -627,6 +674,7 @@ KJ_TEST(
       } else {
         KJ_EXPECT_THROW_MESSAGE("PTY", resize.send().wait(io.waitScope));
       }
+      phase = "terminal";
       fixture.releaseTerminal->fulfill();
       auto waiting = handle.waitRequest().send();
       if (unknownTerminal) {
@@ -638,11 +686,15 @@ KJ_TEST(
       KJ_EXPECT(fixture.runRequests == 1);
       KJ_EXPECT(fixture.createRequests == 1);
       KJ_EXPECT(!fixture.outputClosed && !output.poll(io.waitScope));
+      phase = "output drain";
       fixture.releaseOutput->fulfill();
       KJ_EXPECT(output.wait(io.waitScope) == "late");
       KJ_EXPECT(outputAborted == unknownTerminal);
+      KJ_EXPECT(fixture.peakUnusedCallbacks == 16);
+      phase = "shutdown and task drain";
       implementation->shutdown();
       tasks.onEmpty().wait(io.waitScope);
+      KJ_EXPECT(fixture.unusedCallbacks == 0 && fixture.waitingCallbacks == 0);
       KJ_EXPECT(fixture.stdinBytes == "stdin-after-bootstrap");
     }
   }
