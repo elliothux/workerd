@@ -369,7 +369,7 @@ build:macos --copt='-femit-dwarf-unwind=no-compact-unwind'
 build:macos-cross-x86_64 --cpu=darwin_x86_64 --host_cpu=darwin_arm64 --platforms //:macOS_x86
 # Some cross-compiled tests are slower when run over Rosetta, increase the medium test size timeout.
 # Test performance is still very much satisfactory considering that emulation is being used here.
-build:macos-cross-x86_64 --test_timeout=1,30,60,240
+build:macos-cross-x86_64 --test_timeout=1,60,60,240
 
 # On Linux, always link libc++ statically to avoid compatibility issues with different OS versions.
 # macOS links with dynamic libc++ by default, which has good backwards compatibility.
