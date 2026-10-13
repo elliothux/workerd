@@ -17,6 +17,7 @@
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/exception.h>
 #include <workerd/jsg/url.h>
+#include <workerd/util/abortable.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/uncaught-exception-source.h>
 
@@ -26,6 +27,152 @@
 namespace workerd::api {
 
 namespace {
+
+// Native cancellation must release the TLS dependency before the physical connection.
+struct SocketPhysicalConnection {
+  kj::Own<kj::AsyncIoStream> connection;
+  kj::Own<kj::TlsStarterCallback> tlsStarter;
+};
+
+class SocketIoStream final: public kj::AsyncIoStream, public kj::Refcounted {
+ public:
+  SocketIoStream(kj::Own<kj::AsyncIoStream> connection, kj::Own<kj::TlsStarterCallback> tlsStarter)
+      : SocketIoStream(kj::mv(connection), kj::mv(tlsStarter), kj::heap<ReleasingCanceler>()) {}
+
+  void cancel() {
+    canceler.cancel(KJ_EXCEPTION(DISCONNECTED, "Socket connection was canceled."));
+  }
+
+  kj::Promise<void> startTls(kj::StringPtr hostname) {
+    return impl.wrap([hostname](SocketPhysicalConnection& inner) {
+      return KJ_ASSERT_NONNULL(*inner.tlsStarter)(hostname);
+    });
+  }
+
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    return impl.wrap([&](SocketPhysicalConnection& inner) {
+      return inner.connection->tryRead(buffer, minBytes, maxBytes);
+    });
+  }
+
+  kj::Maybe<size_t> tryReadSync(kj::ArrayPtr<kj::byte> buffer, size_t minBytes) override {
+    KJ_IF_SOME(inner, impl.tryGetInner()) {
+      return inner.connection->tryReadSync(buffer, minBytes);
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<uint64_t> tryGetLength() override {
+    return impl.getInner().connection->tryGetLength();
+  }
+
+  kj::Promise<uint64_t> pumpTo(kj::AsyncOutputStream& output, uint64_t amount) override {
+    return impl.wrap(
+        [&](SocketPhysicalConnection& inner) { return inner.connection->pumpTo(output, amount); });
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::byte> bytes) override {
+    return impl.wrap(
+        [&](SocketPhysicalConnection& inner) { return inner.connection->write(bytes); });
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    return impl.wrap(
+        [&](SocketPhysicalConnection& inner) { return inner.connection->write(pieces); });
+  }
+
+  bool tryWriteSync(kj::ArrayPtr<const kj::byte> bytes) override {
+    KJ_IF_SOME(inner, impl.tryGetInner()) {
+      return inner.connection->tryWriteSync(bytes);
+    }
+    return false;
+  }
+
+  bool tryWriteSync(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    KJ_IF_SOME(inner, impl.tryGetInner()) {
+      return inner.connection->tryWriteSync(pieces);
+    }
+    return false;
+  }
+
+  kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
+      kj::AsyncInputStream& input, uint64_t amount) override {
+    return impl.getInner()
+        .connection->tryPumpFrom(input, amount)
+        .map([this](kj::Promise<uint64_t> promise) { return canceler.wrap(kj::mv(promise)); });
+  }
+
+  kj::Promise<void> whenWriteDisconnected() override {
+    return impl.wrap(
+        [](SocketPhysicalConnection& inner) { return inner.connection->whenWriteDisconnected(); });
+  }
+
+  void shutdownWrite() override {
+    impl.getInner().connection->shutdownWrite();
+  }
+
+  void abortRead() override {
+    impl.getInner().connection->abortRead();
+  }
+
+  void getsockopt(int level, int option, void* value, kj::uint* length) override {
+    impl.getInner().connection->getsockopt(level, option, value, length);
+  }
+
+  void setsockopt(int level, int option, const void* value, kj::uint length) override {
+    impl.getInner().connection->setsockopt(level, option, value, length);
+  }
+
+  void getsockname(struct sockaddr* address, kj::uint* length) override {
+    impl.getInner().connection->getsockname(address, length);
+  }
+
+  void getpeername(struct sockaddr* address, kj::uint* length) override {
+    impl.getInner().connection->getpeername(address, length);
+  }
+
+  kj::Maybe<int> getFd() const override {
+    return const_cast<SocketIoStream*>(this)->impl.getInner().connection->getFd();
+  }
+
+ private:
+  SocketIoStream(kj::Own<kj::AsyncIoStream> connection,
+      kj::Own<kj::TlsStarterCallback> tlsStarter,
+      kj::Own<ReleasingCanceler> canceler)
+      : canceler(*canceler),
+        impl(kj::heap<SocketPhysicalConnection>(
+                 SocketPhysicalConnection{kj::mv(connection), kj::mv(tlsStarter)}),
+            kj::mv(canceler)) {}
+
+  ReleasingCanceler& canceler;
+  AbortableImpl<SocketPhysicalConnection> impl;
+};
+
+class SocketDatagramChannel final: public DatagramChannel, public kj::Refcounted {
+ public:
+  explicit SocketDatagramChannel(kj::Own<DatagramChannel> inner)
+      : SocketDatagramChannel(kj::mv(inner), kj::heap<ReleasingCanceler>()) {}
+
+  void cancel() {
+    canceler.cancel(KJ_EXCEPTION(DISCONNECTED, "Socket connection was canceled."));
+  }
+
+  kj::Promise<kj::Maybe<kj::Array<kj::byte>>> receive() override {
+    return impl.wrap(&DatagramChannel::receive);
+  }
+
+  kj::Promise<void> send(kj::ArrayPtr<const kj::byte> bytes) override {
+    return impl.wrap(&DatagramChannel::send, bytes);
+  }
+
+ private:
+  SocketDatagramChannel(kj::Own<DatagramChannel> inner, kj::Own<ReleasingCanceler> canceler)
+      : canceler(*canceler),
+        impl(kj::mv(inner), kj::mv(canceler)) {}
+
+  ReleasingCanceler& canceler;
+  AbortableImpl<DatagramChannel> impl;
+};
 
 // A kj::AsyncIoStream that bridges the two raw kj half-streams recovered when a Socket is
 // deserialized from RPC: the readable side (an AsyncInputStream unwrapped from the pushed
@@ -521,12 +668,13 @@ jsg::Ref<Socket> setupSocket(jsg::Lock& js,
   // Set up disconnection detection. watchForDisconnect() builds the kj-side watch task (stored in
   // the Socket so it is canceled before the connection stream is destroyed); the JS-side wiring that
   // resolves `closed` is attached by wireClosedToDisconnect() after the Socket is constructed.
-  auto [disconnected, watchForDisconnectTask] = watchForDisconnect(*connection);
+  auto ownedConnection = kj::rc<SocketIoStream>(kj::mv(connection), kj::mv(tlsStarter));
+  auto [disconnected, watchForDisconnectTask] = watchForDisconnect(*ownedConnection);
 
   auto closedPrPair = js.newPromiseAndResolver<void>();
   closedPrPair.promise.markAsHandled(js);
 
-  kj::Rc<kj::AsyncIoStream> refcountedConnection(kj::mv(connection));
+  kj::Rc<kj::AsyncIoStream> refcountedConnection(kj::mv(ownedConnection));
   // Initialize the readable/writable streams with the readable/writable sides of an AsyncIoStream.
   auto sysStreams = newSystemMultiStream(refcountedConnection.addRef(), ioContext);
   auto readable = JsReadableStream::create(js, ioContext, kj::mv(sysStreams.readable));
@@ -545,8 +693,8 @@ jsg::Ref<Socket> setupSocket(jsg::Lock& js,
 
   auto result = js.alloc<Socket>(js, ioContext, kj::mv(refcountedConnection), kj::mv(remoteAddress),
       kj::mv(localAddress), kj::mv(readable), kj::mv(writable), kj::mv(closedPrPair),
-      kj::mv(watchForDisconnectTask), kj::mv(options), kj::mv(tlsStarter), secureTransport,
-      protocol, kj::mv(domain), isDefaultFetchPort, kj::mv(openedPrPair));
+      kj::mv(watchForDisconnectTask), kj::mv(options), secureTransport, protocol, kj::mv(domain),
+      isDefaultFetchPort, kj::mv(openedPrPair));
 
   result->wireClosedToDisconnect(js, kj::mv(disconnected));
   KJ_IF_SOME(p, eofPromise) {
@@ -577,7 +725,7 @@ jsg::Ref<Socket> setupDatagramSocket(jsg::Lock& js,
     kj::Maybe<kj::String> localAddress) {
   auto& ioContext = IoContext::current();
 
-  kj::Rc<DatagramChannel> channel(kj::mv(channelOwn));
+  kj::Rc<DatagramChannel> channel(kj::rc<SocketDatagramChannel>(kj::mv(channelOwn)));
 
   auto closedPrPair = js.newPromiseAndResolver<void>();
   closedPrPair.promise.markAsHandled(js);
@@ -596,8 +744,7 @@ jsg::Ref<Socket> setupDatagramSocket(jsg::Lock& js,
       kj::NEVER_DONE /* watchForDisconnectTask: UDP has no peer-disconnect signal; `closed`
                         resolves from read-EOF (wired below) instead. */
       ,
-      kj::none /* options */, kj::heap<kj::TlsStarterCallback>() /* no TLS for UDP */,
-      SecureTransportKind::OFF, SocketProtocol::UDP, kj::none /* domain */,
+      kj::none /* options */, SecureTransportKind::OFF, SocketProtocol::UDP, kj::none /* domain */,
       false /* isDefaultFetchPort */, kj::mv(openedPrPair));
 
   result->handleReadableEof(js, kj::mv(eofPromise));
@@ -801,6 +948,21 @@ jsg::Ref<Socket> connectImpl(jsg::Lock& js,
   return result;
 }
 
+kj::Own<void> Socket::getConnectionAbortHandle(jsg::Lock& js) {
+  auto& data = JSG_REQUIRE_NONNULL(connectionData, Error, "The Socket connection has ended.");
+  KJ_SWITCH_ONEOF(data->connectionStream) {
+    KJ_CASE_ONEOF(stream, kj::Rc<kj::AsyncIoStream>) {
+      auto& owner = dynamic_cast<SocketIoStream&>(*stream);
+      return kj::heap(kj::defer([stream = stream.addRef(), &owner]() { owner.cancel(); }));
+    }
+    KJ_CASE_ONEOF(channel, kj::Rc<DatagramChannel>) {
+      auto& owner = dynamic_cast<SocketDatagramChannel&>(*channel);
+      return kj::heap(kj::defer([channel = channel.addRef(), &owner]() { owner.cancel(); }));
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
 jsg::Promise<void> Socket::close(jsg::Lock& js) {
   if (isClosing) {
     return closedPromiseCopy.whenResolved(js);
@@ -843,8 +1005,23 @@ jsg::Promise<void> Socket::close(jsg::Lock& js) {
 
     self->resolveFulfiller(js, kj::none);
     return js.resolvedPromise();
-  }).catch_(js, [self = JSG_THIS](jsg::Lock& js, jsg::Value err) mutable {
-    self->errorHandler(js, kj::mv(err));
+  }).then(js, [](jsg::Lock& js) {
+    return js.resolvedPromise();
+  }, [self = JSG_THIS](jsg::Lock& js, jsg::Value err) mutable {
+    // Preserve the close error while both stream cleanup attempts settle.
+    auto reason = jsg::JsValue(err.getHandle(js));
+    auto cancelPromise =
+        self->readable.forceCancel(js, reason).catch_(js, [](jsg::Lock&, jsg::Value) {});
+    auto abortPromise =
+        self->writable.forceAbort(js, reason).catch_(js, [](jsg::Lock&, jsg::Value) {});
+    return cancelPromise
+        .then(js, [abortPromise = kj::mv(abortPromise)](jsg::Lock&) mutable {
+      return kj::mv(abortPromise);
+    }).then(js, [self = kj::mv(self), err = kj::mv(err)](jsg::Lock& js) mutable {
+      { auto _ = kj::mv(self->connectionData); }
+      self->connectionData = kj::none;
+      self->errorHandler(js, kj::mv(err));
+    });
   });
 }
 
@@ -914,21 +1091,22 @@ jsg::Ref<Socket> Socket::startTls(jsg::Lock& js, jsg::Optional<TlsOptions> tlsOp
                 } else {
                 }  // Needed to avoid compiler error/warning
 
-                // All non-secure sockets should have `connectionData` with a `tlsStarter`.
-                // Though since it's inside an IoOwn, if the request's IoContext has ended
+                // The authoritative TCP owner also owns the TLS starter.
+                // Since connectionData is inside an IoOwn, if the request's IoContext has ended
                 // then `connectionData` will be null. This can happen if the flush operation is taking
                 // a particularly long time (EW-8538), so we throw a JSG error if that's the case.
                 auto& connData = JSG_REQUIRE_NONNULL(self->connectionData, TypeError,
                     "The connection was closed before startTls completed.");
 
-                auto& tlsStarter = connData->tlsStarter;
+                auto& transport = dynamic_cast<SocketIoStream&>(*KJ_ASSERT_NONNULL(
+                    connData->connectionStream.tryGet<kj::Rc<kj::AsyncIoStream>>()));
 
                 // Fork the starter promise because we need to create two separate things waiting
                 // on it below. The first is resolving the openedResolver with a JS promise that
                 // wraps one branch, the second is the kj::Promise that we use to resolve the
                 // secureStream for the promised stream. This keeps us from having to bounce in and
                 // out of the JS isolate lock.
-                auto forkedPromise = KJ_ASSERT_NONNULL(*tlsStarter)(acceptedHostname).fork();
+                auto forkedPromise = transport.startTls(acceptedHostname).fork();
 
                 openedResolver.resolve(js,
                     context.awaitIo(js, forkedPromise.addBranch(),
@@ -1266,7 +1444,8 @@ jsg::Ref<Socket> hydrateRpcSocket(jsg::Lock& js,
   // startTls/takeConnectionStream) and derive the readable/writable sources from it.
   kj::Own<kj::AsyncIoStream> asyncIoStream =
       kj::heap<TransferredSocketStream>(kj::mv(input), kj::mv(output));
-  kj::Rc<kj::AsyncIoStream> refcountedConnection(kj::mv(asyncIoStream));
+  kj::Rc<kj::AsyncIoStream> refcountedConnection(
+      kj::rc<SocketIoStream>(kj::mv(asyncIoStream), kj::heap<kj::TlsStarterCallback>()));
   auto sysStreams = newSystemMultiStream(refcountedConnection.addRef(), ioContext);
   // The underlying streams are bound to this IoContext (they disconnect when the RPC session's
   // JsRpcCustomEvent is canceled), so their pumpTo() must not be deferred past the context's
@@ -1308,9 +1487,6 @@ jsg::Ref<Socket> hydrateRpcSocket(jsg::Lock& js,
   // microtask below, since it cannot run where JS execution is disallowed.
   auto [disconnected, watchForDisconnectTask] = watchForDisconnect(*refcountedConnection);
 
-  // No real TLS starter exists for a transferred socket, so startTls is unsupported.
-  auto tlsStarter = kj::heap<kj::TlsStarterCallback>();
-
   // default fetch port
   auto isDefaultFetchPort = socketData.getIsDefaultFetchPort();
 
@@ -1323,8 +1499,8 @@ jsg::Ref<Socket> hydrateRpcSocket(jsg::Lock& js,
   // hardcoded rather than carried across the wire, since the RPC schema has no field for it.
   auto socket = js.alloc<Socket>(js, ioContext, kj::mv(refcountedConnection), kj::str(remoteAddr),
       kj::mv(localAddr), kj::mv(readable), kj::mv(writable), kj::mv(closedPrPair),
-      kj::mv(watchForDisconnectTask), kj::mv(options), kj::mv(tlsStarter), secureTransport,
-      SocketProtocol::TCP, kj::none /* domain */, isDefaultFetchPort, kj::mv(openedPrPair));
+      kj::mv(watchForDisconnectTask), kj::mv(options), secureTransport, SocketProtocol::TCP,
+      kj::none /* domain */, isDefaultFetchPort, kj::mv(openedPrPair));
 
   // handleReadableEof() and wireClosedToDisconnect() both attach jsg `.then()` continuations,
   // which invoke V8 -- forbidden when this body runs as Socket::deserialize()'s in-place
@@ -1413,9 +1589,8 @@ kj::Own<kj::AsyncIoStream> Socket::takeConnectionStream(jsg::Lock& js) {
       connectionData, TypeError, "The socket connection is closed or was already taken.");
   auto& stream = JSG_REQUIRE_NONNULL(dataConn->connectionStream.tryGet<kj::Rc<kj::AsyncIoStream>>(),
       TypeError, "takeConnectionStream() is not supported for datagram sockets.");
-  // Attach tlsStarter to the wrapper so it survives as long as the connection stream
-  // and is destroyed before the stream itself.
-  auto wrapper = stream.addRef().toOwn().attach(kj::mv(dataConn->tlsStarter));
+  // The stream owns the TLS starter and destroys it before the physical connection.
+  auto wrapper = stream.addRef().toOwn();
   connectionData = kj::none;
   closedResolver.resolve(js);
   return wrapper;

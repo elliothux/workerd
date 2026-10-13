@@ -148,14 +148,13 @@ class Socket: public jsg::Object {
       jsg::PromiseResolverPair<void> closedPrPair,
       kj::Promise<void> watchForDisconnectTask,
       jsg::Optional<SocketOptions> options,
-      kj::Own<kj::TlsStarterCallback> tlsStarter,
       SecureTransportKind secureTransport,
       SocketProtocol protocol,
       kj::Maybe<kj::String> domain,
       bool isDefaultFetchPort,
       jsg::PromiseResolverPair<SocketInfo> openedPrPair)
       : connectionData(context.createObject<ConnectionData>(
-            kj::mv(tlsStarter), kj::mv(connectionStream), kj::mv(watchForDisconnectTask))),
+            kj::mv(connectionStream), kj::mv(watchForDisconnectTask))),
         readable(kj::mv(readableParam)),
         writable(kj::mv(writable)),
         closedResolver(kj::mv(closedPrPair.resolver)),
@@ -209,6 +208,10 @@ class Socket: public jsg::Object {
     }
     KJ_UNREACHABLE;
   }
+
+  // Returns an event-owned native cleanup guard. Destroy it on the KJ thread to cancel all
+  // native I/O and release the connection; it must not be stored on the JavaScript heap.
+  kj::Own<void> getConnectionAbortHandle(jsg::Lock& js);
 
   // Takes ownership of the underlying connection stream, detaching the readable and writable streams.
   // This is a destructive operation that renders the Socket unusable for further I/O operations.
@@ -310,15 +313,10 @@ class Socket: public jsg::Object {
     // so that datagram boundaries can never be merged or split.
     kj::OneOf<kj::Rc<kj::AsyncIoStream>, kj::Rc<DatagramChannel>> connectionStream;
     kj::Maybe<kj::Promise<void>> watchForDisconnectTask;
-    // tlsStarter must be declared after connectionStream so that it is destroyed first, since it
-    // holds a reference that keeps the connection alive.
-    kj::Own<kj::TlsStarterCallback> tlsStarter;
-    ConnectionData(kj::Own<kj::TlsStarterCallback> tlsStarter,
-        kj::OneOf<kj::Rc<kj::AsyncIoStream>, kj::Rc<DatagramChannel>> connectionStream,
+    ConnectionData(kj::OneOf<kj::Rc<kj::AsyncIoStream>, kj::Rc<DatagramChannel>> connectionStream,
         kj::Promise<void> disconnectTask)
         : connectionStream(kj::mv(connectionStream)),
-          watchForDisconnectTask(kj::mv(disconnectTask)),
-          tlsStarter(kj::mv(tlsStarter)) {}
+          watchForDisconnectTask(kj::mv(disconnectTask)) {}
   };
   kj::Maybe<IoOwn<ConnectionData>> connectionData;
 

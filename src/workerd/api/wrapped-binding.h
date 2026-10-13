@@ -9,6 +9,7 @@
 #include <workerd/api/open-compute-durable-object.h>
 #include <workerd/api/open-compute-service.h>
 #include <workerd/api/queue.h>
+#include <workerd/api/sockets.h>
 #include <workerd/io/io-context.h>
 #include <workerd/io/worker-interface.capnp.h>
 #include <workerd/jsg/jsg.h>
@@ -68,7 +69,136 @@ class WrappedBindingModule final: public jsg::Object {
   WrappedBindingModule() = default;
   WrappedBindingModule(jsg::Lock&, const jsg::Url&) {}
 
+  void validatePublicTransport(jsg::Ref<Fetcher> transport) {
+    requirePublicTransport(transport);
+  }
+
+  // Public binding dispatch uses the original receiver and its normal subrequest budget.
+  jsg::Promise<jsg::Ref<Response>> fetchPublicTransport(
+      jsg::Lock& js, jsg::Ref<Fetcher> transport, jsg::Ref<Request> request) {
+    requirePublicTransport(transport);
+    return transport->api::Fetcher::fetch(js, kj::mv(request), kj::none);
+  }
+
+  jsg::Ref<Socket> connectPublicTransport(jsg::Lock& js,
+      jsg::Ref<Fetcher> transport,
+      AnySocketAddress address,
+      jsg::Optional<SocketOptions> options) {
+    requirePublicTransport(transport);
+    return transport->api::Fetcher::connect(js, kj::mv(address), kj::mv(options));
+  }
+
+  // These INTERNAL operations select native methods without consulting a public prototype.
+  kj::StringPtr rpcTransportKind(jsg::Lock& js, jsg::JsValue value) {
+    auto object = value.tryCast<jsg::JsObject>();
+    if (object == kj::none) return ""_kj;
+    auto& receiver = KJ_ASSERT_NONNULL(object);
+    KJ_IF_SOME(fetcher, receiver.tryUnwrapAs<Fetcher>(js)) {
+      requireRawTransport(fetcher);
+      return "fetcher"_kj;
+    }
+    if (receiver.tryUnwrapAs<JsRpcStub>(js) != kj::none) return "stub"_kj;
+    if (receiver.tryUnwrapAs<JsRpcPromise>(js) != kj::none) return "promise"_kj;
+    if (receiver.tryUnwrapAs<JsRpcProperty>(js) != kj::none) return "property"_kj;
+    return ""_kj;
+  }
+
+  jsg::JsValue getRpcTransportMember(
+      jsg::Lock& js, jsg::JsObject receiver, kj::String name, kj::String resultKind) {
+    auto kind = resultKind == "value"_kj ? JsRpcResultKind::PUBLIC
+        : resultKind == "stub"_kj        ? JsRpcResultKind::PRIVATE_STUB
+        : resultKind == "stream"_kj      ? JsRpcResultKind::PRIVATE_STREAM
+                                         : JsRpcResultKind::PRIVATE_DATA;
+    JSG_REQUIRE(resultKind == "value"_kj || resultKind == "stub"_kj || resultKind == "stream"_kj ||
+            resultKind == "data"_kj,
+        TypeError, "SERVICE_BINDING_DENIED");
+    auto mark = [&](jsg::JsValue value) {
+      KJ_IF_SOME(object, value.tryCast<jsg::JsObject>()) {
+        auto property = JSG_REQUIRE_NONNULL(
+            object.tryUnwrapAs<JsRpcProperty>(js), TypeError, "SERVICE_BINDING_DENIED");
+        property->setInternalResultKind(js, kind);
+      }
+      return value;
+    };
+    KJ_IF_SOME(fetcher, receiver.tryUnwrapAs<Fetcher>(js)) {
+      requireRawTransport(fetcher);
+      return mark(fetcher->api::Fetcher::getRpcMethod(js, kj::mv(name)).orDefault(js.undefined()));
+    }
+    KJ_IF_SOME(stub, receiver.tryUnwrapAs<JsRpcStub>(js)) {
+      JSG_REQUIRE(kind == JsRpcResultKind::PUBLIC || stub->isNativeInternalTransport(), TypeError,
+          "SERVICE_BINDING_DENIED");
+      return mark(stub->getRpcMethod(js, kj::mv(name)).orDefault(js.undefined()));
+    }
+    const auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<JsRpcProperty>>());
+    KJ_IF_SOME(promise, receiver.tryUnwrapAs<JsRpcPromise>(js)) {
+      JSG_REQUIRE(kind == JsRpcResultKind::PUBLIC || promise->isNativeInternalTransport(),
+          TypeError, "SERVICE_BINDING_DENIED");
+      KJ_IF_SOME(property, promise->getProperty(js, kj::mv(name))) {
+        property->setInternalResultKind(js, kind);
+        return jsg::JsValue(handler.wrap(js, kj::mv(property)));
+      }
+      return js.undefined();
+    }
+    KJ_IF_SOME(parent, receiver.tryUnwrapAs<JsRpcProperty>(js)) {
+      JSG_REQUIRE(kind == JsRpcResultKind::PUBLIC || parent->isNativeInternalTransport(), TypeError,
+          "SERVICE_BINDING_DENIED");
+      KJ_IF_SOME(property, parent->getProperty(js, kj::mv(name))) {
+        property->setInternalResultKind(js, kind);
+        return jsg::JsValue(handler.wrap(js, kj::mv(property)));
+      }
+      return js.undefined();
+    }
+    JSG_FAIL_REQUIRE(TypeError, "SERVICE_BINDING_DENIED");
+  }
+
+  jsg::JsValue thenRpcTransport(jsg::Lock& js,
+      jsg::JsObject receiver,
+      v8::Local<v8::Function> fulfilled,
+      jsg::Optional<v8::Local<v8::Function>> rejected) {
+    KJ_IF_SOME(promise, receiver.tryUnwrapAs<JsRpcPromise>(js)) {
+      return promise->then(js, fulfilled, rejected);
+    }
+    KJ_IF_SOME(property, receiver.tryUnwrapAs<JsRpcProperty>(js)) {
+      return property->then(js, fulfilled, rejected);
+    }
+    JSG_FAIL_REQUIRE(TypeError, "SERVICE_BINDING_DENIED");
+  }
+
+  void disposeRpcTransport(jsg::Lock& js, jsg::JsObject receiver) {
+    KJ_IF_SOME(stub, receiver.tryUnwrapAs<JsRpcStub>(js)) {
+      stub->disposeForJs(js);
+      return;
+    }
+    KJ_IF_SOME(promise, receiver.tryUnwrapAs<JsRpcPromise>(js)) {
+      if (promise->getResultKindForInternalTransport() == JsRpcResultKind::PUBLIC)
+        promise->dispose(js);
+      else
+        promise->disposeForInternalTransport(js);
+      return;
+    }
+    JSG_FAIL_REQUIRE(TypeError, "SERVICE_BINDING_DENIED");
+  }
+
+  jsg::Ref<JsRpcStub> duplicateRpcTransport(
+      jsg::Lock& js, jsg::Ref<JsRpcStub> receiver, kj::String exposure) {
+    JSG_REQUIRE(
+        exposure == "private"_kj || exposure == "value"_kj, TypeError, "SERVICE_BINDING_DENIED");
+    auto duplicate = receiver->dup(js);
+    if (exposure == "value"_kj) return duplicate;
+    auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<JsRpcStub>>());
+    auto value = handler.wrap(js, duplicate.addRef()).As<v8::Object>();
+    auto attributes =
+        static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontDelete | v8::DontEnum);
+    v8::Local<v8::String> thenName = js.str("then"_kj);
+    v8::Local<v8::Value> undefined = js.undefined();
+    JSG_REQUIRE(
+        jsg::check(value->DefineOwnProperty(js.v8Context(), thenName, undefined, attributes)),
+        TypeError, "SERVICE_BINDING_DENIED");
+    return duplicate;
+  }
+
   jsg::Ref<Fetcher> createPrivateTransport(jsg::Lock& js, jsg::Ref<Fetcher> transport) {
+    requirePublicTransport(transport);
     return js.alloc<Fetcher>(kj::mv(transport));
   }
 
@@ -120,6 +250,14 @@ class WrappedBindingModule final: public jsg::Object {
   JSG_RESOURCE_TYPE(WrappedBindingModule) {
     JSG_NESTED_TYPE(WrappedBinding);
     JSG_METHOD(createPrivateTransport);
+    JSG_METHOD(rpcTransportKind);
+    JSG_METHOD(getRpcTransportMember);
+    JSG_METHOD(thenRpcTransport);
+    JSG_METHOD(disposeRpcTransport);
+    JSG_METHOD(duplicateRpcTransport);
+    JSG_METHOD(validatePublicTransport);
+    JSG_METHOD(fetchPublicTransport);
+    JSG_METHOD(connectPublicTransport);
     JSG_METHOD(admitSubrequest);
     JSG_METHOD(createDurableObjectId);
     JSG_METHOD(createDurableObjectNamespace);
@@ -128,6 +266,19 @@ class WrappedBindingModule final: public jsg::Object {
     JSG_METHOD(isRpcStub);
     JSG_METHOD(installQueuePolicy);
     JSG_METHOD(decodeQueueV8);
+  }
+
+ private:
+  static void requireRawTransport(jsg::Ref<Fetcher>& transport) {
+    JSG_REQUIRE(dynamic_cast<open_compute::Fetcher*>(&*transport) == nullptr &&
+            dynamic_cast<open_compute::durable_objects::DurableObject*>(&*transport) == nullptr,
+        TypeError, "SERVICE_BINDING_DENIED");
+  }
+
+  static void requirePublicTransport(jsg::Ref<Fetcher>& transport) {
+    requireRawTransport(transport);
+    JSG_REQUIRE(!transport->channelOrClientFactory.is<jsg::Ref<Fetcher>>(), TypeError,
+        "SERVICE_BINDING_DENIED");
   }
 };
 

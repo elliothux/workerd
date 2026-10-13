@@ -769,6 +769,15 @@ JsReadableStream JsReadableStream::fromPull(
       constructor.newInstance(js, jsg::JsValue(sourceObj), jsg::JsValue(strategyObj)).addRef(js));
 }
 
+kj::Maybe<JsReadableStream> JsReadableStream::tryUnwrap(
+    jsg::Lock& js, v8::Local<v8::Value> handle) {
+  auto& handler = KJ_REQUIRE_NONNULL(js.tryGetTypeHandler<jsg::Ref<ReadableStream>>());
+  KJ_IF_SOME(stream, handler.tryUnwrap(js, handle)) {
+    return JsReadableStream(kj::mv(stream));
+  }
+  return tryUnwrapTs(js, handle);
+}
+
 kj::Maybe<JsReadableStream> JsReadableStream::tryUnwrapTs(
     jsg::Lock& js, v8::Local<v8::Value> handle) {
   // Without the flag there is no TypeScript implementation (and no bootstrap export to

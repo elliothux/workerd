@@ -368,7 +368,7 @@ class Fetcher: public JsRpcClientProvider {
   void onActorCallRetry() override;
 
   // Get a SubrequestChannel representing this Fetcher.
-  kj::Own<IoChannelFactory::SubrequestChannel> getSubrequestChannel(IoContext& ioContext);
+  virtual kj::Own<IoChannelFactory::SubrequestChannel> getSubrequestChannel(IoContext& ioContext);
 
   // Wraps kj::Url::parse to take into account whether the Fetcher requires a host to be
   // specified on URLs, Fetcher-specific URL decoding options, and error handling.
@@ -596,6 +596,8 @@ class Fetcher: public JsRpcClientProvider {
       channelOrClientFactory;
   RequiresHostAndProtocol requiresHost;
   bool isInHouse;
+
+  friend class WrappedBindingModule;
 
   // Generic stubs use the receiving isolate's compat flags. Wrapped bindings explicitly bypass
   // the gate while rebuilding their private inner fetcher.

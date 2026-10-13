@@ -56,6 +56,9 @@ jobs:
           //src/workerd/server:container-client-test@
           //src/workerd/api:container-test@
           //src/workerd/api/tests:worker-loader-host-container-test@
+          //src/workerd/api:sockets-test@
+          //src/workerd/api/tests:socket-close-gc-test@
+          //src/workerd/api/tests:outbound-interceptor-socket-test@
           --strip=always
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none

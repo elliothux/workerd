@@ -9,8 +9,13 @@
 
 namespace workerd::api::open_compute {
 
-// Shared fail-closed channel boundary for bindings whose private policy owns dispatch.
+// Shared fail-closed RPC boundary for bindings whose private policy owns dispatch.
 kj::Own<api::Fetcher::CrossContextOutgoingFactory> newPolicyOnlyFactory(kj::StringPtr code);
+
+// HTTP and TCP callbacks re-enter their original actor and use the same private public-binding policy.
+jsg::JsObject createPolicyChannelCallbacks(IoContext& context, jsg::JsObject policy);
+kj::Own<IoChannelFactory::SubrequestChannel> newPolicySubrequestChannel(
+    IoContext& context, jsg::JsObject callbacks);
 
 // A native Fetcher whose private policy owns Service authority and lifecycle. The native type
 // retains the public Fetcher name and ancestry; the policy never enters the tenant environment.
@@ -31,6 +36,8 @@ class Fetcher: public api::Fetcher {
       jsg::Optional<jsg::Value> options,
       const jsg::TypeHandler<Connect>& handler);
   kj::Maybe<jsg::JsValue> getRpcMethod(jsg::Lock& js, kj::String name) override;
+
+  kj::Own<IoChannelFactory::SubrequestChannel> getSubrequestChannel(IoContext& context) override;
 
   ClientForOneCall getClientForOneCall(
       jsg::Lock& js, kj::Maybe<ActorCallRetryState::Attempt> attempt) override;

@@ -310,6 +310,10 @@ class JsReadableStream final {
     return tryUnwrapTs(js, handle);
   }
 
+  // Recognize either stream implementation for native callers outside a typeWrapper.
+  // The existing JSG wrapper path retains its context and parent-object semantics.
+  static kj::Maybe<JsReadableStream> tryUnwrap(jsg::Lock& js, v8::Local<v8::Value> handle);
+
   // The TypeScript arm of jsgTryUnwrap: recognizes a TypeScript-implemented ReadableStream
   // by the implementation's private brand (via the bootstrap bridge's isReadableStream) and
   // adopts it. Returns kj::none if the typescript_implemented_streams compat flag is off

@@ -19,8 +19,21 @@ const source = `
     }
     state() { return {brand: this.ctx.container.constructor.name, running: this.ctx.container.running, snapshotDirectory: typeof this.ctx.container.snapshotDirectory}; }
     async inspect() { return await this.ctx.container.inspect(); }
+    async registerChannels() {
+      for (const binding of [this.env.OBJECT, this.env.SERVICE]) {
+        await this.ctx.container.interceptOutboundHttp('public.invalid:80', binding);
+        await this.ctx.container.interceptOutboundHttps('public.invalid:443', binding);
+      }
+    }
     async snapshots() {
       await this.ctx.container.snapshotContainer();
+    }
+  }
+  export class TcpOnly extends DurableObject {
+    async registerTcpChannels() {
+      for (const binding of [this.env.OBJECT, this.env.SERVICE]) {
+        await this.ctx.container.interceptOutboundTcp('public.invalid:1234', binding);
+      }
     }
   }
   export class InspectOnly extends DurableObject {
@@ -56,15 +69,16 @@ export class Host extends DurableObject {
       TypeError
     );
     const calls = [];
+    const resolve = async (start, stop, completed, startup, expectedLeaseKey, monitor) => {
+      assert.equal(typeof expectedLeaseKey, 'string');
+      assert.equal(typeof monitor, 'boolean');
+      calls.push({ start, stop, completed, startup, monitor });
+      return undefined;
+    };
     const grant = this.env.factory.getContainer(
       this.ctx.facets,
       'App',
-      async (start, stop, completed, startup, expectedLeaseKey, monitor) => {
-        assert.equal(typeof expectedLeaseKey, 'string');
-        assert.equal(typeof monitor, 'boolean');
-        calls.push({ start, stop, completed, startup, monitor });
-        return undefined;
-      },
+      resolve,
       async () => {
         throw new Error('Unexpected capture');
       },
@@ -76,8 +90,8 @@ export class Host extends DurableObject {
       compatibilityFlags: ['enable_ctx_exports'],
       mainModule: 'tenant.js',
       modules: { 'tenant.js': source },
-      env: {},
-      openComputePrivateEnv: {},
+      env: { DECLARED: 'registration event', SERVICE: this.env.outbound },
+      openComputePrivateEnv: { raw: this.env.outbound },
       openComputeHostPolicy: true,
       openComputeContainer: grant,
       globalOutbound: this.env.outbound,
@@ -92,6 +106,7 @@ export class Host extends DurableObject {
       snapshotDirectory: 'undefined',
     });
     assert.equal(await child.inspect(), null);
+    await child.registerChannels();
     assert.deepEqual(await child.inactivity(), [
       'TypeError',
       'TypeError',
@@ -113,6 +128,38 @@ export class Host extends DurableObject {
     assert.equal(await plain.state(), true);
     grant.revoke();
     await assert.rejects(grant.start(), /Container operation failed/);
+    this.ctx.facets.abort('tenant', new Error('Stable attachment case completed'));
+    const tcpGrant = this.env.factory.getContainer(
+      this.ctx.facets,
+      'TcpOnly',
+      resolve,
+      async () => { throw new Error('Unexpected capture'); },
+      {}
+    );
+    try {
+      const tcpLoaded = loader.load({
+        compatibilityDate: '2026-09-08',
+        compatibilityFlags: ['enable_ctx_exports', 'experimental'],
+        allowExperimental: true,
+        mainModule: 'tenant.js',
+        modules: { 'tenant.js': source },
+        env: { DECLARED: 'registration event', SERVICE: this.env.outbound },
+        openComputePrivateEnv: { raw: this.env.outbound },
+        openComputeHostPolicy: true,
+        openComputeContainer: tcpGrant,
+        globalOutbound: this.env.outbound,
+      });
+      const tcpChild = this.ctx.facets.get('tenant', () => ({
+        class: tcpLoaded.getDurableObjectClass('TcpOnly'),
+        id: 'app',
+      }));
+      const beforeTcp = calls.length;
+      await tcpChild.registerTcpChannels();
+      assert.ok(calls.slice(beforeTcp).every((call) => !call.start && !call.stop));
+    } finally {
+      tcpGrant.revoke();
+      this.ctx.facets.abort('tenant', new Error('TCP owning case completed'));
+    }
   }
   async checkInspectionAuthority() {
     const malformed = [

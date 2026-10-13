@@ -2,7 +2,7 @@ using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   extensions = [(modules = [
     (name = "cloudflare-internal:open-compute-host-policy", internal = true,
-     esModule = "export default () => namespace => namespace;"),
+     esModule = embed "worker-loader-host-container-test-internal.js"),
   ])],
   services = [
     (name = "TEST_TMPDIR", disk = (writable = true)),

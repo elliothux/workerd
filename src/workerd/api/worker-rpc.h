@@ -352,6 +352,9 @@ class JsRpcClientProvider: public jsg::Object {
   virtual kj::LiteralStringConst getRpcTargetKind() = 0;
 };
 
+// INTERNAL acquisition selects result exposure before the first RPC response continuation.
+enum class JsRpcResultKind { PUBLIC, PRIVATE_STUB, PRIVATE_STREAM, PRIVATE_DATA };
+
 class JsRpcProperty;
 class JsRpcCallRetryState;
 class JsRpcCallAttemptObserver;
@@ -395,6 +398,9 @@ class JsRpcPromise: public JsRpcClientProvider {
     // This is set true if the JsRpcPromise's dispose() method was explicitly called, in which
     // case the final result should be considered pre-disposed.
     bool disposed = false;
+    // INTERNAL control results dispose native resources without public prototype dispatch.
+    bool disposeNativeResult = false;
+    JsRpcResultKind resultKind = JsRpcResultKind::PUBLIC;
   };
 
   JsRpcPromise(jsg::JsRef<jsg::JsPromise> inner,
@@ -412,6 +418,13 @@ class JsRpcPromise: public JsRpcClientProvider {
   void resolve(jsg::Lock& js, jsg::JsValue result);
   void setOriginatingCall(kj::Maybe<TraceContextParent> value);
   void dispose(jsg::Lock& js);
+  void disposeForInternalTransport(jsg::Lock& js);
+  JsRpcResultKind getResultKindForInternalTransport() const {
+    return weakRef->resultKind;
+  }
+  bool isNativeInternalTransport() const {
+    return !state.is<PrivatePolicy>();
+  }
 
   ClientForOneCall getClientForOneCall(
       jsg::Lock& js, kj::Maybe<ActorCallRetryState::Attempt> actorCallAttempt) override;
@@ -507,6 +520,14 @@ class JsRpcPromise: public JsRpcClientProvider {
 // Represents a property -- possibly, a method -- of a remote RPC object.
 class JsRpcProperty: public JsRpcClientProvider {
  public:
+  bool isNativeInternalTransport() const {
+    return policy == kj::none;
+  }
+  void setInternalResultKind(jsg::Lock& js, JsRpcResultKind value) {
+    JSG_REQUIRE(value == JsRpcResultKind::PUBLIC || policy == kj::none, TypeError,
+        "SERVICE_BINDING_DENIED");
+    resultKind = value;
+  }
   void checkRpcPolicyContext() override {
     parent->checkRpcPolicyContext();
   }
@@ -587,6 +608,7 @@ class JsRpcProperty: public JsRpcClientProvider {
   }
 
  private:
+  JsRpcResultKind resultKind = JsRpcResultKind::PUBLIC;
   // The parent object from which this property was obtained.
   jsg::Ref<JsRpcClientProvider> parent;
 
@@ -621,6 +643,9 @@ jsg::JsValue newRpcPolicyProperty(
 // `JsRpcStub::sendJsRpc()`.
 class JsRpcStub: public JsRpcClientProvider {
  public:
+  bool isNativeInternalTransport() const {
+    return servicePolicy == kj::none;
+  }
   void checkRpcPolicyContext() override;
   // Only deserialize() needs ExternalMemoryAdjustment for allocations made while extracting a new
   // capability from an RPC response; dup() and constructor() do not create those allocations.

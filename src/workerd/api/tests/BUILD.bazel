@@ -1565,5 +1565,8 @@ sh_test(
 wd_test(
     src = "worker-loader-host-container-test.wd-test",
     args = ["--experimental"],
-    data = ["worker-loader-host-container-test.js"],
+    data = [
+        "worker-loader-host-container-test.js",
+        "worker-loader-host-container-test-internal.js",
+    ],
 )

@@ -32,6 +32,12 @@ kj::Maybe<jsg::JsValue> DurableObject::getRpcMethod(jsg::Lock& js, kj::String na
   return newRpcPolicyProperty(js, JSG_THIS, kj::mv(name), member);
 }
 
+kj::Own<IoChannelFactory::SubrequestChannel> DurableObject::getSubrequestChannel(
+    IoContext& context) {
+  return newPolicySubrequestChannel(
+      context, createPolicyChannelCallbacks(context, policy.getHandle(context.getCurrentLock())));
+}
+
 api::Fetcher::ClientForOneCall DurableObject::getClientForOneCall(
     jsg::Lock&, kj::Maybe<ActorCallRetryState::Attempt>) {
   JSG_FAIL_REQUIRE(Error, "DO_RPC_UNSUPPORTED");

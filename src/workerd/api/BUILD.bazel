@@ -708,9 +708,22 @@ kj_test(
     ],
 )
 
+wd_cc_library(
+    name = "open-compute-policy-channel-tests",
+    testonly = True,
+    alwayslink = True,
+    srcs = ["open-compute-policy-channel-test.c++"],
+    deps = [
+        "//src/workerd/io",
+        "//src/workerd/tests:test-fixture",
+        "@capnp-cpp//src/kj:kj-test",
+    ],
+)
+
 kj_test(
     src = "container-test.c++",
     deps = [
+        ":open-compute-policy-channel-tests",
         "//src/workerd/io",
         "//src/workerd/tests:test-fixture",
     ],

@@ -32,6 +32,8 @@ class DurableObject final: public api::DurableObject {
       jsg::Optional<jsg::Value> options,
       const jsg::TypeHandler<Connect>& handler);
   kj::Maybe<jsg::JsValue> getRpcMethod(jsg::Lock& js, kj::String name) override;
+  kj::Own<IoChannelFactory::SubrequestChannel> getSubrequestChannel(IoContext& context) override;
+
   ClientForOneCall getClientForOneCall(
       jsg::Lock& js, kj::Maybe<ActorCallRetryState::Attempt> attempt) override;
 
