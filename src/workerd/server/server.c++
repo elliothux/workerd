@@ -1497,8 +1497,9 @@ class Server::ActorNamespace final {
       // JS WebSockets.
       // TODO(someday): We could make this timeout configurable to make testing less burdensome.
       co_await timer.afterDelay(10 * kj::SECONDS);
-      if (&root == this) {
-        KJ_IF_SOME(inactivity, hostContainerInactivity) {
+      // Private tenants share their Root's idle policy without becoming active requests.
+      if (&root == this || privateHostContainerTenant) {
+        KJ_IF_SOME(inactivity, root.hostContainerInactivity) {
           if (inactivity->retainsOwner()) co_return;
         }
       }

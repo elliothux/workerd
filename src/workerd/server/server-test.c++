@@ -2633,7 +2633,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
         modules = [(name = "host.js", esModule =
           `import { DurableObject } from 'cloudflare:workers';
           `let births = 0; const grants = [];
-          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async inactivityState() { const info = await this.ctx.container.inspect(); return {running: this.ctx.container.running, info}; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
           `export class Host extends DurableObject {
           `  constructor(ctx, env) {
           `    super(ctx, env);
@@ -2666,6 +2666,8 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `      class:loaded.getDurableObjectClass('Tenant'), id:'tenant'}));
           `  }
           `  async fetch(request) {
+          `    if (new URL(request.url).pathname === '/repair') return new Response(String(await this.child.constructorSerial()));
+          `    if (new URL(request.url).pathname === '/state') return new Response(JSON.stringify(await this.child.inactivityState()));
           `    if (new URL(request.url).pathname === '/snapshot') return new Response(JSON.stringify(await this.child.capture()));
           `    if (new URL(request.url).pathname === '/retire') this.ctx.abort('Server shutting down.');
           `    if (new URL(request.url).pathname === '/failed-warm') {
@@ -2937,11 +2939,23 @@ KJ_TEST("Server: Automatic Container monitoring does not prevent inactivity") {
     first.httpGet200("/first", "1:true:1");
     auto live = test.connect("docker-addr");
     live.httpGet200("/live-count", "2");
-    // Neither the tenant nor its host registers monitor() or waitUntil(). The automatic
-    // running-state observer must not extend the configured inactivity interval.
-    test.wait(90);
+    // Platform alarm repair performs a tenant RPC without calling a user fetch handler.
+    // A private tenant must retain its configured policy while its Root remains idle.
+    if (timeout == 120000) first.httpGet200("/repair", "2");
+    test.wait(25);
+    if (timeout == 120000) {
+      auto repaired = test.connect("test-addr");
+      repaired.httpGet200("/repair", "2");
+    }
+    test.wait(65);
     auto observed = test.connect("docker-addr");
     observed.httpGet200("/live-count", timeout == 1000 ? "0" : "2");
+    auto state = test.connect("test-addr");
+    if (timeout == 120000) state.httpGet200("/repair", "2");
+    state.httpGet200("/state",
+        timeout == 1000
+            ? R"({"running":false,"info":null})"
+            : R"({"running":true,"info":{"labels":{"owner":"tenant"},"image":"registry/owner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}})");
   }
 }
 
