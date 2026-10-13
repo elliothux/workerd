@@ -202,7 +202,7 @@ KJ_TEST("public policy channel streams a fresh HTTP event and rejects replaced o
       client->request(kj::HttpMethod::POST, "https://public/", headers, *pipe.in, response);
   kj::joinPromises(kj::arr(kj::mv(write), kj::mv(request))).wait(fixture.getWaitScope());
   KJ_EXPECT(response.status == 201, response.contentType == "text/plain");
-  KJ_EXPECT(kj::StringPtr(response.body.asPtr().begin(), response.body.size()) == "streamed-body");
+  KJ_EXPECT(response.body.asPtr().asBytes() == "streamed-body"_kj.asBytes());
   auto replacement = fixture.newIoContext();
   state.context = replacement.get();
   kj::NullStream empty;
