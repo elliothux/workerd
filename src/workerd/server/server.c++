@@ -1017,9 +1017,10 @@ class Server::ActorNamespace final {
           state->registerMapping(protocol, hostPort, kj::mv(channel));
         }
       };
+      auto authority = kj::refcounted<HostContainerAuthority>(kj::mv(resolve), kj::mv(capture));
       auto captureSnapshot =
-          [weak = root.weakSelf->addRef(), state = kj::addRef(*staged), capture = kj::mv(capture)](
-              kj::String expectedLeaseKey,
+          [weak = root.weakSelf->addRef(), state = kj::addRef(*staged),
+              authority = kj::addRef(*authority)](kj::String expectedLeaseKey,
               kj::Maybe<kj::String> name) mutable -> kj::Promise<HostContainerSnapshot> {
         auto requireCurrent = [&]() {
           auto& owner =
@@ -1031,11 +1032,19 @@ class Server::ActorNamespace final {
               Error, "Container execution authority changed.");
         };
         requireCurrent();
-        auto result = co_await capture(kj::str(expectedLeaseKey), kj::mv(name));
+        auto& owner = JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
+        kj::Maybe<HostContainerSnapshot> result;
+        auto control = co_await owner.startRequest({});
+        co_await control->customEvent(kj::heap<HostContainerControlEvent>(
+            [&result, authority = kj::addRef(*authority),
+                expectedLeaseKey = kj::str(expectedLeaseKey),
+                name = kj::mv(name)]() mutable -> kj::Promise<void> {
+          result = co_await authority->capture(kj::mv(expectedLeaseKey), kj::mv(name));
+        }));
+        control = nullptr;
         requireCurrent();
-        co_return kj::mv(result);
+        co_return kj::mv(KJ_ASSERT_NONNULL(result));
       };
-      auto authority = kj::refcounted<HostContainerAuthority>(kj::mv(resolve));
       auto configureInactivity = [weak = root.weakSelf->addRef(), state = kj::addRef(*staged),
                                      authority = kj::addRef(*authority)](
                                      int64_t durationMs) mutable {

@@ -76,6 +76,7 @@ jobs:
               "Server: Private Container named images are immutable and class scoped",
               "Server: Automatic Container monitoring does not prevent inactivity",
               "Server: Host Container monitor retains its owner across the idle window",
+              "Server: Host Container snapshot retains fresh owner I/O after lease policy",
               "Server: Host warm start registers callbacks for a previously constructed cold facet",
               "Server: Old execution retirement preserves the current owner's outbound callbacks",
               "Server: Shared outbound mappings survive completed stop and client replacement",

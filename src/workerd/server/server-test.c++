@@ -2620,7 +2620,8 @@ WD_STRONG_BOOL(ExplicitMonitor);
 
 kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
     bool defaultCleanup = false,
-    ExplicitMonitor explicitMonitor = ExplicitMonitor::YES) {
+    ExplicitMonitor explicitMonitor = ExplicitMonitor::YES,
+    bool snapshotPolicyIo = false) {
   return kj::str(R"((
     extensions = [(modules = [
       (name = "cloudflare-internal:open-compute-host-policy", internal = true,
@@ -2633,7 +2634,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
         modules = [(name = "host.js", esModule =
           `import { DurableObject } from 'cloudflare:workers';
           `let births = 0; const grants = [];
-          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async inactivityState() { const info = await this.ctx.container.inspect(); return {running: this.ctx.container.running, info}; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async inactivityState() { const info = await this.ctx.container.inspect(); return {running: this.ctx.container.running, info}; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/snapshot-stream') return new Response(new ReadableStream({start: async (controller) => { try { controller.enqueue(new TextEncoder().encode(JSON.stringify(await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'})))); controller.close(); } catch { controller.error(new Error('Snapshot stream failed')); } }})); if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
           `export class Host extends DurableObject {
           `  constructor(ctx, env) {
           `    super(ctx, env);
@@ -2643,6 +2644,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `  bind(ctx, env) {
           `    this.leaseActive = (this.birth === 1 && this.replaced) || this.birth > 2; this.leaseKey = (this.birth === 1 ? 'a' : '9').repeat(64);
           `    this.grant = env.factory.getContainer(ctx.facets, 'Tenant', async (_start, stop, completed, _startup, expected) => {
+          `      if (env.snapshotPolicyIo) { const resolved = await env.engine.fetch('http://unit/stats'); await resolved.arrayBuffer(); }
           `      if (expected && expected !== this.leaseKey) throw new Error('Stale execution authority');
           `      if (stop && completed) { if (env.inactivityMs || env.defaultCleanup) { await env.engine.fetch('http://unit/containers/' + this.leaseKey, {method:'DELETE'}); await env.engine.fetch('http://unit/containers/' + this.leaseKey + '-proxy', {method:'DELETE'}); } this.leaseActive = false; return undefined; }
           `      if (_start) this.leaseActive = true;
@@ -2654,6 +2656,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `      inspection: {image: 'registry/owner@sha256:' + 'b'.repeat(64), labels: [{name:'owner',value:'tenant'}]}
           `    }); }, async (expected, name) => {
           `      if (expected !== this.leaseKey || !this.leaseActive || name !== 'owner-checkpoint') throw new Error('Invalid capture authority');
+          `      const policy = await this.env.engine.fetch('http://unit/stats'); if (!policy.ok) throw new Error('Snapshot policy I/O failed'); await policy.arrayBuffer();
           `      return {id: 'ee2acc27-21e4-48a7-96f4-9790eb855d78', size: 2850, name};
           `    }, {});
           `    grants.push(this.grant);
@@ -2669,6 +2672,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `    if (new URL(request.url).pathname === '/repair') return new Response(String(await this.child.constructorSerial()));
           `    if (new URL(request.url).pathname === '/state') return new Response(JSON.stringify(await this.child.inactivityState()));
           `    if (new URL(request.url).pathname === '/snapshot') return new Response(JSON.stringify(await this.child.capture()));
+          `    if (new URL(request.url).pathname === '/snapshot-stream') return this.child.fetch(request);
           `    if (new URL(request.url).pathname === '/retire') this.ctx.abort('Server shutting down.');
           `    if (new URL(request.url).pathname === '/failed-warm') {
           `      const serial = await this.child.constructorSerial();
@@ -2743,6 +2747,8 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
       defaultCleanup ? "true" : "false", R"("),
           (name = "explicitMonitor", json = ")",
       explicitMonitor == ExplicitMonitor::YES ? "true" : "false", R"("),
+          (name = "snapshotPolicyIo", json = ")",
+      snapshotPolicyIo ? "true" : "false", R"("),
           (name = "objects", durableObjectNamespace = "Host"),
           (name = "factory", workerLoader = (factory = true)),
           (name = "loader", workerLoader = ()),
@@ -2957,6 +2963,25 @@ KJ_TEST("Server: Automatic Container monitoring does not prevent inactivity") {
             ? R"({"running":false,"info":null})"
             : R"({"running":true,"info":{"labels":{"owner":"tenant"},"image":"registry/owner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}})");
   }
+}
+
+KJ_TEST("Server: Host Container snapshot retains fresh owner I/O after lease policy") {
+  TestServer test(hostContainerOwnerConfig(0, false, ExplicitMonitor::YES, true));
+  test.cwd->openSubdir(kj::Path({"storage"}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/first", "1:true:1");
+  conn.sendHttpGet("/snapshot-stream");
+  conn.recv(R"(
+    HTTP/1.1 200 OK
+    Transfer-Encoding: chunked
+
+    53
+    {"id":"ee2acc27-21e4-48a7-96f4-9790eb855d78","size":2850,"name":"owner-checkpoint"}
+    0
+
+  )"_blockquote);
 }
 
 KJ_TEST("Server: Host Container monitor retains its owner across the idle window") {

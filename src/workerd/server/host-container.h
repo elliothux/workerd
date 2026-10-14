@@ -87,8 +87,11 @@ class HostContainerActivity final: public kj::Refcounted {
 
 class HostContainerAuthority final: public kj::Refcounted {
  public:
-  explicit HostContainerAuthority(ResolveHostContainerLease resolve): resolve(kj::mv(resolve)) {}
+  HostContainerAuthority(ResolveHostContainerLease resolve, CaptureHostContainerSnapshot capture)
+      : resolve(kj::mv(resolve)),
+        capture(kj::mv(capture)) {}
   ResolveHostContainerLease resolve;
+  CaptureHostContainerSnapshot capture;
 };
 
 // Admission stays outside the engine client; returned native capabilities retain their RPC brands.
