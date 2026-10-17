@@ -1013,6 +1013,132 @@ KJ_TEST("Container::start requires mountPoint when no snapshot is given") {
   KJ_EXPECT(captured.size() == 0);
 }
 
+class DeferredExecOutputHandle final: public rpc::Container::ProcessHandle::Server {
+ public:
+  DeferredExecOutputHandle(capnp::ByteStreamFactory& factory,
+      capnp::ByteStream::Client stdoutWriter,
+      capnp::ByteStream::Client stderrWriter,
+      kj::Promise<void> gate,
+      bool& waited,
+      bool& destroyed)
+      : factory(factory),
+        waited(waited),
+        destroyed(destroyed),
+        output(deliver(kj::mv(gate),
+            factory.capnpToKjExplicitEnd(stdoutWriter),
+            factory.capnpToKjExplicitEnd(stderrWriter))
+                .eagerlyEvaluate(nullptr)) {}
+
+  ~DeferredExecOutputHandle() noexcept(false) {
+    destroyed = true;
+  }
+
+  kj::Promise<void> wait(WaitContext context) override {
+    waited = true;
+    context.getResults().setExitCode(0);
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> stdinWriter(StdinWriterContext context) override {
+    context.getResults().setWriter(
+        factory.kjToCapnp(capnp::ExplicitEndOutputStream::wrap(newNullOutputStream(), []() {})));
+    return kj::READY_NOW;
+  }
+
+ private:
+  capnp::ByteStreamFactory& factory;
+  bool& waited;
+  bool& destroyed;
+  kj::Promise<void> output;
+
+  static kj::Promise<void> deliver(kj::Promise<void> gate,
+      kj::Own<capnp::ExplicitEndOutputStream> stdoutWriter,
+      kj::Own<capnp::ExplicitEndOutputStream> stderrWriter) {
+    co_await gate;
+    co_await stdoutWriter->write("late-stdout"_kj.asBytes());
+    co_await stdoutWriter->end();
+    co_await stderrWriter->write("late-stderr"_kj.asBytes());
+    co_await stderrWriter->end();
+  }
+};
+
+class DeferredExecOutputContainer final: public rpc::Container::Server {
+ public:
+  DeferredExecOutputContainer(
+      capnp::ByteStreamFactory& factory, kj::Promise<void> gate, bool& waited, bool& destroyed)
+      : factory(factory),
+        gate(kj::mv(gate)),
+        waited(waited),
+        destroyed(destroyed) {}
+
+  kj::Promise<void> monitor(MonitorContext) override {
+    return kj::NEVER_DONE;
+  }
+
+  kj::Promise<void> exec(ExecContext context) override {
+    auto request = context.getParams();
+    auto process = context.getResults().initProcess();
+    process.setPid(4321);
+    process.setHandle(kj::heap<DeferredExecOutputHandle>(factory, request.getStdoutWriter(),
+        request.getStderrWriter(), kj::mv(gate), waited, destroyed));
+    return kj::READY_NOW;
+  }
+
+ private:
+  capnp::ByteStreamFactory& factory;
+  kj::Promise<void> gate;
+  bool& waited;
+  bool& destroyed;
+};
+
+KJ_TEST("Container::exec output retains its process handle until delayed streams drain") {
+  bool waited = false;
+  bool destroyed = false;
+  TestFixture fixture(TestFixture::SetupParams{
+    .actorId = Worker::Actor::Id(kj::str("exec-output-owner")),
+    .useRealTimers = false,
+  });
+  auto context = fixture.newIoContext();
+  auto request = fixture.newIncomingRequest(*context);
+  auto gate = kj::newPromiseAndFulfiller<void>();
+  kj::Maybe<jsg::Promise<jsg::Ref<ExecOutput>>> pending;
+
+  fixture.enterContext(*request, [&](const TestFixture::Environment& env) {
+    auto container = kj::rc<Container>(
+        rpc::Container::Client(kj::heap<DeferredExecOutputContainer>(
+            env.context.getByteStreamFactory(), kj::mv(gate.promise), waited, destroyed)),
+        true);
+    pending.emplace(container->exec(env.js, kj::arr(kj::str("/command")), kj::none)
+            .then(env.js,
+                [](jsg::Lock& js, jsg::Ref<ExecProcess> process) { return process->output(js); }));
+  });
+  fixture.pollEventLoop();
+  KJ_REQUIRE(waited, "Exec wait was not reached before delayed output");
+  fixture.enterContext(
+      *request, [](const TestFixture::Environment& env) { env.isolate->LowMemoryNotification(); });
+  fixture.pollEventLoop();
+  KJ_EXPECT(!destroyed, "Exec handle ended before output drained");
+  if (gate.fulfiller->isWaiting()) gate.fulfiller->fulfill();
+
+  kj::Maybe<kj::Promise<void>> observed;
+  fixture.enterContext(*request, [&](const TestFixture::Environment& env) {
+    observed.emplace(env.context.awaitJs(env.js,
+        kj::mv(KJ_ASSERT_NONNULL(pending))
+            .then(env.js, [](jsg::Lock& js, jsg::Ref<ExecOutput> result) {
+      KJ_EXPECT(result->getExitCode() == 0);
+      KJ_EXPECT(result->getStdout(js).asArrayPtr() == "late-stdout"_kj.asBytes());
+      KJ_EXPECT(result->getStderr(js).asArrayPtr() == "late-stderr"_kj.asBytes());
+    })));
+    pending = kj::none;
+  });
+  KJ_ASSERT_NONNULL(observed).wait(fixture.getWaitScope());
+  fixture.enterContext(
+      *request, [](const TestFixture::Environment& env) { env.isolate->LowMemoryNotification(); });
+  fixture.pollEventLoop();
+  KJ_EXPECT(destroyed, "Exec handle was retained after output completed");
+  fixture.drainAndDestroy(kj::mv(request));
+}
+
 KJ_TEST("Container::exec output rejects an unclean stream while retaining its trusted exitCode") {
   for (uint abortedStream: {0u, 1u, 2u}) {
     auto fixture = makeFixture();

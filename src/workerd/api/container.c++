@@ -251,10 +251,11 @@ jsg::Promise<jsg::Ref<ExecOutput>> ExecProcess::output(jsg::Lock& js) {
 
   auto exitCodePromise = getExitCodeForOutput(js);
 
-  return stdoutPromise.then(js,
-      [stderrPromise = kj::mv(stderrPromise), exitCodePromise = kj::mv(exitCodePromise)](
-          jsg::Lock& js,
-          kj::Array<kj::byte> stdoutBytes) mutable -> jsg::Promise<jsg::Ref<ExecOutput>> {
+  return stdoutPromise
+      .then(js,
+          [stderrPromise = kj::mv(stderrPromise), exitCodePromise = kj::mv(exitCodePromise)](
+              jsg::Lock& js,
+              kj::Array<kj::byte> stdoutBytes) mutable -> jsg::Promise<jsg::Ref<ExecOutput>> {
     return stderrPromise.then(js,
         [stdoutBytes = kj::mv(stdoutBytes), exitCodePromise = kj::mv(exitCodePromise)](
             jsg::Lock& js,
@@ -265,6 +266,10 @@ jsg::Promise<jsg::Ref<ExecOutput>> ExecProcess::output(jsg::Lock& js) {
         return js.alloc<ExecOutput>(kj::mv(stdoutBytes), kj::mv(stderrBytes), exitCode);
       });
     });
+  }).then(js, [self = JSG_THIS](jsg::Lock&, jsg::Ref<ExecOutput> result) {
+    // The pending collectors retain the process handle until both streams reach EOF.
+    static_cast<void>(self);
+    return kj::mv(result);
   });
 }
 
