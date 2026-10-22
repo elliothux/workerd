@@ -276,8 +276,8 @@ class WorkerLoaderFactory: public jsg::Object {
       kj::String className,
       jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(
           bool, bool, bool, kj::String, kj::String, bool)> resolve,
-      jsg::Function<jsg::Promise<HostContainerSnapshot>(kj::String, jsg::Optional<kj::String>)>
-          capture,
+      jsg::Function<jsg::Promise<HostContainerSnapshot>(
+          kj::String, jsg::Optional<kj::String>, jsg::Optional<kj::String>)> capture,
       jsg::Dict<kj::String> images);
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
       jsg::Ref<WorkerStub> stub,

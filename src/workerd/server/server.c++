@@ -1021,7 +1021,8 @@ class Server::ActorNamespace final {
       auto captureSnapshot =
           [weak = root.weakSelf->addRef(), state = kj::addRef(*staged),
               authority = kj::addRef(*authority)](kj::String expectedLeaseKey,
-              kj::Maybe<kj::String> name) mutable -> kj::Promise<HostContainerSnapshot> {
+              kj::Maybe<kj::String> name,
+              kj::Maybe<kj::String> directory) mutable -> kj::Promise<HostContainerSnapshot> {
         auto requireCurrent = [&]() {
           auto& owner =
               JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container owner has ended.");
@@ -1037,9 +1038,10 @@ class Server::ActorNamespace final {
         auto control = co_await owner.startRequest({});
         co_await control->customEvent(kj::heap<HostContainerControlEvent>(
             [&result, authority = kj::addRef(*authority),
-                expectedLeaseKey = kj::str(expectedLeaseKey),
-                name = kj::mv(name)]() mutable -> kj::Promise<void> {
-          result = co_await authority->capture(kj::mv(expectedLeaseKey), kj::mv(name));
+                expectedLeaseKey = kj::str(expectedLeaseKey), name = kj::mv(name),
+                directory = kj::mv(directory)]() mutable -> kj::Promise<void> {
+          result = co_await authority->capture(
+              kj::mv(expectedLeaseKey), kj::mv(name), kj::mv(directory));
         }));
         control = nullptr;
         requireCurrent();

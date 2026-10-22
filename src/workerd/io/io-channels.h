@@ -79,11 +79,13 @@ struct HostContainerSnapshot {
   double size;
   jsg::Optional<kj::String> name;
 
-  JSG_STRUCT(id, size, name);
+  jsg::Optional<kj::String> dir = kj::none;
+
+  JSG_STRUCT(id, size, name, dir);
 };
 
 using CaptureHostContainerSnapshot = kj::Function<kj::Promise<HostContainerSnapshot>(
-    kj::String expectedLeaseKey, kj::Maybe<kj::String> name)>;
+    kj::String expectedLeaseKey, kj::Maybe<kj::String> name, kj::Maybe<kj::String> directory)>;
 
 class HostContainerOwner;
 

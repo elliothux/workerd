@@ -17,7 +17,8 @@ kj::Promise<void> rejectNativeEgress(
   KJ_FAIL_REQUIRE("Unexpected native egress registration");
 }
 
-kj::Promise<HostContainerSnapshot> rejectSnapshotCapture(kj::String, kj::Maybe<kj::String>) {
+kj::Promise<HostContainerSnapshot> rejectSnapshotCapture(
+    kj::String, kj::Maybe<kj::String>, kj::Maybe<kj::String>) {
   KJ_FAIL_REQUIRE("Unexpected host snapshot capture");
 }
 
@@ -371,6 +372,7 @@ class Engine final: public rpc::Container::Server {
   uint started = 0;
   uint destroyed = 0;
   uint snapshots = 0;
+  uint directorySnapshots = 0;
 
   kj::Promise<void> start(StartContext) override {
     ++started;
@@ -383,6 +385,10 @@ class Engine final: public rpc::Container::Server {
   kj::Promise<void> snapshotContainer(SnapshotContainerContext) override {
     ++snapshots;
     KJ_FAIL_REQUIRE("Snapshot capture reached the Docker client");
+  }
+  kj::Promise<void> snapshotDirectory(SnapshotDirectoryContext) override {
+    ++directorySnapshots;
+    KJ_FAIL_REQUIRE("Directory snapshot capture reached the Docker client");
   }
 };
 
@@ -405,7 +411,8 @@ KJ_TEST("Host snapshot capture returns only metadata for the freshly resolved ex
           kj::str(lookups == 1 ? "first-lease" : "next-lease"), {}, {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
-      [&](kj::String expected, kj::Maybe<kj::String> name) -> kj::Promise<HostContainerSnapshot> {
+      [&](kj::String expected, kj::Maybe<kj::String> name,
+          kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
     KJ_EXPECT(expected == (captures == 0 ? "first-lease" : "next-lease"));
     if (captures == 0) {
       KJ_EXPECT(KJ_ASSERT_NONNULL(name) == "checkpoint");
@@ -415,7 +422,8 @@ KJ_TEST("Host snapshot capture returns only metadata for the freshly resolved ex
     ++captures;
     return HostContainerSnapshot{kj::str("ee2acc27-21e4-48a7-96f4-9790eb855d78"),
       static_cast<double>(jsg::MAX_SAFE_INTEGER), kj::mv(name)};
-  }, rejectInactivity));
+  },
+      rejectInactivity));
   auto container = grant.castAs<rpc::Container>();
   auto request = container.snapshotContainerRequest();
   request.setName("checkpoint");
@@ -429,6 +437,94 @@ KJ_TEST("Host snapshot capture returns only metadata for the freshly resolved ex
   KJ_EXPECT_THROW_MESSAGE(
       "Container operation failed", container.snapshotDirectoryRequest().send().wait(wait));
   KJ_EXPECT(lookups == 2 && captures == 2);
+}
+
+KJ_TEST("Host directory snapshot capture uses the current scoped metadata callback") {
+  kj::EventLoop loop;
+  kj::WaitScope wait(loop);
+  auto engine = kj::heap<Engine>();
+  auto& state = *engine;
+  rpc::Container::Client native(kj::mv(engine));
+  uint lookups = 0;
+  uint captures = 0;
+  capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
+      [&](bool start, bool stop, bool completed, kj::String startup, kj::String expected,
+          bool monitor) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+    KJ_EXPECT(
+        !start && !stop && !completed && !monitor && startup.size() == 0 && expected.size() == 0);
+    ++lookups;
+    return kj::Maybe<HostContainerRpc::Resolved>(
+        HostContainerRpc::Resolved{rpc::Container::Client(native),
+          kj::str(lookups == 1 ? "first-lease" : "next-lease"), {}, {}});
+  },
+      kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
+      [&](kj::String expected, kj::Maybe<kj::String> name,
+          kj::Maybe<kj::String> directory) -> kj::Promise<HostContainerSnapshot> {
+    KJ_EXPECT(expected == (captures == 0 ? "first-lease" : "next-lease"));
+    KJ_EXPECT(KJ_ASSERT_NONNULL(directory) == "/app/data");
+    if (captures == 0) {
+      KJ_EXPECT(KJ_ASSERT_NONNULL(name) == "checkpoint");
+    } else {
+      KJ_EXPECT(name == kj::none);
+    }
+    ++captures;
+    return HostContainerSnapshot{
+      kj::str("directory-snapshot"), 123, kj::mv(name), kj::mv(directory)};
+  },
+      rejectInactivity));
+  auto container = grant.castAs<rpc::Container>();
+  auto first = container.snapshotDirectoryRequest();
+  first.setDir("/app/data");
+  first.setName("checkpoint");
+  auto response = first.send().wait(wait);
+  KJ_EXPECT(response.getSnapshot().getId() == "directory-snapshot");
+  KJ_EXPECT(response.getSnapshot().getSize() == 123);
+  KJ_EXPECT(response.getSnapshot().getDir() == "/app/data");
+  KJ_EXPECT(response.getSnapshot().getName() == "checkpoint");
+  auto second = container.snapshotDirectoryRequest();
+  second.setDir("/app/data");
+  KJ_EXPECT(second.send().wait(wait).getSnapshot().getName().size() == 0);
+  KJ_EXPECT(lookups == 2 && captures == 2 && state.started == 0 && state.directorySnapshots == 0 &&
+      state.snapshots == 0);
+}
+
+KJ_TEST("Host snapshot metadata cannot substitute a full capture for a directory capture") {
+  for (uint invalid = 0; invalid < 5; ++invalid) {
+    kj::EventLoop loop;
+    kj::WaitScope wait(loop);
+    rpc::Container::Client native(kj::heap<Engine>());
+    capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
+        [&](bool, bool, bool, kj::String, kj::String,
+            bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+      return kj::Maybe<HostContainerRpc::Resolved>(
+          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}, {}});
+    },
+        kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
+        [invalid](kj::String, kj::Maybe<kj::String>,
+            kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
+      jsg::Optional<kj::String> directory;
+      if (invalid == 1) directory = kj::str("relative");
+      if (invalid == 2) directory = kj::str(kj::StringPtr("/nul\0path", 9));
+      if (invalid == 3) {
+        auto path = kj::heapString(4097);
+        for (auto& character: path) character = 'a';
+        path[0] = '/';
+        directory = kj::mv(path);
+      }
+      if (invalid == 4) directory = kj::str("/app/data");
+      return HostContainerSnapshot{kj::str("snapshot"), 123, {}, kj::mv(directory)};
+    },
+        rejectInactivity));
+    auto container = grant.castAs<rpc::Container>();
+    if (invalid == 4) {
+      KJ_EXPECT_THROW_MESSAGE(
+          "Container operation failed", container.snapshotContainerRequest().send().wait(wait));
+    } else {
+      auto request = container.snapshotDirectoryRequest();
+      request.setDir("/app/data");
+      KJ_EXPECT_THROW_MESSAGE("Container operation failed", request.send().wait(wait));
+    }
+  }
 }
 
 KJ_TEST("Host snapshot capture rejects missing and stale authority before any capture") {
@@ -460,11 +556,13 @@ KJ_TEST("Host snapshot capture rejects metadata that cannot cross the public num
           HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}, {}});
     },
         kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
-        [invalid](kj::String, kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
+        [invalid](kj::String, kj::Maybe<kj::String>,
+            kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
       constexpr double sizes[] = {-1, 0.5, std::numeric_limits<double>::quiet_NaN(),
         std::numeric_limits<double>::infinity(), 9007199254740992.0, 0};
       return HostContainerSnapshot{kj::str(invalid == 5 ? "" : "snapshot"), sizes[invalid], {}};
-    }, rejectInactivity));
+    },
+        rejectInactivity));
     KJ_EXPECT_THROW_MESSAGE("Container operation failed",
         grant.castAs<rpc::Container>().snapshotContainerRequest().send().wait(wait));
   }
@@ -483,13 +581,15 @@ KJ_TEST("Host snapshot revocation cancels a pending capture and rejects later ca
         HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}, {}});
   },
       kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
-      [&](kj::String, kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
+      [&](kj::String, kj::Maybe<kj::String>,
+          kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
     ++captures;
     capturing = true;
     return kj::Promise<HostContainerSnapshot>(kj::NEVER_DONE).attach(kj::defer([&] {
       capturing = false;
     }));
-  }, rejectInactivity));
+  },
+      rejectInactivity));
   auto revoked = kj::newPromiseAndFulfiller<void>();
   auto container = capnp::membrane(
       grant.castAs<rpc::Container>(), kj::refcounted<RevokerMembrane>(kj::mv(revoked.promise)));
@@ -601,11 +701,13 @@ KJ_TEST("Host snapshot capture waits for startup and serializes destruction unti
           HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}, {}});
     },
         kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
-        [&](kj::String expected, kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
+        [&](kj::String expected, kj::Maybe<kj::String>,
+            kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
       KJ_EXPECT(expected == "lease" && state.started && !state.destroyed);
       ++captures;
       return kj::mv(captured.promise);
-    }, rejectInactivity));
+    },
+        rejectInactivity));
     auto container = grant.castAs<rpc::Container>();
     auto start = container.startRequest().send().dropPipeline();
     auto snapshot = container.snapshotContainerRequest().send().dropPipeline();
@@ -624,6 +726,58 @@ KJ_TEST("Host snapshot capture waits for startup and serializes destruction unti
       KJ_EXPECT(!description.contains("Private archive"));
     } else {
       captured.fulfiller->fulfill(HostContainerSnapshot{kj::str("snapshot"), 123, {}});
+      KJ_EXPECT(snapshot.wait(wait).getSnapshot().getSize() == 123);
+    }
+    destroy.wait(wait);
+    KJ_EXPECT(state.destroyed && captures == 1);
+  }
+}
+
+KJ_TEST(
+    "Host directory snapshot capture waits for startup and serializes destruction until capture ends") {
+  for (bool fail: {false, true}) {
+    kj::EventLoop loop;
+    kj::WaitScope wait(loop);
+    auto engine = kj::heap<StartingEngine>();
+    auto& state = *engine;
+    rpc::Container::Client native(kj::mv(engine));
+    auto captured = kj::newPromiseAndFulfiller<HostContainerSnapshot>();
+    uint captures = 0;
+    capnp::Capability::Client grant(kj::refcounted<HostContainerRpc>(
+        [&](bool, bool, bool, kj::String, kj::String,
+            bool) -> kj::Promise<kj::Maybe<HostContainerRpc::Resolved>> {
+      return kj::Maybe<HostContainerRpc::Resolved>(
+          HostContainerRpc::Resolved{rpc::Container::Client(native), kj::str("lease"), {}, {}});
+    },
+        kj::refcounted<HostContainerRpc::MutationQueue>(), rejectPrestartEgress, rejectNativeEgress,
+        [&](kj::String expected, kj::Maybe<kj::String>,
+            kj::Maybe<kj::String>) -> kj::Promise<HostContainerSnapshot> {
+      KJ_EXPECT(expected == "lease" && state.started && !state.destroyed);
+      ++captures;
+      return kj::mv(captured.promise);
+    },
+        rejectInactivity));
+    auto container = grant.castAs<rpc::Container>();
+    auto start = container.startRequest().send().dropPipeline();
+    auto directoryRequest = container.snapshotDirectoryRequest();
+    directoryRequest.setDir("/app/data");
+    auto snapshot = directoryRequest.send().dropPipeline();
+    auto destroy = container.destroyRequest().send().dropPipeline();
+    KJ_EXPECT(!start.poll(wait) && !snapshot.poll(wait) && !destroy.poll(wait));
+    KJ_EXPECT(captures == 0 && !state.destroyed);
+    state.startup.fulfiller->fulfill();
+    start.wait(wait);
+    KJ_EXPECT(!snapshot.poll(wait) && !destroy.poll(wait));
+    KJ_EXPECT(captures == 1 && !state.destroyed);
+    if (fail) {
+      captured.fulfiller->reject(KJ_EXCEPTION(FAILED, "Private archive path and credentials"));
+      auto error = kj::runCatchingExceptions([&] { snapshot.wait(wait); });
+      auto description = KJ_ASSERT_NONNULL(error).getDescription();
+      KJ_EXPECT(description.contains("Container operation failed"));
+      KJ_EXPECT(!description.contains("Private archive"));
+    } else {
+      captured.fulfiller->fulfill(
+          HostContainerSnapshot{kj::str("snapshot"), 123, {}, kj::str("/app/data")});
       KJ_EXPECT(snapshot.wait(wait).getSnapshot().getSize() == 123);
     }
     destroy.wait(wait);

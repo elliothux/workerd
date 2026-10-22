@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-runner
         with:
-          GOOGLESOURCE_COOKIE: ""
+          GOOGLESOURCE_COOKIE: ''
       - name: Configure macOS linker
         if: runner.os == 'macOS'
         run: |
@@ -118,7 +118,7 @@ jobs:
         run: |
           bazel-bin/src/workerd/server/workerd container-protocol-version > container-protocol.stdout 2> container-protocol.stderr
           test ! -s container-protocol.stderr
-          printf 'open-compute-container-protocol-v3\n' > container-protocol.expected
+          printf 'open-compute-container-protocol-v4\n' > container-protocol.expected
           cmp container-protocol.expected container-protocol.stdout
           cat container-protocol.stdout >> build-inputs.txt
       - name: Record compatibility catalog

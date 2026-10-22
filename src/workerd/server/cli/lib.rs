@@ -184,7 +184,7 @@ fn run_command(
             Ok(0)
         }
         args::Command::ContainerProtocolVersion => {
-            println!("open-compute-container-protocol-v3");
+            println!("open-compute-container-protocol-v4");
             Ok(0)
         }
         args::Command::PyodideLock => {

@@ -162,11 +162,21 @@ class HostContainerRpc final: public capnp::Capability::Server,
  private:
   kj::Promise<void> forward(
       uint16_t methodId, capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
-    JSG_REQUIRE(methodId != 10, Error, "Container directory snapshots are unavailable.");
+    auto validDirectory = [](kj::StringPtr directory) {
+      return directory.size() > 0 && directory.size() <= 4096 && directory.startsWith("/") &&
+          directory.findFirst('\0') == kj::none;
+    };
+    if (methodId == 10) {
+      JSG_REQUIRE(
+          validDirectory(
+              context.getParams().getAs<rpc::Container::SnapshotDirectoryParams>().getDir()),
+          Error, "Invalid Container snapshot directory.");
+    }
     kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> mutation;
     KJ_DEFER(if (mutation != kj::none) KJ_ASSERT_NONNULL(mutation)->fulfill());
     bool egress = methodId == 8 || methodId == 9 || methodId == 13;
-    if (methodId == 1 || methodId == 3 || methodId == 11 || methodId == 7 || egress) {
+    if (methodId == 1 || methodId == 3 || methodId == 10 || methodId == 11 || methodId == 7 ||
+        egress) {
       auto turn = mutations->take();
       mutation = kj::mv(turn.fulfiller);
       co_await turn.promise;
@@ -223,21 +233,44 @@ class HostContainerRpc final: public capnp::Capability::Server,
       }
     }
     auto leaseKey = kj::str(target.leaseKey);
-    if (methodId == 11) {
-      auto params = context.getParams().getAs<rpc::Container::SnapshotContainerParams>();
-      auto name = params.hasName() ? kj::Maybe<kj::String>(kj::str(params.getName())) : kj::none;
-      auto snapshot = co_await capture(kj::mv(leaseKey), kj::mv(name));
+    if (methodId == 10 || methodId == 11) {
+      kj::Maybe<kj::String> name;
+      kj::Maybe<kj::String> directory;
+      if (methodId == 10) {
+        auto params = context.getParams().getAs<rpc::Container::SnapshotDirectoryParams>();
+        directory = kj::str(params.getDir());
+        if (params.hasName()) name = kj::str(params.getName());
+      } else {
+        auto params = context.getParams().getAs<rpc::Container::SnapshotContainerParams>();
+        if (params.hasName()) name = kj::str(params.getName());
+      }
+      auto snapshot = co_await capture(kj::mv(leaseKey), kj::mv(name), kj::mv(directory));
       JSG_REQUIRE(snapshot.id.size() > 0 && snapshot.id.size() <= 256 &&
               snapshot.id.findFirst('\0') == kj::none && snapshot.size >= 0 &&
               snapshot.size <= jsg::MAX_SAFE_INTEGER &&
-              snapshot.size == static_cast<uint64_t>(snapshot.size),
+              snapshot.size == static_cast<uint64_t>(snapshot.size) &&
+              (snapshot.dir != kj::none) == (methodId == 10),
           Error, "Invalid Container snapshot metadata.");
-      auto result =
-          context.getResults().initAs<rpc::Container::SnapshotContainerResults>().initSnapshot();
-      result.setId(snapshot.id);
-      result.setSize(static_cast<uint64_t>(snapshot.size));
-      KJ_IF_SOME(name, snapshot.name) {
-        result.setName(name);
+      if (methodId == 10) {
+        auto& directory =
+            JSG_REQUIRE_NONNULL(snapshot.dir, Error, "Invalid Container snapshot metadata.");
+        JSG_REQUIRE(validDirectory(directory), Error, "Invalid Container snapshot metadata.");
+        auto result =
+            context.getResults().initAs<rpc::Container::SnapshotDirectoryResults>().initSnapshot();
+        result.setId(snapshot.id);
+        result.setSize(static_cast<uint64_t>(snapshot.size));
+        result.setDir(directory);
+        KJ_IF_SOME(name, snapshot.name) {
+          result.setName(name);
+        }
+      } else {
+        auto result =
+            context.getResults().initAs<rpc::Container::SnapshotContainerResults>().initSnapshot();
+        result.setId(snapshot.id);
+        result.setSize(static_cast<uint64_t>(snapshot.size));
+        KJ_IF_SOME(name, snapshot.name) {
+          result.setName(name);
+        }
       }
       co_return;
     }

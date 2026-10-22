@@ -2634,7 +2634,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
         modules = [(name = "host.js", esModule =
           `import { DurableObject } from 'cloudflare:workers';
           `let births = 0; const grants = [];
-          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async inactivityState() { const info = await this.ctx.container.inspect(); return {running: this.ctx.container.running, info}; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/snapshot-stream') return new Response(new ReadableStream({start: async (controller) => { try { controller.enqueue(new TextEncoder().encode(JSON.stringify(await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'})))); controller.close(); } catch { controller.error(new Error('Snapshot stream failed')); } }})); if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
+          `const source = "import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers'; let constructions = 0; export class Proxy extends WorkerEntrypoint { async fetch(request) { if (new URL(request.url).pathname === '/slow') await scheduler.wait(30000); return new Response(this.env.OUTBOUND_HOST); } } export class Tenant extends DurableObject { async capture() { return await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); } constructorSerial() { return this.serial; } async inactivityState() { const info = await this.ctx.container.inspect(); return {running: this.ctx.container.running, info}; } async waitStopped() { await this.ctx.container.monitor(); } async startReplacement() { this.ctx.container.start(); if (!await this.ctx.container.inspect()) throw new Error('Replacement did not start'); } async registerAfterRevoke() { try { await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); return true; } catch { return false; } } constructor(ctx, env) { super(ctx, env); this.serial = ++constructions; this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS visits (count INTEGER)'); this.ctx.storage.sql.exec('INSERT INTO visits SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM visits)'); if (env.EXPLICIT_MONITOR) this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {})); this.applyOutboundInterceptionPromise = Promise.resolve(); this.ctx.blockConcurrencyWhile(async () => { await this.ctx.storage.get('outbound-ready'); if (env.INACTIVITY_MS) await this.ctx.container.setInactivityTimeout(env.INACTIVITY_MS); if (this.ctx.container.running) this.applyOutboundInterceptionPromise = this.applyOutboundInterception(); }); } async applyOutboundInterception() { await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); } async fetch(request) { const path = new URL(request.url).pathname; if (path === '/snapshot-stream' || path === '/directory-snapshot-stream') return new Response(new ReadableStream({start: async (controller) => { try { const snapshot = path === '/directory-snapshot-stream' ? await this.ctx.container.snapshotDirectory({dir: '/app/data', name: 'owner-checkpoint'}) : await this.ctx.container.snapshotContainer({name: 'owner-checkpoint'}); controller.enqueue(new TextEncoder().encode(JSON.stringify(snapshot))); controller.close(); } catch { controller.error(new Error('Snapshot stream failed')); } }})); if (path === '/prepare') { let rejected = false; try { await this.ctx.container.interceptOutboundHttp('', this.ctx.exports.Proxy({})); } catch { rejected = true; } if (!rejected) throw new Error('Invalid pre-start address was accepted'); await this.ctx.container.interceptAllOutboundHttp(this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttp(this.env.OUTBOUND_HOST, this.ctx.exports.Proxy({})); await this.ctx.container.interceptOutboundHttps(this.env.OUTBOUND_HOST + '.secure', this.ctx.exports.Proxy({})); return new Response('registered'); } if (path === '/background') this.ctx.waitUntil(scheduler.wait(30000)); if (path === '/stop') await this.ctx.container.destroy(); this.ctx.storage.sql.exec('UPDATE visits SET count=count+1'); return new Response(this.ctx.container.running + ':' + this.ctx.storage.sql.exec('SELECT count FROM visits').one().count); } }";
           `export class Host extends DurableObject {
           `  constructor(ctx, env) {
           `    super(ctx, env);
@@ -2654,14 +2654,15 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `      providerContractSha256: 'e'.repeat(64), controlToken: (this.controlRotated ? '6' : 'c').repeat(64),
           `      callbackToken: (this.callbackRotated ? '8' : 'd').repeat(64), nativeStartupJson: '{}',
           `      inspection: {image: 'registry/owner@sha256:' + 'b'.repeat(64), labels: [{name:'owner',value:'tenant'}]}
-          `    }); }, async (expected, name) => {
+          `    }); }, async (expected, name, directory) => {
           `      if (expected !== this.leaseKey || !this.leaseActive || name !== 'owner-checkpoint') throw new Error('Invalid capture authority');
+          `      if (directory !== undefined && directory !== '/app/data') throw new Error('Invalid directory capture authority');
           `      const policy = await this.env.engine.fetch('http://unit/stats'); if (!policy.ok) throw new Error('Snapshot policy I/O failed'); await policy.arrayBuffer();
-          `      return {id: 'ee2acc27-21e4-48a7-96f4-9790eb855d78', size: 2850, name};
+          `      return {id: 'ee2acc27-21e4-48a7-96f4-9790eb855d78', size: 2850, name, ...(directory === undefined ? {} : {dir: directory})};
           `    }, {});
           `    grants.push(this.grant);
           `    const loaded = env.loader.load({compatibilityDate:'2026-09-08',
-          `      compatibilityFlags:[], mainModule:'tenant.js',
+          `      compatibilityFlags:env.snapshotPolicyIo ? ['experimental'] : [], allowExperimental:env.snapshotPolicyIo, mainModule:'tenant.js',
           `      modules:{'tenant.js':source}, env:{INACTIVITY_MS: env.inactivityMs, EXPLICIT_MONITOR: env.explicitMonitor, OUTBOUND_HOST: this.birth === 1 ? (this.replaced ? 'replaced.invalid' : 'first.invalid') : 'resumed.invalid'}, openComputePrivateEnv:{},
           `      openComputeHostPolicy:true, openComputeContainer:this.grant,
           `      globalOutbound:env.outbound});
@@ -2672,7 +2673,7 @@ kj::String hostContainerOwnerConfig(int64_t inactivityMs = 0,
           `    if (new URL(request.url).pathname === '/repair') return new Response(String(await this.child.constructorSerial()));
           `    if (new URL(request.url).pathname === '/state') return new Response(JSON.stringify(await this.child.inactivityState()));
           `    if (new URL(request.url).pathname === '/snapshot') return new Response(JSON.stringify(await this.child.capture()));
-          `    if (new URL(request.url).pathname === '/snapshot-stream') return this.child.fetch(request);
+          `    if (['/snapshot-stream', '/directory-snapshot-stream'].includes(new URL(request.url).pathname)) return this.child.fetch(request);
           `    if (new URL(request.url).pathname === '/retire') this.ctx.abort('Server shutting down.');
           `    if (new URL(request.url).pathname === '/failed-warm') {
           `      const serial = await this.child.constructorSerial();
@@ -2979,6 +2980,16 @@ KJ_TEST("Server: Host Container snapshot retains fresh owner I/O after lease pol
 
     53
     {"id":"ee2acc27-21e4-48a7-96f4-9790eb855d78","size":2850,"name":"owner-checkpoint"}
+    0
+
+  )"_blockquote);
+  conn.sendHttpGet("/directory-snapshot-stream");
+  conn.recv(R"(
+    HTTP/1.1 200 OK
+    Transfer-Encoding: chunked
+
+    65
+    {"id":"ee2acc27-21e4-48a7-96f4-9790eb855d78","size":2850,"dir":"/app/data","name":"owner-checkpoint"}
     0
 
   )"_blockquote);

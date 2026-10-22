@@ -188,14 +188,15 @@ class HostContainerChannelImpl final: public IoChannelFactory::HostContainerChan
           .resolve(start, stop, completed, kj::mv(startup), kj::mv(expectedLeaseKey), monitor)
           .attach(kj::addRef(self));
     },
-        [weak = weakSelf->addRef()](kj::String expectedLeaseKey,
-            kj::Maybe<kj::String> name) mutable -> kj::Promise<HostContainerSnapshot> {
+        [weak = weakSelf->addRef()](kj::String expectedLeaseKey, kj::Maybe<kj::String> name,
+            kj::Maybe<kj::String> directory) mutable -> kj::Promise<HostContainerSnapshot> {
       auto& self =
           JSG_REQUIRE_NONNULL(weak->tryGet(), Error, "The Container attachment grant has ended.");
       auto keepAlive = kj::addRef(self);
       JSG_REQUIRE(!self.revoked && self.origin->tryGet() != kj::none, Error,
           "The Container attachment grant has been revoked.");
-      auto result = co_await self.capture(kj::mv(expectedLeaseKey), kj::mv(name));
+      auto result =
+          co_await self.capture(kj::mv(expectedLeaseKey), kj::mv(name), kj::mv(directory));
       JSG_REQUIRE(!self.revoked && self.origin->tryGet() != kj::none, Error,
           "The Container attachment grant has been revoked.");
       co_return kj::mv(result);
@@ -284,8 +285,8 @@ jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
     kj::String className,
     jsg::Function<jsg::Promise<jsg::Optional<HostContainerLease>>(
         bool, bool, bool, kj::String, kj::String, bool)> resolve,
-    jsg::Function<jsg::Promise<HostContainerSnapshot>(kj::String, jsg::Optional<kj::String>)>
-        capture,
+    jsg::Function<jsg::Promise<HostContainerSnapshot>(
+        kj::String, jsg::Optional<kj::String>, jsg::Optional<kj::String>)> capture,
     jsg::Dict<kj::String> images) {
   JSG_REQUIRE(
       className.size() > 0 && className.size() <= 256, TypeError, "Invalid Container class name.");
@@ -340,8 +341,9 @@ jsg::Ref<HostContainer> WorkerLoaderFactory::getContainer(jsg::Lock& js,
   });
   auto captureCallback = ioctx.makeReentryCallbackWeak(
       [capture = kj::mv(capture)](jsg::Lock& js, IoContext& ioctx, kj::String expectedLeaseKey,
-          kj::Maybe<kj::String> name) mutable {
-    return capture(js, kj::mv(expectedLeaseKey), jsg::Optional<kj::String>(kj::mv(name)));
+          kj::Maybe<kj::String> name, kj::Maybe<kj::String> directory) mutable {
+    return capture(js, kj::mv(expectedLeaseKey), jsg::Optional<kj::String>(kj::mv(name)),
+        jsg::Optional<kj::String>(kj::mv(directory)));
   });
   kj::Own<IoChannelFactory::HostContainerChannel> channel =
       kj::refcounted<HostContainerChannelImpl>(facets->getFacetManager(), kj::mv(className),
