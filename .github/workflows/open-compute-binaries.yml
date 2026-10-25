@@ -63,6 +63,29 @@ jobs:
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
           --test_output=errors
+      - name: Check native Tokio Rust style and lints
+        run: >-
+          bazel build //src/rust/cxx/kj-rs-tokio
+          --strip=always
+          --config=${{ matrix.config }}
+          --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
+          --config=lint
+      - name: Qualify Tokio reactor fairness and native I/O
+        run: >-
+          bazel test
+          //src/rust/...
+          //src/rust/cxx/kj-rs-tokio/tests:tokio-event-port-test
+          //src/rust/cxx/kj-rs-tokio:kj-rs-tokio_test
+          //src/rust/cxx/kj-rs-io:kj-rs-io_test
+          //src/rust/cxx/kj-rs-io/tests:async-io-test
+          //src/rust/cxx/kj-rs-io/tests:file-watcher-test
+          //src/rust/cxx/kj-rs-io/tests:http-test
+          //src/rust/cxx/kj-rs-io/tests:peer-filter-test
+          //src/rust/cxx/kj-rs-io/tests:capnp-rpc-test
+          --strip=always
+          --config=${{ matrix.config }}
+          --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
+          --test_output=errors
       - name: Qualify Root ownership across native Container executions
         env:
           BAZEL_CONFIG: ${{ matrix.config }}

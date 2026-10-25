@@ -129,6 +129,8 @@ TokioAsyncIoContext::~TokioAsyncIoContext() noexcept(false) {
 TokioAsyncIoContext setupTokioAsyncIo() {
   auto port = kj::heap<TokioEventPort>();
   auto waitScope = kj::heap<kj::WaitScope>(port->getLoop());
+  // Streaming continuations must not defer polling new socket and timer readiness.
+  waitScope->setBusyPollInterval(64);
   return TokioAsyncIoContext(kj::mv(port), kj::mv(waitScope));
 }
 

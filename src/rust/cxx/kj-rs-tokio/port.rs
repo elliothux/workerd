@@ -16,15 +16,10 @@ use tokio::task::LocalSet;
 
 use crate::ffi::EnteredRuntime;
 
-/// How many bounded yield points `poll()` grants the runtime. This gives ready work opportunities
-/// to run without promising an ordering or an exact number of task or driver polls, which are
-/// Tokio scheduler implementation details.
-///
-/// The value is a latency/throughput compromise, not derived from any tokio internal: large
-/// enough to drain a typical burst of already-ready tasks in one `poll()` call, small enough to
-/// bound how long `poll()` withholds control from the KJ loop when spawned tasks keep re-readying
-/// each other. Safe to retune if profiling shows either starvation or excessive poll latency.
-const POLL_YIELD_BUDGET: u32 = 16;
+/// Yield once when polling the runtime. Busy KJ queues request repeated polls, so extra yields
+/// delay KJ processing of the resulting I/O completions.
+/// Tokio scheduling order and driver-poll counts remain implementation details.
+const POLL_YIELD_BUDGET: u32 = 1;
 
 thread_local! {
     /// Handle to the `TokioPort` runtime driving the KJ event loop on this thread, if any.

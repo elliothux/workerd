@@ -614,6 +614,30 @@ KJ_TEST("a KJ timer armed by a spawned task during a wait-forever park is honore
   done.store(true);
 }
 
+KJ_TEST("Tokio context services ready tasks before a busy KJ queue drains") {
+  auto io = setupTokioAsyncIo();
+  auto before = completed_task_count();
+  spawn_detached_completing_task();
+
+  struct Busy {
+    static kj::Promise<void> run(uint &turns, uint64_t before) {
+      return kj::evalLater([&turns, before]() -> kj::Promise<void> {
+        ++turns;
+        delayMillis(1);
+        if (turns < 1024 && completed_task_count() == before) {
+          return run(turns, before);
+        }
+        return kj::READY_NOW;
+      });
+    }
+  };
+  uint turns = 0;
+  Busy::run(turns, before).wait(io.getWaitScope());
+
+  KJ_EXPECT(completed_task_count() == before + 1);
+  KJ_EXPECT(turns < 1024);
+}
+
 KJ_TEST("cross-thread bridged wake arriving while the loop is busy (not parked) is delivered") {
   auto io = setupTokioAsyncIo();
   auto &ws = io.getWaitScope();

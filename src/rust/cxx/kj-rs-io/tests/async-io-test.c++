@@ -1164,13 +1164,15 @@ KJ_TEST("parseAddress of an unresolvable host fails with a getaddrinfo exception
   auto io = setupTokioAsyncIo();
   auto &ws = io.getWaitScope();
 
-  // RFC 6761 reserves .invalid: resolvers must answer NXDOMAIN without asking upstream.
+  // An overlong label makes getaddrinfo fail even when local DNS rewrites .invalid.
   auto exception = KJ_ASSERT_NONNULL(kj::runCatchingExceptions([&]() {
-    boundedBy(io, io.getNetwork().parseAddress("nonexistent.invalid:80"), 30 * kj::SECONDS,
-        "DNS failure to be reported")
+    boundedBy(io,
+        io.getNetwork().parseAddress(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.invalid:80"),
+        30 * kj::SECONDS, "DNS failure to be reported")
         .wait(ws);
   }),
-      "nonexistent.invalid unexpectedly resolved");
+      "overlong DNS label unexpectedly resolved");
   KJ_EXPECT(exception.getDescription().contains("getaddrinfo"), exception.getDescription());
 }
 
