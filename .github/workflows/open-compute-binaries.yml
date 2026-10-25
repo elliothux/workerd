@@ -7,31 +7,105 @@ on:
         description: Release tag, for example v1.20260930.0-open-compute-r4.012345678
         required: true
         type: string
+      recover_r23:
+        description: Reuse the three verified R23 artifacts and rebuild only macOS x64
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: linux-x64
-            config: release_linux
-          - runner: ubuntu-24.04-arm
-            target: linux-arm64
-            config: release_linux
-          - runner: macos-15
-            target: darwin-arm64
-            config: release_macos
-          - runner: macos-15
-            target: darwin-x64
-            config: release_macos_cross_x86_64
+        include: ${{ fromJSON(inputs.recover_r23 && '[{"runner":"macos-15","target":"darwin-x64","config":"release_macos_cross_x86_64"}]' || '[{"runner":"ubuntu-24.04","target":"linux-x64","config":"release_linux"},{"runner":"ubuntu-24.04-arm","target":"linux-arm64","config":"release_linux"},{"runner":"macos-15","target":"darwin-arm64","config":"release_macos"},{"runner":"macos-15","target":"darwin-x64","config":"release_macos_cross_x86_64"}]') }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}
+      - name: Verify R23 reusable artifacts
+        if: inputs.recover_r23
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          python3 - <<'PYTHON'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          REVISION = "25f2a0fded9744c65988880e6c2003434aa90d3b"
+          RUN = 40199209196
+          EXPECTED = {
+              "workerd-linux-x64": (12605877244, "831c155f22184ba35d344d85932db3919ba5cdafa1026c4b384e0b866df2bde3"),
+              "workerd-darwin-arm64": (12604054660, "7a88c9b1f6325122c83c3e43daa1e071f278da112b10d34c0487440bf83fbaa7"),
+              "workerd-linux-arm64": (12603164530, "7407ce2e663cd063b71e2312e75305d26571a28e8b49fdf16ffb622f0a97a3ba"),
+          }
+          BUILD_JOBS = {
+              "workerd-linux-x64": "build (ubuntu-24.04, linux-x64, release_linux)",
+              "workerd-darwin-arm64": "build (macos-15, darwin-arm64, release_macos)",
+              "workerd-linux-arm64": "build (ubuntu-24.04-arm, linux-arm64, release_linux)",
+          }
+          REQUIRED = {
+              "Check Tokio I/O graph", "Build", "Qualify native Container callbacks and attachment",
+              "Check native Tokio Rust style and lints", "Qualify Tokio reactor fairness and native I/O",
+              "Qualify Root ownership across native Container executions", "Record inputs",
+              "Verify private Container protocol", "Record compatibility catalog",
+          }
+
+          def validate(run, jobs, artifacts):
+              assert run["id"] == RUN and run["run_attempt"] == 1 and run["head_sha"] == REVISION
+              assert run["repository"]["full_name"] == "elliothux/workerd"
+              assert run["path"] == ".github/workflows/open-compute-binaries.yml"
+              assert run["event"] == "workflow_dispatch" and run["head_branch"] == "main"
+              assert run["status"] == "completed" and run["conclusion"] == "failure"
+              assert jobs["total_count"] == len(jobs["jobs"]) == 5
+              assert all(job["status"] == "completed" and job["head_sha"] == REVISION and
+                         job["run_id"] == RUN and job["run_attempt"] == 1 for job in jobs["jobs"])
+              by_name = {job["name"]: job for job in jobs["jobs"]}
+              assert len(by_name) == 5
+              assert set(by_name) == set(BUILD_JOBS.values()) | {
+                  "build (macos-15, darwin-x64, release_macos_cross_x86_64)", "publish"}
+              assert artifacts["total_count"] == len(artifacts["artifacts"]) == 3
+              assert {a["name"] for a in artifacts["artifacts"]} == set(EXPECTED)
+              result = {}
+              for asset in artifacts["artifacts"]:
+                  name = asset["name"]
+                  identifier, digest = EXPECTED[name]
+                  assert asset["id"] == identifier and asset["digest"] == "sha256:" + digest
+                  assert asset["expired"] is False and 0 < asset["size_in_bytes"] < 64 * 1024**2
+                  assert datetime.datetime.fromisoformat(asset["expires_at"].replace("Z", "+00:00")) > datetime.datetime.now(datetime.timezone.utc)
+                  assert asset["workflow_run"]["id"] == RUN and asset["workflow_run"]["head_sha"] == REVISION
+                  job = by_name[BUILD_JOBS[name]]
+                  assert job["conclusion"] == "success"
+                  steps = {step["name"]: step for step in job["steps"]}
+                  assert len(steps) == len(job["steps"]) and REQUIRED <= set(steps)
+                  assert all(steps[name]["status"] == "completed" and steps[name]["conclusion"] == "success" for name in REQUIRED)
+                  result[name] = {"artifactId": identifier, "archiveSha256": digest, "jobId": job["id"]}
+              return {"r23ReusableArtifacts": {"sourceRevision": REVISION, "run": RUN,
+                      "sourceRunConclusion": "failure", "qualifiedTargetsOnly": result}}
+
+          def main():
+              assert os.environ["GITHUB_REPOSITORY"] == "elliothux/workerd"
+              assert os.environ["RELEASE"] == "v1.20260930.0-open-compute-r23.25f2a0fde"
+              assert subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip() == REVISION
+              assert not subprocess.check_output(["git", "status", "--porcelain"])
+              records = []
+              for suffix in ["", "/jobs?per_page=100", "/artifacts?per_page=100"]:
+                  records.append(json.loads(subprocess.check_output(["gh", "api", f"repos/elliothux/workerd/actions/runs/{RUN}{suffix}"])))
+              proof = validate(*records)
+              (Path(os.environ["RUNNER_TEMP"]) / "r23-reuse-proof.json").write_text(json.dumps(proof, separators=(",", ":")) + "\n")
+
+          if __name__ == "__main__":
+              main()
+          PYTHON
       - uses: ./.github/actions/setup-runner
         with:
           GOOGLESOURCE_COOKIE: ''
@@ -69,7 +143,9 @@ jobs:
           --strip=always
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
-          --config=lint
+          --config=clippy
+          --config=rustfmt
+          --@rules_rust//:extra_rustc_flag=-Dwarnings
       - name: Qualify Tokio reactor fairness and native I/O
         run: >-
           bazel test
@@ -137,6 +213,10 @@ jobs:
           xcrun --show-sdk-version >> build-inputs.txt 2>&1 || true
           bazel-bin/src/workerd/server/workerd --version >> build-inputs.txt
           shasum -a 256 bazel-bin/src/workerd/server/workerd >> build-inputs.txt
+          if [ "${{ inputs.recover_r23 }}" = "true" ]; then
+            printf 'source-revision 25f2a0fded9744c65988880e6c2003434aa90d3b\nworkflow-revision %s\n' "$GITHUB_SHA" >> build-inputs.txt
+            cat "$RUNNER_TEMP/r23-reuse-proof.json" >> build-inputs.txt
+          fi
       - name: Verify private Container protocol
         run: |
           bazel-bin/src/workerd/server/workerd container-protocol-version > container-protocol.stdout 2> container-protocol.stderr
@@ -171,8 +251,17 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        if: inputs.recover_r23
+        with:
+          github-token: ${{ github.token }}
+          repository: elliothux/workerd
+          run-id: 40199209196
+          artifact-ids: 12605877244,12604054660,12603164530
+          path: artifacts
       - uses: actions/download-artifact@v8
         with:
           pattern: workerd-*
@@ -221,6 +310,6 @@ jobs:
           release/build-inputs-linux-arm64.txt
           release/build-inputs-linux-x64.txt
           release/SHA256SUMS
-          --target "$GITHUB_SHA"
+          --target "${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}"
           --title "$RELEASE"
-          --notes "Four-platform open-compute workerd build from $GITHUB_SHA."
+          --notes "Four-platform open-compute workerd build from ${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}."
