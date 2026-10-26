@@ -13,12 +13,19 @@ on:
         type: boolean
         default: false
 
+      publish_r23:
+        description: Publish the four retained R23 build artifacts without compiling
+        required: false
+        type: boolean
+        default: false
+
 permissions:
   contents: read
   actions: read
 
 jobs:
   build:
+    if: ${{ !inputs.publish_r23 }}
     strategy:
       fail-fast: false
       matrix:
@@ -247,6 +254,7 @@ jobs:
           retention-days: 7
 
   publish:
+    if: ${{ always() && ((!inputs.publish_r23 && needs.build.result == 'success') || (inputs.publish_r23 && inputs.recover_r23 && needs.build.result == 'skipped')) }}
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -254,6 +262,65 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}
+      - name: Verify retained R23 build artifacts
+        if: inputs.publish_r23
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          python3 - <<'PYTHON'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          EXPECTED = {'workerd-linux-x64': {'artifactId': 12605877244, 'archiveSha256': 'sha256:831c155f22184ba35d344d85932db3919ba5cdafa1026c4b384e0b866df2bde3', 'runId': 40199209196, 'workflowRevision': '25f2a0fded9744c65988880e6c2003434aa90d3b', 'jobId': 121186569660}, 'workerd-darwin-arm64': {'artifactId': 12604054660, 'archiveSha256': 'sha256:7a88c9b1f6325122c83c3e43daa1e071f278da112b10d34c0487440bf83fbaa7', 'runId': 40199209196, 'workflowRevision': '25f2a0fded9744c65988880e6c2003434aa90d3b', 'jobId': 121186569431}, 'workerd-linux-arm64': {'artifactId': 12603164530, 'archiveSha256': 'sha256:7407ce2e663cd063b71e2312e75305d26571a28e8b49fdf16ffb622f0a97a3ba', 'runId': 40199209196, 'workflowRevision': '25f2a0fded9744c65988880e6c2003434aa90d3b', 'jobId': 121186569657}, 'workerd-darwin-x64': {'artifactId': 12610838358, 'archiveSha256': 'sha256:23f8fdcce4f596470788d84e3d172e4a2d5ef5beddd4083cd8ccf89c481e04d9', 'runId': 40216315540, 'workflowRevision': 'e1e632f1c7eab06e3ab233774753ff4c8aaafcaf', 'jobId': 121238099808}}
+          REQUIRED = {
+              "Check Tokio I/O graph", "Build", "Qualify native Container callbacks and attachment",
+              "Check native Tokio Rust style and lints", "Qualify Tokio reactor fairness and native I/O",
+              "Qualify Root ownership across native Container executions", "Record inputs",
+              "Verify private Container protocol", "Record compatibility catalog",
+          }
+          NAMES = {
+              "workerd-linux-x64": "build (ubuntu-24.04, linux-x64, release_linux)",
+              "workerd-linux-arm64": "build (ubuntu-24.04-arm, linux-arm64, release_linux)",
+              "workerd-darwin-arm64": "build (macos-15, darwin-arm64, release_macos)",
+              "workerd-darwin-x64": "build (macos-15, darwin-x64, release_macos_cross_x86_64)",
+          }
+
+          def validate(name, asset, job):
+              expected = EXPECTED[name]
+              assert asset["id"] == expected["artifactId"] and asset["name"] == name
+              assert asset["digest"] == expected["archiveSha256"] and asset["expired"] is False
+              assert 0 < asset["size_in_bytes"] < 64 * 1024**2
+              assert datetime.datetime.fromisoformat(asset["expires_at"].replace("Z", "+00:00")) > datetime.datetime.now(datetime.timezone.utc)
+              assert asset["workflow_run"]["id"] == expected["runId"]
+              assert asset["workflow_run"]["head_sha"] == expected["workflowRevision"]
+              assert job["id"] == expected["jobId"] and job["name"] == NAMES[name]
+              assert job["run_id"] == expected["runId"] and job["head_sha"] == expected["workflowRevision"]
+              assert job["run_attempt"] == 1 and job["status"] == "completed" and job["conclusion"] == "success"
+              steps = {step["name"]: step for step in job["steps"]}
+              assert len(steps) == len(job["steps"]) and REQUIRED <= set(steps)
+              assert all(steps[key]["status"] == "completed" and steps[key]["conclusion"] == "success" for key in REQUIRED)
+              if name == "workerd-darwin-x64":
+                  assert steps["Verify R23 reusable artifacts"]["conclusion"] == "success"
+
+          def main():
+              assert os.environ["GITHUB_REPOSITORY"] == "elliothux/workerd"
+              assert os.environ["RELEASE"] == "v1.20260930.0-open-compute-r23.25f2a0fde"
+              assert subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip() == "25f2a0fded9744c65988880e6c2003434aa90d3b"
+              assert not subprocess.check_output(["git", "status", "--porcelain"])
+              for name, expected in EXPECTED.items():
+                  asset = json.loads(subprocess.check_output(["gh", "api", f"repos/elliothux/workerd/actions/artifacts/{expected['artifactId']}"]))
+                  job = json.loads(subprocess.check_output(["gh", "api", f"repos/elliothux/workerd/actions/jobs/{expected['jobId']}"]))
+                  validate(name, asset, job)
+
+          if __name__ == "__main__":
+              main()
+          PYTHON
       - uses: actions/download-artifact@v8
         if: inputs.recover_r23
         with:
@@ -263,9 +330,18 @@ jobs:
           artifact-ids: 12605877244,12604054660,12603164530
           path: artifacts
       - uses: actions/download-artifact@v8
+        if: inputs.publish_r23
+        with:
+          github-token: ${{ github.token }}
+          repository: elliothux/workerd
+          run-id: 40216315540
+          artifact-ids: 12610838358
+          path: artifacts/workerd-darwin-x64
+      - uses: actions/download-artifact@v8
+        if: ${{ !inputs.publish_r23 }}
         with:
           pattern: workerd-*
-          path: artifacts
+          path: ${{ inputs.recover_r23 && 'artifacts/workerd-darwin-x64' || 'artifacts' }}
       - name: Validate and package release assets
         env:
           RELEASE: ${{ inputs.release }}
