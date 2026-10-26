@@ -374,18 +374,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
-        run: >-
-          gh release create "$RELEASE"
-          release/workerd-darwin-arm64.gz
-          release/workerd-darwin-64.gz
-          release/workerd-linux-arm64.gz
-          release/workerd-linux-64.gz
-          release/compatibility-catalog.json
-          release/build-inputs-darwin-arm64.txt
-          release/build-inputs-darwin-x64.txt
-          release/build-inputs-linux-arm64.txt
-          release/build-inputs-linux-x64.txt
-          release/SHA256SUMS
-          --target "${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}"
-          --title "$RELEASE"
-          --notes "Four-platform open-compute workerd build from ${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}."
+        run: |
+          release_source_revision="${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}"
+          target_args=(--target "$release_source_revision")
+          if [ "${{ inputs.recover_r23 }}" = "true" ]; then
+            test "$(gh api "repos/elliothux/workerd/git/ref/tags/$RELEASE" --jq .object.sha)" = "$release_source_revision"
+            target_args=(--verify-tag)
+          fi
+          gh release create "$RELEASE" \
+          release/workerd-darwin-arm64.gz \
+          release/workerd-darwin-64.gz \
+          release/workerd-linux-arm64.gz \
+          release/workerd-linux-64.gz \
+          release/compatibility-catalog.json \
+          release/build-inputs-darwin-arm64.txt \
+          release/build-inputs-darwin-x64.txt \
+          release/build-inputs-linux-arm64.txt \
+          release/build-inputs-linux-x64.txt \
+          release/SHA256SUMS \
+          "${target_args[@]}" \
+          --title "$RELEASE" \
+          --notes "Four-platform open-compute workerd build from $release_source_revision."
