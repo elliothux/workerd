@@ -27,6 +27,11 @@ bazel_dep(name = "brotli", version = "1.2.0.bcr.3")
 # capnp-cpp
 http.archive(
     name = "capnp-cpp",
+    patch_strip = 1,
+    patches = [
+        "//:patches/capnp/0001-Honor-HTTP-1.0-default-connection-close.patch",
+        "//:patches/capnp/0002-Test-HTTP-1.0-connection-persistence.patch",
+    ],
     sha256 = "17fed2f708217291547d8b3a2b768f7f5ee2c8f65224d81bc4f313488b93fd40",
     strip_prefix = "capnproto-capnproto-1be2d2a/c++",
     type = "tgz",

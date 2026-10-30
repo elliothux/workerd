@@ -136,6 +136,7 @@ jobs:
           //src/workerd/server:host-container-test@
           //src/workerd/server:container-client-test@
           //src/workerd/api:container-test@
+          @capnp-cpp//src/kj/compat:http-test
           //src/workerd/api/tests:worker-loader-host-container-test@
           //src/workerd/api:sockets-test@
           //src/workerd/api/tests:socket-close-gc-test@

@@ -34,7 +34,12 @@
       "owner": "capnproto",
       "repo": "capnproto",
       "branch": "v2",
-      "extra_strip_prefix": "/c++"
+      "freeze_commit": "1be2d2a8e60152c89b00adca758c0c495acadc2b",
+      "extra_strip_prefix": "/c++",
+      "patches": [
+        "//:patches/capnp/0001-Honor-HTTP-1.0-default-connection-close.patch",
+        "//:patches/capnp/0002-Test-HTTP-1.0-connection-persistence.patch"
+      ]
     },
     // We want to avoid version skew with v8, so we use identical versions. Keep this
     // V8-aligned dependency marked as such in ci/v8_update.py.

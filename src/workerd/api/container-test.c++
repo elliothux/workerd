@@ -337,6 +337,8 @@ void setUpPortPooling(jsg::Lock& js, Container& container, PortPooling pooling) 
 
 enum class ResponseMode {
   KEEP_ALIVE,
+  HTTP10_DEFAULT_CLOSE,
+  HTTP10_KEEP_ALIVE,
   CLOSE_AFTER_RESPONSE,
   CLOSE_DELIMITED,
   CONNECTION_CLOSE,
@@ -485,6 +487,14 @@ class TestPort final: public rpc::Container::Port::Server, private kj::TaskSet::
       switch (mode) {
         case ResponseMode::KEEP_ALIVE:
           co_await down->write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"_kjb);
+          break;
+        case ResponseMode::HTTP10_DEFAULT_CLOSE:
+          // Keep EOF pending so the client must honor HTTP/1.0 without waiting for closure.
+          co_await down->write("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"_kjb);
+          break;
+        case ResponseMode::HTTP10_KEEP_ALIVE:
+          co_await down->write(
+              "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK"_kjb);
           break;
         case ResponseMode::CLOSE_AFTER_RESPONSE:
           co_await down->write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"_kjb);
@@ -1453,6 +1463,14 @@ KJ_TEST("Container::exec process outlives the IoContext its abort action was reg
 
 KJ_TEST("Container reuses a healthy HTTP tunnel") {
   runTunnelTest(ResponseMode::KEEP_ALIVE, 1);
+}
+
+KJ_TEST("Container does not reuse HTTP/1.0 tunnels without explicit persistence") {
+  runTunnelTest(ResponseMode::HTTP10_DEFAULT_CLOSE, 2);
+}
+
+KJ_TEST("Container reuses an explicitly persistent HTTP/1.0 tunnel") {
+  runTunnelTest(ResponseMode::HTTP10_KEEP_ALIVE, 1);
 }
 
 KJ_TEST("Container discards a tunnel closed after a complete response") {
