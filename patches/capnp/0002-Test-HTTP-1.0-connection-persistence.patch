@@ -1,0 +1,39 @@
+--- a/src/kj/compat/http-test.c++
++++ b/src/kj/compat/http-test.c++
+@@ -190,3 +190,33 @@
+-KJ_TEST("HttpHeaders::parseResponse") {
+-  HttpHeaderTable::Builder builder;
+-
++KJ_TEST("HttpHeaders HTTP/1.0 default connection persistence") {
++  HttpHeaderTable::Builder builder;
++  auto table = builder.build();
++  for (auto connection: kj::arr(""_kj, "Connection: Upgrade\r\n"_kj,
++           "Connection: close\r\n"_kj)) {
++    HttpHeaders headers(*table);
++    auto text = kj::str("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n", connection, "\r\n");
++    auto result = headers.tryParseResponse(text.asArray()).get<HttpHeaders::Response>();
++    KJ_EXPECT(result.statusCode == 200);
++    KJ_EXPECT(headers.get(HttpHeaderId::CONNECTION).orDefault("") == "close");
++  }
++}
++
++KJ_TEST("HttpHeaders preserves explicit persistence") {
++  HttpHeaderTable::Builder builder;
++  auto table = builder.build();
++  for (auto value: kj::arr("keep-alive"_kj, "KeEp-AlIvE"_kj)) {
++    HttpHeaders headers(*table);
++    auto text = kj::str("HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: ", value, "\r\n\r\n");
++    auto result = headers.tryParseResponse(text.asArray()).get<HttpHeaders::Response>();
++    KJ_EXPECT(result.statusCode == 200);
++    KJ_EXPECT(headers.get(HttpHeaderId::CONNECTION).orDefault("") == value);
++  }
++  HttpHeaders headers(*table);
++  auto text = kj::heapString("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n");
++  auto result = headers.tryParseResponse(text.asArray()).get<HttpHeaders::Response>();
++  KJ_EXPECT(result.statusCode == 200);
++  KJ_EXPECT(headers.get(HttpHeaderId::CONNECTION) == kj::none);
++}
++
++KJ_TEST("HttpHeaders::parseResponse") {
++  HttpHeaderTable::Builder builder;
++

@@ -1,0 +1,35 @@
+--- a/src/kj/compat/http.c++
++++ b/src/kj/compat/http.c++
+@@ -1093,3 +1093,4 @@
+-  HttpHeaders::Response response;
+-
+-  KJ_IF_SOME(version, consumeWord(ptr)) {
++  HttpHeaders::Response response;
++  bool closeByDefault = false;
++
++  KJ_IF_SOME(version, consumeWord(ptr)) {
+@@ -1098,3 +1099,4 @@
+-          "Invalid response status line (invalid protocol).", content };
+-    }
+-  } else {
++          "Invalid response status line (invalid protocol).", content };
++    }
++    closeByDefault = version == "HTTP/1.0";
++  } else {
+@@ -1116,5 +1118,11 @@
+-        "The headers sent by the server are not valid.", content };
+-  }
+-
+-  return response;
+-}
++        "The headers sent by the server are not valid.", content };
++  }
++
++  // HTTP/1.0 requires an explicit keep-alive option for persistence.
++  if (closeByDefault && !fastCaseCmp<'k', 'e', 'e', 'p', '-', 'a', 'l', 'i', 'v', 'e'>(
++      get(HttpHeaderId::CONNECTION).orDefault("").cStr())) {
++    set(HttpHeaderId::CONNECTION, "close");
++  }
++
++  return response;
++}
