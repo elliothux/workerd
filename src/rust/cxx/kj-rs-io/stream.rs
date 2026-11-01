@@ -550,7 +550,20 @@ impl TokioStream {
         match &self.shared().socket {
             #[cfg(unix)]
             Socket::Unix(s) => {
-                let cred = s.peer_cred().map_err(op("getsockopt(SO_PEERCRED)"))?;
+                let cred = match s.peer_cred() {
+                    Ok(cred) => cred,
+                    // macOS returns ENOTCONN once the peer has closed; report unknown
+                    // credentials rather than failing the accept.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {
+                        return Ok(crate::ffi::PeerCredentials {
+                            has_pid: false,
+                            pid: 0,
+                            has_uid: false,
+                            uid: 0,
+                        });
+                    }
+                    Err(err) => return Err(op("getsockopt(SO_PEERCRED)")(err)),
+                };
                 let pid = cred.pid().filter(|pid| *pid > 0);
                 Ok(crate::ffi::PeerCredentials {
                     has_pid: pid.is_some(),

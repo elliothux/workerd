@@ -277,6 +277,24 @@ KJ_TEST("acceptAuthenticated reports LocalPeerIdentity credentials on unix socke
 
   unlink(path.cStr());
 }
+
+KJ_TEST("acceptAuthenticated survives a unix peer that disconnects before accept") {
+  // macOS reports ENOTCONN for LOCAL_PEERCRED once the peer has closed. The accept must still
+  // succeed, with unknown credentials, instead of throwing out of the listener loop.
+  auto io = setupTokioAsyncIo();
+  auto &ws = io.getWaitScope();
+
+  auto path = kj::str("/tmp/kj-rs-io-auth-gone-test-", getpid(), ".sock");
+  auto addr = parseNow(io, kj::str("unix:", path));
+
+  auto listener = addr->listen();
+  { auto client = addr->connect().wait(ws); }
+  auto server = listener->acceptAuthenticated().wait(ws);
+
+  KJ_ASSERT_NONNULL(kj::tryDowncast<kj::LocalPeerIdentity>(*server.peerIdentity));
+
+  unlink(path.cStr());
+}
 #endif
 
 KJ_TEST("sockname/peername/raw handle passthrough") {
