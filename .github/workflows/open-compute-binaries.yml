@@ -29,14 +29,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.recover_r23 && '[{"runner":"macos-15","target":"darwin-x64","config":"release_macos_cross_x86_64"}]' || '[{"runner":"ubuntu-24.04","target":"linux-x64","config":"release_linux"},{"runner":"ubuntu-24.04-arm","target":"linux-arm64","config":"release_linux"},{"runner":"macos-15","target":"darwin-arm64","config":"release_macos"},{"runner":"macos-15","target":"darwin-x64","config":"release_macos_cross_x86_64"}]') }}
+        include: ${{ fromJSON(inputs.recover_r23 && '[{"runner":"macos-15","target":"darwin-x64","config":"release_macos_cross_x86_64"}]' || '[{"runner":"ubuntu-24.04","target":"linux-x64","config":"release_linux","manylinux":"quay.io/pypa/manylinux_2_34_x86_64@sha256:b9bb1e7780cebc4a8375c032428411ee1a78c4cd0b8edd1313983166dd3d6cf1","llvm_arch":"x86_64","llvm_sha256":"8d5d1e52a06e1c10e457fd36489047053ac451ddad9c88017b0d0fc6b8e5d4c0","bazelisk_arch":"amd64","bazelisk_sha256":"e1508323f347ad1465a887bc5d2bfb91cffc232d11e8e997b623227c6b32fb76"},{"runner":"ubuntu-24.04-arm","target":"linux-arm64","config":"release_linux","manylinux":"quay.io/pypa/manylinux_2_34_aarch64@sha256:a742af40e8c0afb854962bde958a40b784408577a2dbdd9998740dac1dd0e9ec","llvm_arch":"aarch64","llvm_sha256":"0b0131b9a6fb38c2fbe73e576d7812962268db610b8b2f1b6ef217dd5161ef77","bazelisk_arch":"arm64","bazelisk_sha256":"bb608519a440d45d10304eb684a73a2b6bb7699c5b0e5434361661b25f113a5d"},{"runner":"macos-15","target":"darwin-arm64","config":"release_macos"},{"runner":"macos-15","target":"darwin-x64","config":"release_macos_cross_x86_64"}]') }}
     runs-on: ${{ matrix.runner }}
+    # Linux steps run inside the glibc 2.34 builder; the work directory is mounted at
+    # the same path so bazel-bin symlinks also resolve for artifact upload on the host.
+    defaults:
+      run:
+        shell: ${{ matrix.manylinux && format('docker exec -e BAZEL_CONFIG -e GITHUB_SHA -e RUNNER_TEMP -w {0} oc-builder bash -e {{0}}', github.workspace) || 'bash -e {0}' }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.recover_r23 && '25f2a0fded9744c65988880e6c2003434aa90d3b' || github.sha }}
       - name: Verify R23 reusable artifacts
         if: inputs.recover_r23
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
@@ -114,8 +120,36 @@ jobs:
               main()
           PYTHON
       - uses: ./.github/actions/setup-runner
+        if: runner.os == 'macOS'
         with:
           GOOGLESOURCE_COOKIE: ''
+      - name: Start glibc 2.34 builder
+        if: matrix.manylinux
+        shell: bash
+        run: |
+          docker build -f .github/open-compute/glibc-2.34.Dockerfile \
+            --build-arg MANYLINUX='${{ matrix.manylinux }}' \
+            --build-arg LLVM_ARCH='${{ matrix.llvm_arch }}' \
+            --build-arg LLVM_SHA256='${{ matrix.llvm_sha256 }}' \
+            --build-arg BAZELISK_ARCH='${{ matrix.bazelisk_arch }}' \
+            --build-arg BAZELISK_SHA256='${{ matrix.bazelisk_sha256 }}' \
+            -t oc-builder .github/open-compute
+          work="$(dirname "$(dirname "$GITHUB_WORKSPACE")")"
+          docker run -d --name oc-builder --network host -v "$work:$work" oc-builder sleep infinity
+          docker exec oc-builder git config --global --add safe.directory '*'
+          cat >> .bazelrc <<CONFIG
+          startup --output_user_root=$work/_bazel
+          build:linux --repo_env=CC=/opt/llvm/bin/clang
+          build:linux --repo_env=AR=/opt/llvm/bin/llvm-ar
+          build:linux --copt=--gcc-toolchain=/opt/rh/gcc-toolset-14/root/usr
+          build:linux --host_copt=--gcc-toolchain=/opt/rh/gcc-toolset-14/root/usr
+          build:linux --cxxopt=-isystem/opt/llvm/include/c++/v1
+          build:linux --host_cxxopt=-isystem/opt/llvm/include/c++/v1
+          build:linux --linkopt=-L/opt/llvm/lib
+          build:linux --host_linkopt=-L/opt/llvm/lib
+          build:linux --linkopt=--ld-path=/opt/llvm/bin/ld.lld
+          build:linux --host_linkopt=--ld-path=/opt/llvm/bin/ld.lld
+          CONFIG
       - name: Configure macOS linker
         if: runner.os == 'macOS'
         run: |
@@ -130,6 +164,15 @@ jobs:
           --strip=always
           --config=${{ matrix.config }}
           --@rules_rust//:extra_exec_rustc_flags=-Cstrip=none
+      - name: Check glibc 2.34 baseline
+        if: matrix.manylinux
+        run: |
+          binary=bazel-bin/src/workerd/server/workerd
+          ! objdump -p "$binary" | grep -E 'NEEDED +libstdc\+\+'
+          ! objdump -T "$binary" | grep -E 'GLIBCXX_|CXXABI_'
+          highest="$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+          printf 'glibc-highest %s\n' "$highest"
+          test "$(printf '%s\n2.34\n' "$highest" | sort -V | tail -1)" = 2.34
       - name: Qualify native Container callbacks and attachment
         run: >-
           bazel test
@@ -219,6 +262,7 @@ jobs:
           clang --version >> build-inputs.txt 2>&1 || true
           ld.lld --version >> build-inputs.txt 2>&1 || true
           xcrun --show-sdk-version >> build-inputs.txt 2>&1 || true
+          getconf GNU_LIBC_VERSION >> build-inputs.txt 2>&1 || true
           bazel-bin/src/workerd/server/workerd --version >> build-inputs.txt
           shasum -a 256 bazel-bin/src/workerd/server/workerd >> build-inputs.txt
           if [ "${{ inputs.recover_r23 }}" = "true" ]; then
