@@ -13,7 +13,7 @@ ARG BAZELISK_ARCH
 ARG BAZELISK_SHA256
 
 ENV PATH=/opt/python/cp313-cp313/bin:/opt/llvm/bin:$PATH
-RUN dnf install -y gcc git tar gzip xz unzip zip patch which perl-Digest-SHA libxml2 libzstd zlib-devel \
+RUN dnf install -y gcc gcc-c++ git tar gzip xz unzip zip patch which perl-Digest-SHA libxml2 libzstd zlib-devel \
     && dnf clean all \
     && python -m pip install --no-cache-dir cmake==3.31.6 ninja==1.13.0
 RUN mkdir -p /opt/llvm /build \
