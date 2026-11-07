@@ -17,13 +17,13 @@ RUN dnf install -y gcc gcc-c++ git tar gzip xz unzip zip patch which perl-Digest
     && dnf clean all \
     && python -m pip install --no-cache-dir cmake==3.31.6 ninja==1.13.0
 RUN mkdir -p /opt/llvm /build \
-    && curl -fsSL "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-22.1.8-${LLVM_ARCH}.tar.xz" -o /build/clang.tar.xz \
+    && curl -fsSL --retry 5 --retry-all-errors "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-22.1.8-${LLVM_ARCH}.tar.xz" -o /build/clang.tar.xz \
     && echo "${LLVM_SHA256}  /build/clang.tar.xz" | sha256sum -c - \
     && tar -xJf /build/clang.tar.xz --strip-components=1 -C /opt/llvm \
     && for driver in clang clang++; do \
          echo '--gcc-toolchain=/usr' > "/opt/llvm/bin/$driver.cfg"; \
        done \
-    && curl -fsSL https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/llvm-project-22.1.8.src.tar.xz -o /build/llvm.tar.xz \
+    && curl -fsSL --retry 5 --retry-all-errors https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/llvm-project-22.1.8.src.tar.xz -o /build/llvm.tar.xz \
     && echo '922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888  /build/llvm.tar.xz' | sha256sum -c - \
     && tar -xJf /build/llvm.tar.xz -C /build \
     && cmake -G Ninja -S /build/llvm-project-22.1.8.src/runtimes -B /build/runtimes \
@@ -41,7 +41,7 @@ RUN mkdir -p /opt/llvm /build \
     && cmake --build /build/runtimes \
     && cmake --install /build/runtimes \
     && rm -rf /build
-RUN curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-${BAZELISK_ARCH}" -o /usr/local/bin/bazel \
+RUN curl -fsSL --retry 5 --retry-all-errors "https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-${BAZELISK_ARCH}" -o /usr/local/bin/bazel \
     && echo "${BAZELISK_SHA256}  /usr/local/bin/bazel" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/bazel \
     && test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.34'
