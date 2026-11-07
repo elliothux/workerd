@@ -149,6 +149,7 @@ jobs:
           build:linux --host_linkopt=-L/opt/llvm/lib
           build:linux --linkopt=--ld-path=/opt/llvm/bin/ld.lld
           build:linux --host_linkopt=--ld-path=/opt/llvm/bin/ld.lld
+          build:linux --linkopt=-l:libunwind.a
           CONFIG
       - name: Configure macOS linker
         if: runner.os == 'macOS'

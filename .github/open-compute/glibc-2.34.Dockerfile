@@ -2,8 +2,8 @@
 # manylinux_2_34 provides AlmaLinux 9 glibc; kernel.org supplies
 # LLVM 22, and libc++/libc++abi/libunwind are rebuilt here so the static C++
 # runtime links only glibc 2.34 symbols. The system GCC 11 supplies crt objects and
-# libgcc: gcc-toolset-14's libgcc_eh calls _dl_find_object, which AlmaLinux 9 backports
-# as GLIBC_2.35 and upstream glibc 2.34 does not provide.
+# libgcc. AlmaLinux 9 backports _dl_find_object as GLIBC_2.35 and its libgcc_eh calls it,
+# so the release link puts LLVM libunwind ahead of libgcc_eh.
 # Remove when upstream release_linux builds target a glibc 2.34 sysroot.
 ARG MANYLINUX=quay.io/pypa/manylinux_2_34_x86_64@sha256:b9bb1e7780cebc4a8375c032428411ee1a78c4cd0b8edd1313983166dd3d6cf1
 FROM ${MANYLINUX}
