@@ -18,6 +18,9 @@ RUN mkdir -p /opt/llvm /build \
     && curl -fsSL "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-22.1.8-${LLVM_ARCH}.tar.xz" -o /build/clang.tar.xz \
     && echo "${LLVM_SHA256}  /build/clang.tar.xz" | sha256sum -c - \
     && tar -xJf /build/clang.tar.xz --strip-components=1 -C /opt/llvm \
+    && for driver in clang clang++; do \
+         echo '--gcc-toolchain=/opt/rh/gcc-toolset-14/root/usr' > "/opt/llvm/bin/$driver.cfg"; \
+       done \
     && curl -fsSL https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/llvm-project-22.1.8.src.tar.xz -o /build/llvm.tar.xz \
     && echo '922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888  /build/llvm.tar.xz' | sha256sum -c - \
     && tar -xJf /build/llvm.tar.xz -C /build \
